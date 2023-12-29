@@ -1,0 +1,1 @@
+A simple Lisp (scheme) like language to learn Rust and play around with some stuff.

@@ -1,0 +1,57 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "(Windows) Launch",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/lisp.exe",
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "console": "integratedTerminal",
+            "preLaunchTask": "rust: cargo build"
+        }
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'lisp'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=lisp",
+                    "--package=lisp"
+                ],
+                "filter": {
+                    "name": "lisp",
+                    "kind": "bin"
+                }
+            },
+            "env": {"RUST_BACKTRACE": "1"},
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'lisp'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=lisp",
+                    "--package=lisp"
+                ],
+                "filter": {
+                    "name": "lisp",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
