@@ -96,4 +96,35 @@ mod test {
         (+ 2 (square 4) (five))");
         assert!(matches!(res, SExpression::Atom(Atom::Integer(23))));
     }
+
+    #[test]
+    fn test_and() {
+        let res = parse_and_eval("(and");
+        assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+        let res = parse_and_eval("(and 1");
+        assert!(matches!(res, SExpression::Atom(Atom::Integer(1))));
+        let res = parse_and_eval("(and 1 2");
+        assert!(matches!(res, SExpression::Atom(Atom::Integer(2))));
+        let res = parse_and_eval("(and (> 2 1) (> 3 2) (> 3 4)");
+        assert!(matches!(res, SExpression::Atom(Atom::Boolean(false))));
+    }
+
+    #[test]
+    fn test_or() {
+        let res = parse_and_eval("(or");
+        assert!(matches!(res, SExpression::Atom(Atom::Boolean(false))));
+        let res = parse_and_eval("(or 1");
+        assert!(matches!(res, SExpression::Atom(Atom::Integer(1))));
+        let res = parse_and_eval("(or false 2");
+        assert!(matches!(res, SExpression::Atom(Atom::Integer(2))));
+        let res = parse_and_eval("(or false false");
+        assert!(matches!(res, SExpression::Atom(Atom::Boolean(false))));
+        let res = parse_and_eval("(or (> 2 1) (> 3 2) (> 3 4)");
+        assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+    }
+    #[test]
+    fn test_if() {
+        let res = parse_and_eval("(if 10 20 30");
+        assert!(matches!(res, SExpression::Atom(Atom::Integer(20))));
+    }
 }

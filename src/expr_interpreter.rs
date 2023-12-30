@@ -171,7 +171,7 @@ impl Interpreter {
     fn execute_expr(&self, root: &SExpression, args: &[SExpression], env: &mut Env) -> Result<SExpression, ExecutionError> {
         match root {
             SExpression::Atom(l) => Ok(SExpression::Atom(l.clone())),
-            SExpression::BuiltIn(b) => todo!(),
+            SExpression::BuiltIn(b) => self.execute_builtin(b, &[], env), //TODO
             SExpression::Symbol(s) => {
                 let value = env.lookup(s);
                 if value.is_none() {
@@ -256,18 +256,25 @@ impl Interpreter {
                         return self.execute_list(&list[1..], env);
                      }
                 },
-                SExpression::Lambda(_) => todo!()
+                SExpression::Lambda(_) => Err(ExecutionError::from("Unexpected lambda")) //should not happen
             }
         }
         else {
-            Err(ExecutionError::from("Empty list"))
+            Ok(SExpression::List(vec![]))
         }
     }
 
     fn execute_builtin(&self, instr: &instructions::Instruction, remainder: &[SExpression], env: &mut Env) -> Result<SExpression, ExecutionError> {
         if remainder.is_empty() {
-            return Err(ExecutionError::from("Empty list"));
+            let allow_empty_list = match instr {
+                &instructions::Instruction::And | &instructions::Instruction::Or => true,
+                _ => false
+            };
+            if !allow_empty_list {
+                return Err(ExecutionError::from("Empty list"));
+            }
         }
+
         match instr {
             instructions::Instruction::Define => {
                 if remainder.len() != 2 {
@@ -306,16 +313,10 @@ impl Interpreter {
                     return Err(ExecutionError::from("Expected 3 arguments"));
                 }
                 let cond_result = self.execute_expr(&remainder[0], &[], env)?;
-                if let SExpression::Atom(Atom::Boolean(b)) = cond_result {
-                    if b {
-                        return self.execute_expr(&remainder[1], &[], env);
-                    }
-                    else {
-                        return self.execute_expr(&remainder[2], &[], env);
-                    }
-                }
-                else {
-                    return Err(ExecutionError::from("Expected a boolean"));
+                match cond_result {
+                    //everything that is not "false", is true
+                    SExpression::Atom(Atom::Boolean(b)) if !b => return self.execute_expr(&remainder[2], &[], env),
+                    _ => return self.execute_expr(&remainder[1], &[], env)
                 }
             },
             instructions::Instruction::Not => {
@@ -330,8 +331,31 @@ impl Interpreter {
                     return Err(ExecutionError::from("Expected a boolean"));
                 }
             },
-            instructions::Instruction::And => todo!(),
-            instructions::Instruction::Or => todo!(),
+            instructions::Instruction::And => {
+                for (i, cond) in remainder.iter().enumerate() {
+                    let res = self.execute_expr(cond, &[], env)?;
+                    match res {
+                        SExpression::Atom(Atom::Boolean(b)) if !b => return Ok(res.clone()),
+                        _ => if i == remainder.len() - 1 {
+                            return Ok(res.clone());
+                        }
+                    }
+                }
+                return Ok(SExpression::Atom(Atom::Boolean(true)));
+            },
+            instructions::Instruction::Or => {
+                for (i, cond) in remainder.iter().enumerate() {
+                    let res = self.execute_expr(cond, &[], env)?;
+                    if i == remainder.len() - 1 {
+                        return Ok(res.clone());
+                    }
+                    match res {
+                        SExpression::Atom(Atom::Boolean(b)) if b => return Ok(res.clone()),
+                        _ => continue,
+                    }
+                }
+                return Ok(SExpression::Atom(Atom::Boolean(false)))
+            },
             instructions::Instruction::Plus => binary_op!(remainder, self, env, +=),
             instructions::Instruction::Minus => binary_op!(remainder, self, env, -=),
             instructions::Instruction::Multiply => binary_op!(remainder, self, env, *=),
