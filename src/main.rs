@@ -4,6 +4,9 @@ mod lexer;
 mod parser;
 mod instructions;
 mod expr_interpreter;
+mod vm;
+
+use crate::vm::compiler::*;
 
 use mimalloc::MiMalloc;
 
@@ -39,6 +42,8 @@ mod test {
     use crate::parser::{SExpression, Atom, Parser};
     use crate::lexer;
     use crate::Interpreter;
+    use crate::vm::compiler::Compiler;
+    use crate::vm::vm::Vm;
 
     fn parse_and_eval(prog: &str) -> SExpression {
         let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
@@ -126,5 +131,17 @@ mod test {
     fn test_if() {
         let res = parse_and_eval("(if 10 20 30");
         assert!(matches!(res, SExpression::Atom(Atom::Integer(20))));
+    }
+
+    #[test]
+    fn test_compiler() {
+        let mut compiler = Compiler::new();
+        let tokens = lexer::tokenize("(+ 1 (+ 2 3))").unwrap_or(vec![]);
+        let parser = Parser::new();
+        let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
+        let mut prog = compiler.compile(&list.0).unwrap();
+        let mut vm = Vm::new();
+        let res = vm.run(&mut prog);
+        assert!(matches!(res, Some(SExpression::Atom(Atom::Integer(6)))));
     }
 }
