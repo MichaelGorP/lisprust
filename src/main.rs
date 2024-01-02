@@ -117,9 +117,17 @@ mod test {
         let res = parse_and_eval("(<= 2 2");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
 
-        //test error case
-        let res = parse_might_fail("(= 2 2 2");
-        assert!(matches!(res, None));
+        let res = parse_and_eval("(=)");
+        assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+
+        let res = parse_and_eval("(= 2 2 2");
+        assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+
+        let res = parse_and_eval("(< 2 3 4");
+        assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+
+        let res = parse_and_eval("(> 2 3 1");
+        assert!(matches!(res, SExpression::Atom(Atom::Boolean(false))));
     }
 
     #[test]

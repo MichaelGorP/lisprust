@@ -71,27 +71,32 @@ macro_rules! binary_op {
 macro_rules! comparison_op {
     ($self: ident, $remainder: ident, $env: ident, $op: tt) => {
         {
-            if $remainder.len() != 2 {
-                return Err(ExecutionError::from("Expected 2 arguments"));
+            if $remainder.len() <= 1 {
+                return Ok(SExpression::Atom(Atom::Boolean(true)));
             }
-            let op1 = $self.execute_to_numeric(&$remainder[0], $env);
-            if op1.is_none() {
+            let Some (mut op1) = $self.execute_to_numeric(&$remainder[0], $env) else {
                 let mut err = String::new();
                 write!(&mut err, "Expected a number, got {}", $remainder[0])?;
                 return Err(ExecutionError::from(err.as_str()));
+            };
+            for i in 1..$remainder.len() {
+                let Some(op2) = $self.execute_to_numeric(&$remainder[i], $env) else {
+                    let mut err = String::new();
+                    write!(&mut err, "Expected a number, got {}", $remainder[1])?;
+                    return Err(ExecutionError::from(err.as_str()));
+                };
+                let matches = match (op1, &op2) {
+                    (Numeric::Integer(lhs), Numeric::Integer(rhs)) => lhs $op *rhs,
+                    (Numeric::Integer(lhs), Numeric::Float(rhs)) => (lhs as f64) $op *rhs,
+                    (Numeric::Float(lhs), Numeric::Integer(rhs)) => lhs $op *rhs as f64,
+                    (Numeric::Float(lhs), Numeric::Float(rhs)) => lhs $op *rhs,
+                };
+                if !matches {
+                    return Ok(SExpression::Atom(Atom::Boolean(false)));
+                }
+                op1 = op2;
             }
-            let op2 = $self.execute_to_numeric(&$remainder[1], $env);
-            if op2.is_none() {
-                let mut err = String::new();
-                write!(&mut err, "Expected a number, got {}", $remainder[1])?;
-                return Err(ExecutionError::from(err.as_str()));
-            }
-            match (op1.unwrap(), op2.unwrap()) {
-                (Numeric::Integer(lhs), Numeric::Integer(rhs)) => Ok(SExpression::Atom(Atom::Boolean(lhs $op rhs))),
-                (Numeric::Integer(lhs), Numeric::Float(rhs)) => Ok(SExpression::Atom(Atom::Boolean((lhs as f64) $op rhs))),
-                (Numeric::Float(lhs), Numeric::Integer(rhs)) => Ok(SExpression::Atom(Atom::Boolean(lhs $op rhs as f64))),
-                (Numeric::Float(lhs), Numeric::Float(rhs)) => Ok(SExpression::Atom(Atom::Boolean(lhs $op rhs))),
-            }
+            return Ok(SExpression::Atom(Atom::Boolean(true)));
         }
     };
 }
@@ -265,16 +270,6 @@ impl Interpreter {
     }
 
     fn execute_builtin(&self, instr: &instructions::Instruction, remainder: &[SExpression], env: &mut Env) -> Result<SExpression, ExecutionError> {
-        if remainder.is_empty() {
-            let allow_empty_list = match instr {
-                &instructions::Instruction::And | &instructions::Instruction::Or => true,
-                _ => false
-            };
-            if !allow_empty_list {
-                return Err(ExecutionError::from("Empty list"));
-            }
-        }
-
         match instr {
             instructions::Instruction::Define => {
                 if remainder.len() != 2 {

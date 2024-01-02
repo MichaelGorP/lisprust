@@ -1,14 +1,22 @@
-use std::{io::{Read, BufReader, Cursor}, thread::current};
+use std::io::{Read, Cursor};
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
 pub(super) enum Instr {
+    //register handling
     LoadInt,
     LoadFloat,
+    //arithmetic
     Add,
     Sub,
     Mul,
-    Div
+    Div,
+    //comparisons
+    Eq,
+    Lt,
+    Gt,
+    Leq,
+    Geq
 }
 
 impl TryFrom<u8> for Instr {
