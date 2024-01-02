@@ -71,7 +71,7 @@ macro_rules! binary_op {
 macro_rules! comparison_op {
     ($self: ident, $remainder: ident, $env: ident, $op: tt) => {
         {
-            if $remainder.len() <= 1 {
+            if $remainder.len() == 0 {
                 return Ok(SExpression::Atom(Atom::Boolean(true)));
             }
             let Some (mut op1) = $self.execute_to_numeric(&$remainder[0], $env) else {

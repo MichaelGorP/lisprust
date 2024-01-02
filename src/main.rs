@@ -120,6 +120,12 @@ mod test {
         let res = parse_and_eval("(=)");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
 
+        let res = parse_and_eval("(> 5)");
+        assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+
+        let res = parse_might_fail("> \"a\")");
+        assert!(matches!(res, None));
+
         let res = parse_and_eval("(= 2 2 2");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
 
