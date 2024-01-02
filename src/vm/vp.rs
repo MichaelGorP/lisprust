@@ -1,4 +1,4 @@
-use std::io::{Read, Cursor};
+use std::{io::{Read, Cursor}, mem::size_of};
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -6,6 +6,9 @@ pub(super) enum Instr {
     //register handling
     LoadInt,
     LoadFloat,
+    LoadBool,
+    LoadString,
+    CopyReg,
     //arithmetic
     Add,
     Sub,
@@ -26,10 +29,18 @@ impl TryFrom<u8> for Instr {
         match value {
             x if x == Instr::LoadInt as u8 => Ok(Instr::LoadInt),
             x if x == Instr::LoadFloat as u8 => Ok(Instr::LoadFloat),
+            x if x == Instr::LoadBool as u8 => Ok(Instr::LoadBool),
+            x if x == Instr::LoadString as u8 => Ok(Instr::LoadString),
+            x if x == Instr::CopyReg as u8 => Ok(Instr::CopyReg),
             x if x == Instr::Add as u8 => Ok(Instr::Add),
             x if x == Instr::Sub as u8 => Ok(Instr::Sub),
             x if x == Instr::Mul as u8 => Ok(Instr::Mul),
             x if x == Instr::Div as u8 => Ok(Instr::Div),
+            x if x == Instr::Eq as u8 => Ok(Instr::Eq),
+            x if x == Instr::Lt as u8 => Ok(Instr::Lt),
+            x if x == Instr::Gt as u8 => Ok(Instr::Gt),
+            x if x == Instr::Leq as u8 => Ok(Instr::Leq),
+            x if x == Instr::Geq as u8 => Ok(Instr::Geq),
             _ => Err(())
         }
     }
@@ -40,8 +51,12 @@ pub(super) struct OpCode {
 }
 
 impl OpCode {
-    pub fn new(instr: Instr, dest_reg: u8) -> OpCode {
+    pub fn new_dest(instr: Instr, dest_reg: u8) -> OpCode {
         OpCode{data: [instr as u8, dest_reg, 0, 0]}
+    }
+
+    pub fn new(instr: Instr, dest_reg: u8, r1: u8, r2: u8) -> OpCode {
+        OpCode{data: [instr as u8, dest_reg, r1, r2]}
     }
 
     pub fn get_data(&self) -> [u8; 4] {
@@ -93,5 +108,20 @@ impl VirtualProgram {
         else {
             None
         }
+    }
+
+    pub fn read_string(&mut self) -> Option<String> {
+        let mut buffer = [0 as u8; size_of::<usize>()];
+        if let Ok(()) = self.cursor.read_exact(&mut buffer) {
+            let size = usize::from_le_bytes(buffer);
+            let mut str_buf: Vec<u8> = Vec::with_capacity(size);
+            str_buf.resize(size, 0);
+            if let Ok(()) = self.cursor.read_exact(&mut str_buf) {
+                if let Ok(str) = String::from_utf8(str_buf) {
+                    return Some(str);
+                }
+            }
+        }
+        return None;
     }
 }

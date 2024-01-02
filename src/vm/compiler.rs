@@ -46,18 +46,26 @@ impl BytecodeBuilder {
 
     fn load_atom(&mut self, atom: &Atom, reg: u8) {
         match atom {
-            Atom::Boolean(_) => todo!(),
+            Atom::Boolean(b) => {
+                let opcode = OpCode::new(Instr::LoadBool, reg, *b as u8, 0);
+                let _ = self.cursor.write(&opcode.get_data());
+            },
             Atom::Integer(i) => {
-                let opcode = OpCode::new(Instr::LoadInt, reg);
+                let opcode = OpCode::new_dest(Instr::LoadInt, reg);
                 let _ = self.cursor.write(&opcode.get_data());
                 let _ = self.cursor.write(&i.to_le_bytes());
             }
             Atom::Float(f) => {
-                let opcode = OpCode::new(Instr::LoadFloat, reg);
+                let opcode = OpCode::new_dest(Instr::LoadFloat, reg);
                 let _ = self.cursor.write(&opcode.get_data());
                 let _ = self.cursor.write(&f.to_le_bytes());
             },
-            Atom::String(_) => todo!(),
+            Atom::String(s) => {
+                let opcode = OpCode::new_dest(Instr::LoadFloat, reg);
+                let _ = self.cursor.write(&opcode.get_data());
+                let _ = self.cursor.write(&s.len().to_le_bytes());
+                let _ = self.cursor.write(s.as_bytes());
+            },
         }
     }
 
@@ -144,11 +152,11 @@ impl Compiler {
             Instruction::Minus => self.compile_binary_op(args, Instr::Sub),
             Instruction::Multiply => self.compile_binary_op(args, Instr::Mul),
             Instruction::Divide => self.compile_binary_op(args, Instr::Div),
-            Instruction::Eq => todo!(),
-            Instruction::Lt => todo!(),
-            Instruction::Gt => todo!(),
-            Instruction::Leq => todo!(),
-            Instruction::Geq => todo!(),
+            Instruction::Eq => self.compile_comparison_op(args, Instr::Eq),
+            Instruction::Lt => self.compile_comparison_op(args, Instr::Lt),
+            Instruction::Gt => self.compile_comparison_op(args, Instr::Gt),
+            Instruction::Leq => self.compile_comparison_op(args, Instr::Leq),
+            Instruction::Geq => self.compile_comparison_op(args, Instr::Geq),
         }
     }
 
@@ -166,5 +174,32 @@ impl Compiler {
         else {
             todo!()
         }
+    }
+
+    fn compile_comparison_op(&mut self, args: &[SExpression], instr: Instr) -> Result<u8, CompilationError> {
+        let result_reg = self.allocate_reg()?;
+                self.bytecode.load_atom(&Atom::Boolean(true), result_reg);
+                if args.is_empty() {    
+                    Ok(result_reg)
+                }
+                else {
+                    let r1 = self.compile_expr(&args[0], &[])?;
+                    if args.len() >= 2 {
+                        for i in 1..args.len() {
+                            let rnext = self.compile_expr(&args[i], &[])?;
+                            self.bytecode.store_opcode(instr, result_reg, r1, rnext);
+                            if i < args.len() - 1 {
+                                self.bytecode.store_opcode(Instr::CopyReg, r1, rnext, 0)
+                            }
+                            self.reset_reg(r1 + 1)
+                        }
+                    }
+                    else {
+                        //compare it to itself to check the type and produce the result true
+                        self.bytecode.store_opcode(Instr::Eq, result_reg, r1, r1);
+                    }
+                    self.reset_reg(result_reg + 1);
+                    Ok(result_reg)
+                }
     }
 }

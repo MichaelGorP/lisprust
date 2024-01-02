@@ -19,6 +19,29 @@ macro_rules! binary_op {
     };
 }
 
+macro_rules! comparison_op {
+    ($self:ident, $opcode:ident, $op:tt) => {
+        {
+            let r1 = &$self.registers[$opcode[2] as usize];
+            let r2 = &$self.registers[$opcode[3] as usize];
+            let res_reg = $opcode[1] as usize;
+            let matches = match (r1, r2) {
+                (Value::Integer(lhs), Value::Integer(rhs)) => *lhs $op *rhs,
+                (Value::Integer(lhs), Value::Float(rhs)) => (*lhs as f64) $op *rhs,
+                (Value::Float(lhs), Value::Float(rhs)) => *lhs $op *rhs,
+                (Value::Float(lhs), Value::Integer(rhs)) => *lhs $op *rhs as f64,
+                _ => break,
+            };
+            //only override register, if it is true
+            if let Value::Boolean(b) = $self.registers[res_reg] {
+                if (b && !matches) {
+                    $self.registers[res_reg] = Value::Boolean(matches);
+                }
+            }
+        }
+    };
+}
+
 #[derive(PartialEq, Clone, Debug)]
 enum Value {
     Empty,
@@ -60,11 +83,28 @@ impl Vm {
                         return None;
                     };
                     self.registers[opcode[1] as usize] = Value::Float(val);
-                }
+                },
+                Ok(Instr::LoadBool) => {
+                    self.registers[opcode[1] as usize] = Value::Boolean(opcode[2] != 0);
+                },
+                Ok(Instr::LoadString) => {
+                    let Some(val) = prog.read_string() else {
+                        return None;
+                    };
+                    self.registers[opcode[1] as usize] = Value::String(val);
+                },
+                Ok(Instr::CopyReg) => {
+                    self.registers[opcode[1] as usize] = self.registers[opcode[2] as usize].clone();
+                },
                 Ok(Instr::Add) => binary_op!(self, opcode, +),
                 Ok(Instr::Sub) => binary_op!(self, opcode, -),
                 Ok(Instr::Mul) => binary_op!(self, opcode, *),
                 Ok(Instr::Div) => binary_op!(self, opcode, /),
+                Ok(Instr::Eq) => comparison_op!(self, opcode, ==),
+                Ok(Instr::Lt) => comparison_op!(self, opcode, <),
+                Ok(Instr::Gt) => comparison_op!(self, opcode, >),
+                Ok(Instr::Leq) => comparison_op!(self, opcode, <=),
+                Ok(Instr::Geq) => comparison_op!(self, opcode, >=),
                 _ => break,
             }
         }

@@ -179,12 +179,12 @@ mod test {
     #[test]
     fn test_compiler() {
         let mut compiler = Compiler::new();
-        let tokens = lexer::tokenize("(+ 1 (+ 2 3))").unwrap_or(vec![]);
+        let tokens = lexer::tokenize("(> 10 (+ 2 3) (* 2 2)))").unwrap_or(vec![]);
         let parser = Parser::new();
         let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
         let mut prog = compiler.compile(&list.0).unwrap();
         let mut vm = Vm::new();
         let res = vm.run(&mut prog);
-        assert!(matches!(res, Some(SExpression::Atom(Atom::Integer(6)))));
+        assert!(matches!(res, Some(SExpression::Atom(Atom::Boolean(true)))));
     }
 }
