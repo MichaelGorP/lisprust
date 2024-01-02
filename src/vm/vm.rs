@@ -2,6 +2,23 @@ use crate::parser::{SExpression, Atom};
 
 use super::vp::{VirtualProgram, Instr};
 
+macro_rules! binary_op {
+    ($self:ident, $opcode:ident, $op:tt) => {
+        {
+            let r1 = &$self.registers[$opcode[2] as usize];
+            let r2 = &$self.registers[$opcode[3] as usize];
+            let res_reg = $opcode[1] as usize;
+            match (r1, r2) {
+                (Value::Integer(lhs), Value::Integer(rhs)) => $self.registers[res_reg] = Value::Integer(*lhs $op *rhs),
+                (Value::Integer(lhs), Value::Float(rhs)) => $self.registers[res_reg] = Value::Float(*lhs as f64 $op *rhs),
+                (Value::Float(lhs), Value::Float(rhs)) => $self.registers[res_reg] = Value::Float(*lhs $op *rhs),
+                (Value::Float(lhs), Value::Integer(rhs)) => $self.registers[res_reg] = Value::Float(*lhs $op *rhs as f64),
+                _ => break,
+            }
+        }
+    };
+}
+
 #[derive(PartialEq, Clone, Debug)]
 enum Value {
     Empty,
@@ -44,18 +61,10 @@ impl Vm {
                     };
                     self.registers[opcode[1] as usize] = Value::Float(val);
                 }
-                Ok(Instr::Add) => {
-                    let r1 = &self.registers[opcode[2] as usize];
-                    let r2 = &self.registers[opcode[3] as usize];
-                    let res_reg = opcode[1] as usize;
-                    match (r1, r2) {
-                        (Value::Integer(lhs), Value::Integer(rhs)) => self.registers[res_reg] = Value::Integer(*lhs + *rhs),
-                        (Value::Integer(lhs), Value::Float(rhs)) => self.registers[res_reg] = Value::Float(*lhs as f64 + *rhs),
-                        (Value::Float(lhs), Value::Float(rhs)) => self.registers[res_reg] = Value::Float(*lhs + *rhs),
-                        (Value::Float(lhs), Value::Integer(rhs)) => self.registers[res_reg] = Value::Float(*lhs + *rhs as f64),
-                        _ => break,
-                    }
-                },
+                Ok(Instr::Add) => binary_op!(self, opcode, +),
+                Ok(Instr::Sub) => binary_op!(self, opcode, -),
+                Ok(Instr::Mul) => binary_op!(self, opcode, *),
+                Ok(Instr::Div) => binary_op!(self, opcode, /),
                 _ => break,
             }
         }

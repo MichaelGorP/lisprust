@@ -1,6 +1,7 @@
 use std::{io::{Read, BufReader, Cursor}, thread::current};
 
 #[repr(u8)]
+#[derive(Clone, Copy)]
 pub(super) enum Instr {
     LoadInt,
     LoadFloat,

@@ -2,7 +2,7 @@ use std::fmt;
 use crate::{lexer::Token, instructions};
 use case_insensitive_hashmap::CaseInsensitiveHashMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Atom {
     Boolean(bool),
     Integer(i64),
@@ -22,13 +22,13 @@ impl fmt::Display for Atom {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Lambda {
     pub args: Vec<String>,
     pub body: SExpression
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SExpression {
     Atom(Atom),
     BuiltIn(instructions::Instruction),

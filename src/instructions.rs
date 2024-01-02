@@ -1,7 +1,7 @@
 use enum_display::EnumDisplay;
 
 
-#[derive(Clone, Copy, Debug, EnumDisplay)]
+#[derive(Clone, Copy, Debug, EnumDisplay, PartialEq)]
 pub enum Instruction {
     Define,
     Lambda,

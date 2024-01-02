@@ -8,6 +8,9 @@ mod vm;
 
 use crate::vm::compiler::*;
 
+use crate::vm::compiler::Compiler;
+use crate::vm::vm::Vm;
+
 use mimalloc::MiMalloc;
 
 #[global_allocator]
@@ -34,6 +37,17 @@ fn main() {
     if let Ok(SExpression::Atom(lit)) = res {
         println!("Result: {}", lit);
     }
+
+    //to get rid of unused warnings for now
+    let mut compiler = Compiler::new();
+    let Ok(mut prog) = compiler.compile(&list.0) else {
+        return;
+    };
+    let mut vm = Vm::new();
+    let res = vm.run(&mut prog);
+    if let Some(SExpression::Atom(lit)) = res {
+        println!("VM result: {}", lit)
+    }
 }
 
 
@@ -54,6 +68,21 @@ mod test {
         res.expect("Failed to execute")
     }
 
+    fn parse_and_exec(prog: &str) -> SExpression {
+        let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
+        let parser = Parser::new();
+        let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
+        let interpreter = Interpreter::new();
+        let res = interpreter.execute(&list.0).expect("Failed to execute");
+
+        let mut compiler = Compiler::new();
+        let mut prog = compiler.compile(&list.0).unwrap();
+        let mut vm = Vm::new();
+        let res2 = vm.run(&mut prog).expect("Failed to execute");
+        assert!(res == res2);
+        res
+    }
+
     fn parse_might_fail(prog: &str) -> Option<SExpression> {
         let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
         let parser = Parser::new();
@@ -65,13 +94,13 @@ mod test {
 
     #[test]
     fn test_binary_operations() {
-        let res = parse_and_eval("(+ 1 2 2.5)");
+        let res = parse_and_exec("(+ 1 2 2.5)");
         assert!(matches!(res, SExpression::Atom(Atom::Float(5.5))));
-        let res = parse_and_eval("(- 10 3)");
+        let res = parse_and_exec("(- 10 3)");
         assert!(matches!(res, SExpression::Atom(Atom::Integer(7))));
-        let res = parse_and_eval("(* 2 2 3)");
+        let res = parse_and_exec("(* 2 2 3)");
         assert!(matches!(res, SExpression::Atom(Atom::Integer(12))));
-        let res = parse_and_eval("(/ 8 2)");
+        let res = parse_and_exec("(/ 8 2)");
         assert!(matches!(res, SExpression::Atom(Atom::Integer(4))));
     }
 

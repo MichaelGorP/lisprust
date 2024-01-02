@@ -140,29 +140,31 @@ impl Compiler {
             Instruction::Not => todo!(),
             Instruction::And => todo!(),
             Instruction::Or => todo!(),
-            Instruction::Plus => {
-                if args.len() >= 2 {
-                    let result_reg = self.compile_expr(&args[0], &[])?;
-                    for i in 1..args.len() {
-                        let rnext = self.compile_expr(&args[i], &[])?;
-                        self.bytecode.store_opcode(Instr::Add, result_reg, result_reg, rnext);
-                        self.reset_reg(result_reg + 1);
-                    }
-                    self.reset_reg(result_reg + 1);
-                    Ok(result_reg)
-                }
-                else {
-                    todo!()
-                }
-            },
-            Instruction::Minus => todo!(),
-            Instruction::Multiply => todo!(),
-            Instruction::Divide => todo!(),
+            Instruction::Plus => self.compile_binary_op(args, Instr::Add),
+            Instruction::Minus => self.compile_binary_op(args, Instr::Sub),
+            Instruction::Multiply => self.compile_binary_op(args, Instr::Mul),
+            Instruction::Divide => self.compile_binary_op(args, Instr::Div),
             Instruction::Eq => todo!(),
             Instruction::Lt => todo!(),
             Instruction::Gt => todo!(),
             Instruction::Leq => todo!(),
             Instruction::Geq => todo!(),
+        }
+    }
+
+    fn compile_binary_op(&mut self, args: &[SExpression], instr: Instr) -> Result<u8, CompilationError> {
+        if args.len() >= 2 {
+            let result_reg = self.compile_expr(&args[0], &[])?;
+            for i in 1..args.len() {
+                let rnext = self.compile_expr(&args[i], &[])?;
+                self.bytecode.store_opcode(instr, result_reg, result_reg, rnext);
+                self.reset_reg(result_reg + 1);
+            }
+            self.reset_reg(result_reg + 1);
+            Ok(result_reg)
+        }
+        else {
+            todo!()
         }
     }
 }
