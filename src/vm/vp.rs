@@ -19,7 +19,17 @@ pub(super) enum Instr {
     Lt,
     Gt,
     Leq,
-    Geq
+    Geq,
+    //control flow
+    Not,
+    Jump
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub(super) enum JumpCondition {
+    JumpTrue,
+    JumpFalse
 }
 
 impl TryFrom<u8> for Instr {
@@ -41,6 +51,8 @@ impl TryFrom<u8> for Instr {
             x if x == Instr::Gt as u8 => Ok(Instr::Gt),
             x if x == Instr::Leq as u8 => Ok(Instr::Leq),
             x if x == Instr::Geq as u8 => Ok(Instr::Geq),
+            x if x == Instr::Not as u8 => Ok(Instr::Not),
+            x if x == Instr::Jump as u8 => Ok(Instr::Jump),
             _ => Err(())
         }
     }
@@ -91,7 +103,7 @@ impl VirtualProgram {
     }
 
     pub fn read_int(&mut self) -> Option<i64> {
-        let mut buffer = [0 as u8; 8];
+        let mut buffer = [0 as u8; size_of::<i64>()];
         if let Ok(()) = self.cursor.read_exact(&mut buffer) {
             Some(i64::from_le_bytes(buffer))
         }
@@ -101,7 +113,7 @@ impl VirtualProgram {
     }
 
     pub fn read_float(&mut self) -> Option<f64> {
-        let mut buffer = [0 as u8; 8];
+        let mut buffer = [0 as u8; size_of::<f64>()];
         if let Ok(()) = self.cursor.read_exact(&mut buffer) {
             Some(f64::from_le_bytes(buffer))
         }
@@ -123,5 +135,10 @@ impl VirtualProgram {
             }
         }
         return None;
+    }
+
+    pub fn jump(&mut self, distance: i64) {
+        let pos = (self.cursor.position() as i64) + distance;
+        self.cursor.set_position(pos as u64);
     }
 }

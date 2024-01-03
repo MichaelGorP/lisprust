@@ -92,6 +92,16 @@ mod test {
         res.ok()
     }
 
+    fn compile_and_run(prog: &str) -> Option<SExpression> {
+        let mut compiler = Compiler::new();
+        let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
+        let parser = Parser::new();
+        let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
+        let mut prog = compiler.compile(&list.0).unwrap();
+        let mut vm = Vm::new();
+        vm.run(&mut prog)
+    }
+
     #[test]
     fn test_binary_operations() {
         let res = parse_and_exec("(+ 1 2 2.5)");
@@ -106,33 +116,33 @@ mod test {
 
     #[test]
     fn test_comparisons() {
-        let res = parse_and_eval("(= 2 2");
+        let res = parse_and_exec("(= 2 2");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
-        let res = parse_and_eval("(< 1 2");
+        let res = parse_and_exec("(< 1 2");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
-        let res = parse_and_eval("(> 1 2");
+        let res = parse_and_exec("(> 1 2");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(false))));
-        let res = parse_and_eval("(>= 2 2");
+        let res = parse_and_exec("(>= 2 2");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
-        let res = parse_and_eval("(<= 2 2");
-        assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
-
-        let res = parse_and_eval("(=)");
+        let res = parse_and_exec("(<= 2 2");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
 
-        let res = parse_and_eval("(> 5)");
+        let res = parse_and_exec("(=)");
+        assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+
+        let res = parse_and_exec("(> 5)");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
 
         let res = parse_might_fail("> \"a\")");
         assert!(matches!(res, None));
 
-        let res = parse_and_eval("(= 2 2 2");
+        let res = parse_and_exec("(= 2 2 2");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
 
-        let res = parse_and_eval("(< 2 3 4");
+        let res = parse_and_exec("(< 2 3 4");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
 
-        let res = parse_and_eval("(> 2 3 1");
+        let res = parse_and_exec("(> 2 3 1");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(false))));
     }
 
@@ -147,29 +157,39 @@ mod test {
 
     #[test]
     fn test_and() {
-        let res = parse_and_eval("(and");
+        let res = parse_and_exec("(and");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
-        let res = parse_and_eval("(and 1");
+        let res = parse_and_exec("(and 1");
         assert!(matches!(res, SExpression::Atom(Atom::Integer(1))));
-        let res = parse_and_eval("(and 1 2");
+        let res = parse_and_exec("(and 1 2");
         assert!(matches!(res, SExpression::Atom(Atom::Integer(2))));
-        let res = parse_and_eval("(and (> 2 1) (> 3 2) (> 3 4)");
+        let res = parse_and_exec("(and (> 2 1) (> 3 2) (> 3 4)");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(false))));
     }
 
     #[test]
     fn test_or() {
-        let res = parse_and_eval("(or");
+        let res = parse_and_exec("(or");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(false))));
-        let res = parse_and_eval("(or 1");
+        let res = parse_and_exec("(or 1");
         assert!(matches!(res, SExpression::Atom(Atom::Integer(1))));
-        let res = parse_and_eval("(or false 2");
+        let res = parse_and_exec("(or false 2");
         assert!(matches!(res, SExpression::Atom(Atom::Integer(2))));
-        let res = parse_and_eval("(or false false");
+        let res = parse_and_exec("(or false false");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(false))));
-        let res = parse_and_eval("(or (> 2 1) (> 3 2) (> 3 4)");
+        let res = parse_and_exec("(or (> 2 1) (> 3 2) (> 3 4)");
         assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
     }
+
+    #[test]
+    fn test_not() {
+        let res = parse_and_exec("(not 1)");
+        assert!(matches!(res, SExpression::Atom(Atom::Boolean(false))));
+
+        let res = parse_and_exec("(not false)");
+        assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+    }
+
     #[test]
     fn test_if() {
         let res = parse_and_eval("(if 10 20 30");
@@ -177,14 +197,11 @@ mod test {
     }
 
     #[test]
-    fn test_compiler() {
-        let mut compiler = Compiler::new();
-        let tokens = lexer::tokenize("(> 10 (+ 2 3) (* 2 2)))").unwrap_or(vec![]);
-        let parser = Parser::new();
-        let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
-        let mut prog = compiler.compile(&list.0).unwrap();
-        let mut vm = Vm::new();
-        let res = vm.run(&mut prog);
+    fn test_compiler_comparisons() {
+        let res = compile_and_run("(> 10 (+ 2 3) (* 2 2)))");
+        assert!(matches!(res, Some(SExpression::Atom(Atom::Boolean(true)))));
+
+        let res = compile_and_run("(< 4 (+ 2 3) (* 2 6)))");
         assert!(matches!(res, Some(SExpression::Atom(Atom::Boolean(true)))));
     }
 }

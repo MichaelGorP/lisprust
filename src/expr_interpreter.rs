@@ -323,7 +323,7 @@ impl Interpreter {
                     return Ok(SExpression::Atom(Atom::Boolean(!b)));
                 }
                 else {
-                    return Err(ExecutionError::from("Expected a boolean"));
+                    return Ok(SExpression::Atom(Atom::Boolean(false)));
                 }
             },
             instructions::Instruction::And => {

@@ -1,10 +1,11 @@
 use crate::instructions::Instruction;
 use crate::parser::{SExpression, Atom};
 use std::io::Write;
+use std::mem::size_of;
 use std::{fmt, io::Cursor};
 use std::error::Error;
 
-use super::vp::{VirtualProgram, Instr, OpCode};
+use super::vp::{VirtualProgram, Instr, OpCode, JumpCondition};
 
 #[derive(Debug)]
 pub struct CompilationError {
@@ -72,6 +73,23 @@ impl BytecodeBuilder {
     fn store_opcode(&mut self, instr: Instr, dest_reg: u8, r1: u8, r2: u8) {
         let opcode = [instr as u8, dest_reg, r1, r2];
         let _ = self.cursor.write(&opcode);
+    }
+
+    fn store_value(&mut self, val: &[u8]) {
+        let _ = self.cursor.write(&val);
+    }
+
+    fn store_at(&mut self, pos: u64, val: &[u8]) {
+        self.cursor.set_position(pos);
+        let _ = self.cursor.write(val);
+    }
+
+    fn position(&self) -> u64 {
+        self.cursor.position()
+    }
+
+    fn set_position(&mut self, pos: u64) {
+        self.cursor.set_position(pos);
     }
 }
 
@@ -145,9 +163,91 @@ impl Compiler {
             Instruction::Define => todo!(),
             Instruction::Lambda => todo!(),
             Instruction::If => todo!(),
-            Instruction::Not => todo!(),
-            Instruction::And => todo!(),
-            Instruction::Or => todo!(),
+            Instruction::Not => {
+                if args.len() != 1 {
+                    Err(CompilationError::from("Expected 1 argument"))
+                }
+                else {
+                    let reg = self.compile_expr(&args[0], &[])?;
+                    self.bytecode.store_opcode(Instr::Not, reg, reg, 0);
+                    Ok(reg)
+                }
+            },
+            Instruction::And => {
+                let mut result_reg = 0;
+                //empty and evaluates to true
+                if args.is_empty() {
+                    //write true into target register
+                    let result_reg = self.allocate_reg()?;
+                    self.bytecode.load_atom(&Atom::Boolean(true), result_reg);
+                }
+                //positions of jump marks
+                let mut jump_marks : Vec<u64> = vec![];
+                for (i, expr) in args.iter().enumerate() {
+                    result_reg = self.compile_expr(expr, &[])?;
+                    if i == args.len() - 1 {
+                        //after the last check, write false into target register. If the check succeeded, skip it
+                        self.bytecode.store_opcode(Instr::Jump, result_reg, JumpCondition::JumpTrue as u8, 0);
+                        self.bytecode.store_value(&(4 as i64).to_le_bytes()); //skip one opcode
+
+                        //now, we have the jump target for all other jumps
+                        let jump_target = self.bytecode.position();
+                        self.bytecode.load_atom(&Atom::Boolean(false), result_reg);
+
+                        //replace all jump targets
+                        let end = self.bytecode.position();
+                        for pos in &jump_marks {
+                            let distance : i64 = (jump_target - pos - size_of::<i64>() as u64) as i64;
+                            self.bytecode.store_at(*pos,&distance.to_le_bytes());
+                        }
+                        self.bytecode.set_position(end);
+                    }
+                    else {
+                        //if the condition did not evaluate to true, jump to end and skip all other checks
+                        self.bytecode.store_opcode(Instr::Jump, result_reg, JumpCondition::JumpFalse as u8, 0);
+                        jump_marks.push(self.bytecode.position());
+                        self.bytecode.store_value(&[0; size_of::<i64>()]);
+                    }
+                    self.reset_reg(result_reg);
+                }
+                self.reset_reg(result_reg + 1);
+                Ok(result_reg)
+            },
+            Instruction::Or => {
+                let mut result_reg = 0;
+                //empty or evaluates to false
+                if args.is_empty() {
+                    //write false into target register
+                    let result_reg = self.allocate_reg()?;
+                    self.bytecode.load_atom(&Atom::Boolean(false), result_reg);
+                }
+                //positions of jump marks
+                let mut jump_marks : Vec<u64> = vec![];
+                for (i, expr) in args.iter().enumerate() {
+                    result_reg = self.compile_expr(expr, &[])?;
+                    if i == args.len() - 1 {
+                        //now, we have the jump target for all other jumps
+                        let jump_target = self.bytecode.position();
+
+                        //replace all jump targets
+                        let end = self.bytecode.position();
+                        for pos in &jump_marks {
+                            let distance : i64 = (jump_target - pos - size_of::<i64>() as u64) as i64;
+                            self.bytecode.store_at(*pos,&distance.to_le_bytes());
+                        }
+                        self.bytecode.set_position(end);
+                    }
+                    else {
+                        //if the condition did not evaluate to false, jump to end and skip all other checks
+                        self.bytecode.store_opcode(Instr::Jump, result_reg, JumpCondition::JumpTrue as u8, 0);
+                        jump_marks.push(self.bytecode.position());
+                        self.bytecode.store_value(&[0; size_of::<i64>()]);
+                    }
+                    self.reset_reg(result_reg);
+                }
+                self.reset_reg(result_reg + 1);
+                Ok(result_reg)
+            },
             Instruction::Plus => self.compile_binary_op(args, Instr::Add),
             Instruction::Minus => self.compile_binary_op(args, Instr::Sub),
             Instruction::Multiply => self.compile_binary_op(args, Instr::Mul),
@@ -178,28 +278,28 @@ impl Compiler {
 
     fn compile_comparison_op(&mut self, args: &[SExpression], instr: Instr) -> Result<u8, CompilationError> {
         let result_reg = self.allocate_reg()?;
-                self.bytecode.load_atom(&Atom::Boolean(true), result_reg);
-                if args.is_empty() {    
-                    Ok(result_reg)
-                }
-                else {
-                    let r1 = self.compile_expr(&args[0], &[])?;
-                    if args.len() >= 2 {
-                        for i in 1..args.len() {
-                            let rnext = self.compile_expr(&args[i], &[])?;
-                            self.bytecode.store_opcode(instr, result_reg, r1, rnext);
-                            if i < args.len() - 1 {
-                                self.bytecode.store_opcode(Instr::CopyReg, r1, rnext, 0)
-                            }
-                            self.reset_reg(r1 + 1)
-                        }
+        self.bytecode.load_atom(&Atom::Boolean(true), result_reg);
+        if args.is_empty() {    
+            Ok(result_reg)
+        }
+        else {
+            let r1 = self.compile_expr(&args[0], &[])?;
+            if args.len() >= 2 {
+                for i in 1..args.len() {
+                    let rnext = self.compile_expr(&args[i], &[])?;
+                    self.bytecode.store_opcode(instr, result_reg, r1, rnext);
+                    if i < args.len() - 1 {
+                        self.bytecode.store_opcode(Instr::CopyReg, r1, rnext, 0)
                     }
-                    else {
-                        //compare it to itself to check the type and produce the result true
-                        self.bytecode.store_opcode(Instr::Eq, result_reg, r1, r1);
-                    }
-                    self.reset_reg(result_reg + 1);
-                    Ok(result_reg)
+                    self.reset_reg(r1 + 1)
                 }
+            }
+            else {
+                //compare it to itself to check the type and produce the result true
+                self.bytecode.store_opcode(Instr::Eq, result_reg, r1, r1);
+            }
+            self.reset_reg(result_reg + 1);
+            Ok(result_reg)
+        }
     }
 }

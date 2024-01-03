@@ -1,6 +1,6 @@
 use crate::parser::{SExpression, Atom};
 
-use super::vp::{VirtualProgram, Instr};
+use super::vp::{VirtualProgram, Instr, JumpCondition};
 
 macro_rules! binary_op {
     ($self:ident, $opcode:ident, $op:tt) => {
@@ -105,6 +105,26 @@ impl Vm {
                 Ok(Instr::Gt) => comparison_op!(self, opcode, >),
                 Ok(Instr::Leq) => comparison_op!(self, opcode, <=),
                 Ok(Instr::Geq) => comparison_op!(self, opcode, >=),
+                Ok(Instr::Not) => {
+                    let value = &self.registers[opcode[2] as usize];
+                    match value {
+                        Value::Boolean(b) => self.registers[opcode[1] as usize] = Value::Boolean(!*b),
+                        _ => self.registers[opcode[1] as usize] = Value::Boolean(false)
+                    }
+                }
+                Ok(Instr::Jump) => {
+                    let Some(distance) = prog.read_int() else {
+                        break;
+                    };
+                    //everything that is not false, is true
+                    let check = match &self.registers[opcode[1] as usize] {
+                        Value::Boolean(b) if !b => false,
+                        _ => true
+                    };
+                    if (check && opcode[2] == JumpCondition::JumpTrue as u8) || (!check && opcode[2] == JumpCondition::JumpFalse as u8) {
+                        prog.jump(distance);
+                    }
+                }
                 _ => break,
             }
         }
