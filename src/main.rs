@@ -192,7 +192,7 @@ mod test {
 
     #[test]
     fn test_if() {
-        let res = parse_and_eval("(if 10 20 30");
+        let res = parse_and_exec("(if 10 20 30");
         assert!(matches!(res, SExpression::Atom(Atom::Integer(20))));
     }
 

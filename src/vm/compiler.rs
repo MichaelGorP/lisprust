@@ -84,6 +84,13 @@ impl BytecodeBuilder {
         let _ = self.cursor.write(val);
     }
 
+    fn store_and_reset_pos(&mut self, pos: u64, val: &[u8]) {
+        let cur_pos = self.cursor.position();
+        self.cursor.set_position(pos);
+        let _ = self.cursor.write(val);
+        self.cursor.set_position(cur_pos);
+    }
+
     fn position(&self) -> u64 {
         self.cursor.position()
     }
@@ -162,7 +169,32 @@ impl Compiler {
         match instr {
             Instruction::Define => todo!(),
             Instruction::Lambda => todo!(),
-            Instruction::If => todo!(),
+            Instruction::If => {
+                if args.len() < 2 || args.len() > 3 {
+                    Err(CompilationError::from("Expected 2 or 3 arguments"))
+                }
+                else {
+                    let reg = self.compile_expr(&args[0], &[])?;
+                    self.bytecode.store_opcode(Instr::Jump, reg, JumpCondition::JumpFalse as u8, 0);
+                    self.reset_reg(reg); //not needed after the check
+                    let target_pos = self.bytecode.position();
+                    self.bytecode.store_value(&[0; size_of::<i64>()]);
+                    let ok_reg = self.compile_expr(&args[1], &[])?;
+                    self.reset_reg(ok_reg); //should be the same for the else branch then
+                    //update jump target
+                    self.bytecode.store_and_reset_pos(target_pos, &self.bytecode.position().to_le_bytes());
+                    if args.len() == 3 {
+                        //we have to jump past the else expression
+                        self.bytecode.store_opcode(Instr::Jump, reg, JumpCondition::Jump as u8, 0);
+                        let target_pos = self.bytecode.position();
+                        self.bytecode.store_value(&[0; size_of::<i64>()]);
+                        //compile else expression
+                        let _ = self.compile_expr(&args[2], &[])?; //should be the same as ok_reg
+                        self.bytecode.store_and_reset_pos(target_pos, &self.bytecode.position().to_le_bytes());
+                    }
+                    Ok(ok_reg)
+                }
+            },
             Instruction::Not => {
                 if args.len() != 1 {
                     Err(CompilationError::from("Expected 1 argument"))

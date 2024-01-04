@@ -29,7 +29,8 @@ pub(super) enum Instr {
 #[derive(Clone, Copy)]
 pub(super) enum JumpCondition {
     JumpTrue,
-    JumpFalse
+    JumpFalse,
+    Jump
 }
 
 impl TryFrom<u8> for Instr {
