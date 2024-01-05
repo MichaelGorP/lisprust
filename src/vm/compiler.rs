@@ -91,6 +91,11 @@ impl BytecodeBuilder {
         self.cursor.set_position(cur_pos);
     }
 
+    fn store_string(&mut self, val: &str) {
+        let _ = self.cursor.write(&val.len().to_le_bytes());
+        let _ = self.cursor.write(val.as_bytes());
+    }
+
     fn position(&self) -> u64 {
         self.cursor.position()
     }
@@ -167,7 +172,22 @@ impl Compiler {
 
     fn compile_builtin(&mut self, instr: &Instruction, args: &[SExpression]) -> Result<u8, CompilationError> {
         match instr {
-            Instruction::Define => todo!(),
+            Instruction::Define => {
+                if args.len() != 2 {
+                    Err(CompilationError::from("Expected 2 arguments"))
+                }
+                else {
+                    if let SExpression::Symbol(sym) = &args[0] {
+                        let reg = self.compile_expr(&args[1], &[])?;
+                        self.bytecode.store_opcode(Instr::Define, reg, 0, 0);
+                        self.bytecode.store_string(sym);
+                        Ok(reg)
+                    }
+                    else {
+                        Err(CompilationError::from("Expected a symbol name"))
+                    }
+                }
+            },
             Instruction::Lambda => todo!(),
             Instruction::If => {
                 if args.len() < 2 || args.len() > 3 {

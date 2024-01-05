@@ -22,7 +22,10 @@ pub(super) enum Instr {
     Geq,
     //control flow
     Not,
-    Jump
+    Jump,
+    //definitions and contexts
+    Define,
+    LoadGlobal
 }
 
 #[repr(u8)]
@@ -54,6 +57,8 @@ impl TryFrom<u8> for Instr {
             x if x == Instr::Geq as u8 => Ok(Instr::Geq),
             x if x == Instr::Not as u8 => Ok(Instr::Not),
             x if x == Instr::Jump as u8 => Ok(Instr::Jump),
+            x if x == Instr::Define as u8 => Ok(Instr::Define),
+            x if x == Instr::LoadGlobal as u8 => Ok(Instr::LoadGlobal),
             _ => Err(())
         }
     }

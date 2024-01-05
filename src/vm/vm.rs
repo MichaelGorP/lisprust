@@ -1,3 +1,5 @@
+use case_insensitive_hashmap::CaseInsensitiveHashMap;
+
 use crate::parser::{SExpression, Atom};
 
 use super::vp::{VirtualProgram, Instr, JumpCondition};
@@ -76,6 +78,8 @@ impl Vm {
     }
 
     pub fn run(&mut self, prog: &mut VirtualProgram) -> Option<SExpression> {
+        let mut global_vars = CaseInsensitiveHashMap::new();
+
         loop {
             let Some(opcode) = prog.read_opcode() else {
                 break;
@@ -134,7 +138,23 @@ impl Vm {
                     if (check && opcode[2] == JumpCondition::JumpTrue as u8) || (!check && opcode[2] == JumpCondition::JumpFalse as u8) {
                         prog.jump(distance);
                     }
-                }
+                },
+                Ok(Instr::Define) => {
+                    let Some(sym_name) = prog.read_string() else {
+                        break;
+                    };
+                    global_vars.insert(sym_name, self.registers[opcode[1] as usize].clone());
+                },
+                Ok(Instr::LoadGlobal) => {
+                    let Some(sym_name) = prog.read_string() else {
+                        break;
+                    };
+                    let value = global_vars.get(sym_name);
+                    match value {
+                        Some(v) => self.registers[opcode[1] as usize] = v.clone(),
+                        _ => self.registers[opcode[1] as usize] = empty_value()
+                    }
+                },
                 _ => break,
             }
         }
