@@ -1,4 +1,4 @@
-use std::{io::{Read, Cursor}, mem::size_of};
+use std::{io::{Read, Cursor}, mem::size_of, ptr::read};
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -23,9 +23,10 @@ pub(super) enum Instr {
     //control flow
     Not,
     Jump,
-    //definitions and contexts
+    //definitions, symbols, and function handling
     Define,
-    LoadGlobal
+    LoadGlobal,
+    LoadFuncRef
 }
 
 #[repr(u8)]
@@ -59,6 +60,7 @@ impl TryFrom<u8> for Instr {
             x if x == Instr::Jump as u8 => Ok(Instr::Jump),
             x if x == Instr::Define as u8 => Ok(Instr::Define),
             x if x == Instr::LoadGlobal as u8 => Ok(Instr::LoadGlobal),
+            x if x == Instr::LoadFuncRef as u8 => Ok(Instr::LoadFuncRef),
             _ => Err(())
         }
     }
@@ -79,6 +81,26 @@ impl OpCode {
 
     pub fn get_data(&self) -> [u8; 4] {
         self.data
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(packed)]
+pub(super) struct FunctionHeader {
+    pub register_count: u8,
+    pub result_reg: u8
+}
+
+impl FunctionHeader {
+    pub fn as_u8_slice(&self) -> &[u8] {
+         unsafe { core::slice::from_raw_parts((self as *const FunctionHeader) as *const u8, std::mem::size_of::<FunctionHeader>()) }
+    }
+
+    fn read(reader: &mut Cursor<Vec<u8>>) -> FunctionHeader {
+        let mut buf = [0; std::mem::size_of::<FunctionHeader>()];
+        let _ = reader.read(&mut buf);
+        let header: FunctionHeader = unsafe { std::mem::transmute(buf) };
+        header
     }
 }
 
@@ -141,6 +163,10 @@ impl VirtualProgram {
             }
         }
         return None;
+    }
+
+    pub(super) fn read_function_header(&mut self) -> Option<FunctionHeader> {
+        Some(FunctionHeader::read(&mut self.cursor))
     }
 
     pub fn jump(&mut self, distance: i64) {

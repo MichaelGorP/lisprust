@@ -2,7 +2,7 @@ use case_insensitive_hashmap::CaseInsensitiveHashMap;
 
 use crate::parser::{SExpression, Atom};
 
-use super::vp::{VirtualProgram, Instr, JumpCondition};
+use super::vp::{VirtualProgram, Instr, JumpCondition, FunctionHeader};
 
 macro_rules! binary_op {
     ($self:ident, $opcode:ident, $op:tt) => {
@@ -51,7 +51,8 @@ enum Value {
     Integer(i64),
     Float(f64),
     String(String),
-    List(Vec<Value>)
+    List(Vec<Value>),
+    FuncRef(FunctionHeader)
 }
 
 impl Value {
@@ -155,6 +156,12 @@ impl Vm {
                         _ => self.registers[opcode[1] as usize] = empty_value()
                     }
                 },
+                Ok(Instr::LoadFuncRef) => {
+                    let Some(header) = prog.read_function_header() else {
+                        break;
+                    };
+                    self.registers[opcode[1] as usize] = Value::FuncRef(header);
+                },
                 _ => break,
             }
         }
@@ -167,6 +174,7 @@ impl Vm {
             Value::Float(f) => Some(SExpression::Atom(Atom::Float(*f))),
             Value::String(s) => Some(SExpression::Atom(Atom::String(s.clone()))),
             Value::List(_) => todo!(),
+            Value::FuncRef(_) => todo!()
         }
     }
 }

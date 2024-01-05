@@ -6,8 +6,6 @@ mod instructions;
 mod expr_interpreter;
 mod vm;
 
-use crate::vm::compiler::*;
-
 use crate::vm::compiler::Compiler;
 use crate::vm::vm::Vm;
 

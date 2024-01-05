@@ -1,3 +1,5 @@
+use case_insensitive_hashmap::CaseInsensitiveHashMap;
+
 use crate::instructions::Instruction;
 use crate::parser::{SExpression, Atom};
 use std::io::Write;
@@ -5,7 +7,7 @@ use std::mem::size_of;
 use std::{fmt, io::Cursor};
 use std::error::Error;
 
-use super::vp::{VirtualProgram, Instr, OpCode, JumpCondition};
+use super::vp::{VirtualProgram, Instr, OpCode, JumpCondition, FunctionHeader};
 
 #[derive(Debug)]
 pub struct CompilationError {
@@ -105,16 +107,54 @@ impl BytecodeBuilder {
     }
 }
 
+struct CompilationScope {
+    last_used_reg: u8,
+    symbols: CaseInsensitiveHashMap<u8>
+}
+
 pub struct Compiler {
     bytecode: BytecodeBuilder,
     last_used_reg: u8,
+    symbols: CaseInsensitiveHashMap<u8>,
+
+    scope_stack: Vec<CompilationScope>
 }
 
 impl Compiler {
     const MAX_REG: u8 = 255;
 
     pub fn new() -> Compiler {
-        Compiler{bytecode: BytecodeBuilder::new(), last_used_reg: 0}
+        Compiler{bytecode: BytecodeBuilder::new(), last_used_reg: 0, symbols: CaseInsensitiveHashMap::new(), scope_stack: Vec::new()}
+    }
+
+    fn begin_scope(&mut self) {
+        let mut new_symbols = CaseInsensitiveHashMap::new();
+        std::mem::swap(&mut self.symbols, &mut new_symbols);
+        let current_scope = CompilationScope{last_used_reg: self.last_used_reg, symbols: new_symbols};
+        self.scope_stack.push(current_scope);
+        self.last_used_reg = 0;
+
+    }
+
+    fn end_scope(&mut self) {
+        if let Some(last_scope) = self.scope_stack.pop() {
+            self.last_used_reg = last_scope.last_used_reg;
+            self.symbols = last_scope.symbols;
+        }
+    }
+
+    fn find_or_alloc(&mut self, symbol: &str) -> Result<u8, CompilationError> {
+        if let Some(reg) = self.symbols.get(symbol) {
+            return Ok(*reg);
+        }
+        for scope in self.scope_stack.iter().rev() {
+            if let Some(reg) = scope.symbols.get(symbol) {
+                return Ok(*reg);
+            }
+        }
+        let reg = self.allocate_reg()?;
+        self.symbols.insert(symbol, reg);
+        Ok(reg)
     }
 
     fn allocate_reg(&mut self) -> Result<u8, CompilationError> {
@@ -188,7 +228,45 @@ impl Compiler {
                     }
                 }
             },
-            Instruction::Lambda => todo!(),
+            Instruction::Lambda => {
+                if args.len() < 2 {
+                    Err(CompilationError::from("Expected at least 2 arguments"))
+                }
+                else {
+                    self.begin_scope();
+                    let header_addr = self.bytecode.position();
+                    self.bytecode.store_value(&[0; std::mem::size_of::<FunctionHeader>()]);
+                    let symbols_before = self.symbols.len();
+                    //register parameters
+                    if let SExpression::List(arg_list) = &args[0] {
+                        for param in arg_list {
+                            if let SExpression::Symbol(sym) = param {
+                                self.find_or_alloc(sym.as_str())?;
+                            }
+                        }
+                    }
+
+                    let mut last_reg = 0;
+                    for expr in args.iter().skip(1) {
+                        last_reg = self.compile_expr(expr, &[])?;
+                        self.reset_reg(last_reg);
+                    }
+                    self.reset_reg(last_reg + 1); //keep the result reg of the last expression
+                    //add some ret instruction
+
+                    let header = FunctionHeader{register_count: (self.symbols.len() - symbols_before) as u8, result_reg: last_reg};
+                    self.bytecode.store_and_reset_pos(header_addr, header.as_u8_slice());
+
+                    self.end_scope();
+
+                    //the return of a compiled lambda is a function reference
+                    let reg = self.allocate_reg()?;
+                    self.bytecode.store_opcode(Instr::LoadFuncRef, reg, 0, 0);
+                    self.bytecode.store_value(&header_addr.to_le_bytes());
+
+                    Ok(reg)
+                }
+            },
             Instruction::If => {
                 if args.len() < 2 || args.len() > 3 {
                     Err(CompilationError::from("Expected 2 or 3 arguments"))
