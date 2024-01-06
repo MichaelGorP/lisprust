@@ -9,6 +9,7 @@ pub(super) enum Instr {
     LoadBool,
     LoadString,
     CopyReg,
+    SwapReg,
     //arithmetic
     Add,
     Sub,
@@ -49,6 +50,7 @@ impl TryFrom<u8> for Instr {
             x if x == Instr::LoadBool as u8 => Ok(Instr::LoadBool),
             x if x == Instr::LoadString as u8 => Ok(Instr::LoadString),
             x if x == Instr::CopyReg as u8 => Ok(Instr::CopyReg),
+            x if x == Instr::SwapReg as u8 => Ok(Instr::SwapReg),
             x if x == Instr::Add as u8 => Ok(Instr::Add),
             x if x == Instr::Sub as u8 => Ok(Instr::Sub),
             x if x == Instr::Mul as u8 => Ok(Instr::Mul),

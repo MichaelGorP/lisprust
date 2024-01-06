@@ -327,20 +327,27 @@ impl Compiler {
                     self.reset_reg(reg); //not needed after the check
                     let target_pos = self.bytecode.position();
                     self.bytecode.store_value(&[0; size_of::<i64>()]);
+                    //compile_expr might return an existing register, so no code is generated. But we need some code for now, so copy to a target register
+                    let target_reg = self.allocate_reg()?;
                     let ok_reg = self.compile_expr(&args[1], &[])?;
-                    self.reset_reg(ok_reg); //should be the same for the else branch then
+                    self.bytecode.store_opcode(Instr::CopyReg, target_reg, ok_reg, 0);
+                    self.reset_reg(target_reg + 1); //not needed, copied
                     //update jump target
-                    self.bytecode.store_and_reset_pos(target_pos, &self.bytecode.position().to_le_bytes());
+                    let mut false_jump_target = self.bytecode.position() - target_pos - std::mem::size_of::<i64>() as u64;
                     if args.len() == 3 {
                         //we have to jump past the else expression
                         self.bytecode.store_opcode(Instr::Jump, reg, JumpCondition::Jump as u8, 0);
                         let target_pos = self.bytecode.position();
                         self.bytecode.store_value(&[0; size_of::<i64>()]);
+                        false_jump_target += 4 + size_of::<i64>() as u64;
                         //compile else expression
-                        let _ = self.compile_expr(&args[2], &[])?; //should be the same as ok_reg
+                        let ok_reg = self.compile_expr(&args[2], &[])?;
+                        self.bytecode.store_opcode(Instr::CopyReg, target_reg, ok_reg, 0);
                         self.bytecode.store_and_reset_pos(target_pos, &(self.bytecode.position() - target_pos - std::mem::size_of::<i64>() as u64).to_le_bytes());
+                        self.reset_reg(target_reg + 1)
                     }
-                    Ok(ok_reg)
+                    self.bytecode.store_and_reset_pos(target_pos, &false_jump_target.to_le_bytes());
+                    Ok(target_reg)
                 }
             },
             Instruction::Not => {

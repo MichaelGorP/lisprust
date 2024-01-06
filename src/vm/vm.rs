@@ -125,6 +125,11 @@ impl Vm {
                 Ok(Instr::CopyReg) => {
                     self.registers[opcode[1] as usize + self.window_start] = self.registers[opcode[2] as usize + self.window_start].clone();
                 },
+                Ok(Instr::SwapReg) => {
+                    let src_reg = self.window_start + opcode[1] as usize;
+                    let target_reg = self.window_start + opcode[2] as usize;
+                    self.registers.swap(src_reg, target_reg);
+                },
                 Ok(Instr::Add) => binary_op!(self, opcode, +),
                 Ok(Instr::Sub) => binary_op!(self, opcode, -),
                 Ok(Instr::Mul) => binary_op!(self, opcode, *),
