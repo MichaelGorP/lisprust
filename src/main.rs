@@ -146,7 +146,7 @@ mod test {
 
     #[test]
     fn test_lambda() {
-        let res = parse_and_eval("(define square (lambda (x)
+        let res = parse_and_exec("(define square (lambda (x)
         (* x x)))
         (define five (lambda () 5))
         (+ 2 (square 4) (five))");

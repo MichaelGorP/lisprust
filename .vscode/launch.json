@@ -14,7 +14,7 @@
             "environment": [],
             "console": "integratedTerminal",
             "preLaunchTask": "rust: cargo build"
-        }
+        },
         {
             "type": "lldb",
             "request": "launch",

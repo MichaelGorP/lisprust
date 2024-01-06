@@ -144,17 +144,24 @@ impl Compiler {
     }
 
     fn find_or_alloc(&mut self, symbol: &str) -> Result<u8, CompilationError> {
-        if let Some(reg) = self.symbols.get(symbol) {
-            return Ok(*reg);
-        }
-        for scope in self.scope_stack.iter().rev() {
-            if let Some(reg) = scope.symbols.get(symbol) {
-                return Ok(*reg);
-            }
+        if let Some(reg) = self.find_symbol(symbol) {
+            return Ok(reg);
         }
         let reg = self.allocate_reg()?;
         self.symbols.insert(symbol, reg);
         Ok(reg)
+    }
+
+    fn find_symbol(&self, symbol: &str) -> Option<u8> {
+        if let Some(reg) = self.symbols.get(symbol) {
+            return Some(*reg);
+        }
+        for scope in self.scope_stack.iter().rev() {
+            if let Some(reg) = scope.symbols.get(symbol) {
+                return Some(*reg);
+            }
+        }
+        None
     }
 
     fn allocate_reg(&mut self) -> Result<u8, CompilationError> {
@@ -188,7 +195,17 @@ impl Compiler {
                 Ok(reg)
             },
             SExpression::BuiltIn(b) => self.compile_builtin(b, args),
-            SExpression::Symbol(_) => todo!(),
+            SExpression::Symbol(s) => {
+                let sym_reg;
+                if let Some(reg) = self.find_symbol(s.as_str()) {
+                    sym_reg = reg;
+                }
+                else {
+                    sym_reg = self.allocate_reg()?;
+                    self.bytecode.store_opcode(Instr::LoadGlobal, sym_reg, 0, 0);
+                }
+                Ok(sym_reg)
+            },
             SExpression::List(l) => self.compile_list(l),
             SExpression::Lambda(_) => todo!(),
         }
@@ -200,8 +217,35 @@ impl Compiler {
             match expr {
                 SExpression::Atom(_) => todo!(),
                 SExpression::BuiltIn(b) => self.compile_builtin(b, &list[1..]),
-                SExpression::Symbol(_) => todo!(),
-                SExpression::List(l) => self.compile_list(l),
+                SExpression::Symbol(s) => {
+                    let sym_reg; //register for symbol
+                    if let Some(reg) = self.find_symbol(s.as_str()) {
+                        sym_reg = reg;
+                    }
+                    else {
+                        sym_reg = self.allocate_reg()?;
+                        self.bytecode.store_opcode(Instr::LoadGlobal, sym_reg, 0, 0);
+                        self.bytecode.store_string(s);
+                    }
+
+                    //evaluate all other expressions as arguments
+                    let start_reg = self.last_used_reg;
+                    for expr in list.iter().skip(1) {
+                        self.compile_expr(expr, &[])?;
+                    }
+                    let result_reg = self.allocate_reg()?;
+                    self.bytecode.store_opcode(Instr::CallSymbol, sym_reg, start_reg, result_reg);
+                    Ok(result_reg)
+                },
+                SExpression::List(l) => {
+                    let ret = self.compile_list(l)?;
+                    if list.len() == 1 {
+                        Ok(ret)
+                    }
+                    else {
+                        self.compile_list(&list[1..])
+                    }
+                },
                 SExpression::Lambda(_) => todo!(),
             }
         }
@@ -233,6 +277,11 @@ impl Compiler {
                     Err(CompilationError::from("Expected at least 2 arguments"))
                 }
                 else {
+                    //jump past the lambda body
+                    self.bytecode.store_opcode(Instr::Jump, 0, JumpCondition::Jump as u8, 0);
+                    let jump_addr = self.bytecode.position();
+                    self.bytecode.store_value(&[0; std::mem::size_of::<i64>()]);
+
                     self.begin_scope();
                     let header_addr = self.bytecode.position();
                     self.bytecode.store_value(&[0; std::mem::size_of::<FunctionHeader>()]);
@@ -252,13 +301,14 @@ impl Compiler {
                         self.reset_reg(last_reg);
                     }
                     self.reset_reg(last_reg + 1); //keep the result reg of the last expression
-                    //add some ret instruction
+                    self.bytecode.store_opcode(Instr::Ret, 0, 0, 0);
 
-                    let header = FunctionHeader{register_count: (self.symbols.len() - symbols_before) as u8, result_reg: last_reg};
+                    let header = FunctionHeader{register_count: (self.symbols.len() + 1 - symbols_before) as u8, result_reg: last_reg};
                     self.bytecode.store_and_reset_pos(header_addr, header.as_u8_slice());
 
                     self.end_scope();
 
+                    self.bytecode.store_and_reset_pos(jump_addr, &(self.bytecode.position() - jump_addr - std::mem::size_of::<i64>() as u64).to_le_bytes());
                     //the return of a compiled lambda is a function reference
                     let reg = self.allocate_reg()?;
                     self.bytecode.store_opcode(Instr::LoadFuncRef, reg, 0, 0);
@@ -288,7 +338,7 @@ impl Compiler {
                         self.bytecode.store_value(&[0; size_of::<i64>()]);
                         //compile else expression
                         let _ = self.compile_expr(&args[2], &[])?; //should be the same as ok_reg
-                        self.bytecode.store_and_reset_pos(target_pos, &self.bytecode.position().to_le_bytes());
+                        self.bytecode.store_and_reset_pos(target_pos, &(self.bytecode.position() - target_pos - std::mem::size_of::<i64>() as u64).to_le_bytes());
                     }
                     Ok(ok_reg)
                 }

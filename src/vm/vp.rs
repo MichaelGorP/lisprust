@@ -1,4 +1,4 @@
-use std::{io::{Read, Cursor}, mem::size_of, ptr::read};
+use std::{io::{Read, Cursor}, mem::size_of};
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -26,7 +26,9 @@ pub(super) enum Instr {
     //definitions, symbols, and function handling
     Define,
     LoadGlobal,
-    LoadFuncRef
+    LoadFuncRef,
+    CallSymbol,
+    Ret
 }
 
 #[repr(u8)]
@@ -61,6 +63,8 @@ impl TryFrom<u8> for Instr {
             x if x == Instr::Define as u8 => Ok(Instr::Define),
             x if x == Instr::LoadGlobal as u8 => Ok(Instr::LoadGlobal),
             x if x == Instr::LoadFuncRef as u8 => Ok(Instr::LoadFuncRef),
+            x if x == Instr::CallSymbol as u8 => Ok(Instr::CallSymbol),
+            x if x == Instr::Ret as u8 => Ok(Instr::Ret),
             _ => Err(())
         }
     }
@@ -120,6 +124,10 @@ impl VirtualProgram {
         self.result_reg
     }
 
+    pub fn current_address(&self) -> u64 {
+        self.cursor.position()
+    }
+
     pub fn read_opcode(&mut self) -> Option<[u8; 4]> {
         let mut buffer = [0 as u8; 4];
         if let Ok(()) = self.cursor.read_exact(&mut buffer) {
@@ -165,12 +173,20 @@ impl VirtualProgram {
         return None;
     }
 
-    pub(super) fn read_function_header(&mut self) -> Option<FunctionHeader> {
-        Some(FunctionHeader::read(&mut self.cursor))
+    pub(super) fn read_function_header(&mut self, addr: u64) -> Option<FunctionHeader> {
+        let pos = self.cursor.position();
+        self.cursor.set_position(addr);
+        let header = FunctionHeader::read(&mut self.cursor);
+        self.cursor.set_position(pos);
+        Some(header)
     }
 
     pub fn jump(&mut self, distance: i64) {
         let pos = (self.cursor.position() as i64) + distance;
         self.cursor.set_position(pos as u64);
+    }
+
+    pub fn jump_to(&mut self, pos: u64) {
+        self.cursor.set_position(pos);
     }
 }

@@ -7,9 +7,9 @@ use super::vp::{VirtualProgram, Instr, JumpCondition, FunctionHeader};
 macro_rules! binary_op {
     ($self:ident, $opcode:ident, $op:tt) => {
         {
-            let r1 = &$self.registers[$opcode[2] as usize];
-            let r2 = &$self.registers[$opcode[3] as usize];
-            let res_reg = $opcode[1] as usize;
+            let r1 = &$self.registers[$opcode[2] as usize + $self.window_start];
+            let r2 = &$self.registers[$opcode[3] as usize + $self.window_start];
+            let res_reg = $opcode[1] as usize + $self.window_start;
             match (r1, r2) {
                 (Value::Integer(lhs), Value::Integer(rhs)) => $self.registers[res_reg] = Value::Integer(*lhs $op *rhs),
                 (Value::Integer(lhs), Value::Float(rhs)) => $self.registers[res_reg] = Value::Float(*lhs as f64 $op *rhs),
@@ -24,9 +24,9 @@ macro_rules! binary_op {
 macro_rules! comparison_op {
     ($self:ident, $opcode:ident, $op:tt) => {
         {
-            let r1 = &$self.registers[$opcode[2] as usize];
-            let r2 = &$self.registers[$opcode[3] as usize];
-            let res_reg = $opcode[1] as usize;
+            let r1 = &$self.registers[$opcode[2] as usize + $self.window_start];
+            let r2 = &$self.registers[$opcode[3] as usize + $self.window_start];
+            let res_reg = $opcode[1] as usize + $self.window_start;
             let matches = match (r1, r2) {
                 (Value::Integer(lhs), Value::Integer(rhs)) => *lhs $op *rhs,
                 (Value::Integer(lhs), Value::Float(rhs)) => (*lhs as f64) $op *rhs,
@@ -45,6 +45,12 @@ macro_rules! comparison_op {
 }
 
 #[derive(PartialEq, Clone, Debug)]
+struct FunctionData {
+    header: FunctionHeader,
+    address: u64
+}
+
+#[derive(PartialEq, Clone, Debug)]
 enum Value {
     Empty,
     Boolean(bool),
@@ -52,7 +58,7 @@ enum Value {
     Float(f64),
     String(String),
     List(Vec<Value>),
-    FuncRef(FunctionHeader)
+    FuncRef(FunctionData)
 }
 
 impl Value {
@@ -68,14 +74,23 @@ const fn empty_value() -> Value {
     Value::Empty
 }
 
+struct CallState {
+    window_start: usize,
+    result_reg: u8,
+    target_reg: u8,
+    return_addr: u64
+}
+
 pub struct Vm {
-    registers: [Value; 256]
+    registers: Vec<Value>,
+    call_states: Vec<CallState>,
+    window_start: usize
 }
 
 impl Vm {
     pub fn new() -> Vm {
         const EMPTY : Value = empty_value();
-        Vm {registers: [EMPTY; 256]}
+        Vm {registers: vec![EMPTY; 256], call_states: Vec::new(), window_start: 0}
     }
 
     pub fn run(&mut self, prog: &mut VirtualProgram) -> Option<SExpression> {
@@ -90,25 +105,25 @@ impl Vm {
                     let Some(val) = prog.read_int() else {
                         return None;
                     };
-                    self.registers[opcode[1] as usize] = Value::Integer(val);
+                    self.registers[opcode[1] as usize + self.window_start] = Value::Integer(val);
                 },
                 Ok(Instr::LoadFloat) => {
                     let Some(val) = prog.read_float() else {
                         return None;
                     };
-                    self.registers[opcode[1] as usize] = Value::Float(val);
+                    self.registers[opcode[1] as usize + self.window_start] = Value::Float(val);
                 },
                 Ok(Instr::LoadBool) => {
-                    self.registers[opcode[1] as usize] = Value::Boolean(opcode[2] != 0);
+                    self.registers[opcode[1] as usize + self.window_start] = Value::Boolean(opcode[2] != 0);
                 },
                 Ok(Instr::LoadString) => {
                     let Some(val) = prog.read_string() else {
                         return None;
                     };
-                    self.registers[opcode[1] as usize] = Value::String(val);
+                    self.registers[opcode[1] as usize + self.window_start] = Value::String(val);
                 },
                 Ok(Instr::CopyReg) => {
-                    self.registers[opcode[1] as usize] = self.registers[opcode[2] as usize].clone();
+                    self.registers[opcode[1] as usize + self.window_start] = self.registers[opcode[2] as usize + self.window_start].clone();
                 },
                 Ok(Instr::Add) => binary_op!(self, opcode, +),
                 Ok(Instr::Sub) => binary_op!(self, opcode, -),
@@ -120,9 +135,9 @@ impl Vm {
                 Ok(Instr::Leq) => comparison_op!(self, opcode, <=),
                 Ok(Instr::Geq) => comparison_op!(self, opcode, >=),
                 Ok(Instr::Not) => {
-                    let value = &self.registers[opcode[2] as usize];
+                    let value = &self.registers[opcode[2] as usize + self.window_start];
                     match value {
-                        Value::Boolean(b) => self.registers[opcode[1] as usize] = Value::Boolean(!*b),
+                        Value::Boolean(b) => self.registers[opcode[1] as usize + self.window_start] = Value::Boolean(!*b),
                         _ => self.registers[opcode[1] as usize] = Value::Boolean(false)
                     }
                 }
@@ -135,7 +150,7 @@ impl Vm {
                         continue;
                     }
                     //everything that is not false, is true
-                    let check = self.registers[opcode[1] as usize].is_true();
+                    let check = self.registers[opcode[1] as usize + self.window_start].is_true();
                     if (check && opcode[2] == JumpCondition::JumpTrue as u8) || (!check && opcode[2] == JumpCondition::JumpFalse as u8) {
                         prog.jump(distance);
                     }
@@ -144,7 +159,7 @@ impl Vm {
                     let Some(sym_name) = prog.read_string() else {
                         break;
                     };
-                    global_vars.insert(sym_name, self.registers[opcode[1] as usize].clone());
+                    global_vars.insert(sym_name, self.registers[opcode[1] as usize + self.window_start].clone());
                 },
                 Ok(Instr::LoadGlobal) => {
                     let Some(sym_name) = prog.read_string() else {
@@ -152,22 +167,55 @@ impl Vm {
                     };
                     let value = global_vars.get(sym_name);
                     match value {
-                        Some(v) => self.registers[opcode[1] as usize] = v.clone(),
-                        _ => self.registers[opcode[1] as usize] = empty_value()
+                        Some(v) => self.registers[opcode[1] as usize + self.window_start] = v.clone(),
+                        _ => self.registers[opcode[1] as usize + self.window_start] = empty_value()
                     }
                 },
                 Ok(Instr::LoadFuncRef) => {
-                    let Some(header) = prog.read_function_header() else {
+                    let Some(header_addr) = prog.read_int() else {
                         break;
                     };
-                    self.registers[opcode[1] as usize] = Value::FuncRef(header);
+                    let Some(header) = prog.read_function_header(header_addr as u64) else {
+                        break;
+                    };
+                    let func_addr = header_addr as usize + std::mem::size_of::<FunctionHeader>();
+                    self.registers[opcode[1] as usize + self.window_start] = Value::FuncRef(FunctionData{header, address: func_addr as u64});
+                },
+                Ok(Instr::CallSymbol) => {
+                    let Value::FuncRef(func) = &self.registers[opcode[1] as usize + self.window_start] else {
+                        break;
+                    };
+
+                    let func = func.clone(); //because of possible resize
+                    let param_start = opcode[2];
+                    if (param_start + func.header.register_count) as usize > self.registers.len() {
+                        self.registers.resize((param_start + func.header.register_count) as usize, empty_value());
+                    }
+                    let state = CallState{window_start: self.window_start, result_reg: func.header.result_reg, target_reg: opcode[3], return_addr: prog.current_address()};
+                    self.call_states.push(state);
+                    self.window_start += param_start as usize;
+                    prog.jump_to(func.address);
+                },
+                Ok(Instr::Ret) => {
+                    let Some(state) = self.call_states.pop() else {
+                        break; //nothing to return from
+                    };
+                    let source_reg = self.window_start + state.result_reg as usize;
+                    let target_reg = state.window_start + state.target_reg as usize;
+                    self.registers.swap(source_reg, target_reg);
+                    self.window_start = state.window_start;
+                    prog.jump_to(state.return_addr);
                 },
                 _ => break,
             }
         }
 
+        //cleanup
+        self.registers.truncate(256);
+        self.registers.shrink_to_fit();
+
         //convert result
-        match &self.registers[prog.get_result_reg() as usize] {
+        match &self.registers[prog.get_result_reg() as usize + self.window_start] {
             Value::Empty => None,
             Value::Boolean(b) => Some(SExpression::Atom(Atom::Boolean(*b))),
             Value::Integer(i) => Some(SExpression::Atom(Atom::Integer(*i))),
