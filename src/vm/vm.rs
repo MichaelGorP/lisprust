@@ -1,4 +1,4 @@
-use case_insensitive_hashmap::CaseInsensitiveHashMap;
+use std::collections::HashMap;
 
 use crate::parser::{SExpression, Atom};
 
@@ -94,7 +94,7 @@ impl Vm {
     }
 
     pub fn run(&mut self, prog: &mut VirtualProgram) -> Option<SExpression> {
-        let mut global_vars = CaseInsensitiveHashMap::new();
+        let mut global_vars = HashMap::new();
 
         loop {
             let Some(opcode) = prog.read_opcode() else {
@@ -161,16 +161,16 @@ impl Vm {
                     }
                 },
                 Ok(Instr::Define) => {
-                    let Some(sym_name) = prog.read_string() else {
+                    let Some(sym_id) = prog.read_int() else {
                         break;
                     };
-                    global_vars.insert(sym_name, self.registers[opcode[1] as usize + self.window_start].clone());
+                    global_vars.insert(sym_id, self.registers[opcode[1] as usize + self.window_start].clone());
                 },
                 Ok(Instr::LoadGlobal) => {
-                    let Some(sym_name) = prog.read_string() else {
+                    let Some(sym_id) = prog.read_int() else {
                         break;
                     };
-                    let value = global_vars.get(sym_name);
+                    let value = global_vars.get(&sym_id);
                     match value {
                         Some(v) => self.registers[opcode[1] as usize + self.window_start] = v.clone(),
                         _ => self.registers[opcode[1] as usize + self.window_start] = empty_value()

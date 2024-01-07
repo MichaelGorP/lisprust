@@ -123,12 +123,27 @@ struct CompilationScope {
     symbols: CaseInsensitiveHashMap<u8>
 }
 
+struct SymbolInterner {
+    lookup: CaseInsensitiveHashMap<i64>,
+    last_id: i64
+}
+
+impl SymbolInterner {
+    fn new() -> SymbolInterner {
+        SymbolInterner{lookup: CaseInsensitiveHashMap::new(), last_id: 0}
+    }
+
+    fn get_or_intern(&mut self, symbol: &str) -> i64 {
+        *self.lookup.entry(symbol).or_insert_with(|| { self.last_id += 1; self.last_id })
+    }
+}
+
 pub struct Compiler {
     bytecode: BytecodeBuilder,
     last_used_reg: u8,
     fixed_registers: u8,
     symbols: CaseInsensitiveHashMap<u8>,
-
+    interner: SymbolInterner, //for global symbols
     scope_stack: Vec<CompilationScope>
 }
 
@@ -136,7 +151,7 @@ impl Compiler {
     const MAX_REG: u8 = 255;
 
     pub fn new() -> Compiler {
-        Compiler{bytecode: BytecodeBuilder::new(), last_used_reg: 0, fixed_registers: 0, symbols: CaseInsensitiveHashMap::new(), scope_stack: Vec::new()}
+        Compiler{bytecode: BytecodeBuilder::new(), last_used_reg: 0, fixed_registers: 0, symbols: CaseInsensitiveHashMap::new(), interner: SymbolInterner::new(), scope_stack: Vec::new()}
     }
 
     fn begin_scope(&mut self) {
@@ -217,7 +232,9 @@ impl Compiler {
                 }
                 else {
                     sym_reg = self.allocate_reg()?;
+                    let symbol_id = self.interner.get_or_intern(s);
                     self.bytecode.store_opcode(Instr::LoadGlobal, sym_reg, 0, 0);
+                    self.bytecode.store_value(&symbol_id.to_le_bytes());
                 }
                 Ok(sym_reg)
             },
@@ -240,8 +257,9 @@ impl Compiler {
                     }
                     else {
                         sym_reg = self.allocate_reg()?;
+                        let symbol_id = self.interner.get_or_intern(s);
                         self.bytecode.store_opcode(Instr::LoadGlobal, sym_reg, 0, 0);
-                        self.bytecode.store_string(s);
+                        self.bytecode.store_value(&symbol_id.to_le_bytes());
                     }
 
                     //evaluate all other expressions as arguments
@@ -285,7 +303,8 @@ impl Compiler {
                     if let SExpression::Symbol(sym) = &args[0] {
                         let reg = self.compile_expr(&args[1], &[])?;
                         self.bytecode.store_opcode(Instr::Define, reg, 0, 0);
-                        self.bytecode.store_string(sym);
+                        let symbol_id = self.interner.get_or_intern(sym);
+                        self.bytecode.store_value(&symbol_id.to_le_bytes());
                         Ok(reg)
                     }
                     else {
