@@ -24,19 +24,18 @@ fn main() {
      (tak (- z 1) x y)))))
 
     (tak 30 12 6)").unwrap_or(vec![]);
-    println!("{}", tokens.len());
 
     let parser = parser::Parser::new();
     let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(parser::Atom::Boolean(false)), 0));
-    println!("{}", list.1);
 
+    /*
     let interpreter = Interpreter::new();
     let res = interpreter.execute(&list.0);
     if let Ok(SExpression::Atom(lit)) = res {
         println!("Result: {}", lit);
     }
+    */
 
-    //to get rid of unused warnings for now
     let mut compiler = Compiler::new();
     let Ok(mut prog) = compiler.compile(&list.0) else {
         return;

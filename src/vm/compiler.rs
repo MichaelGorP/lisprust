@@ -52,22 +52,26 @@ impl BytecodeBuilder {
             Atom::Boolean(b) => {
                 let opcode = OpCode::new(Instr::LoadBool, reg, *b as u8, 0);
                 let _ = self.cursor.write(&opcode.get_data());
+                //println!("{} {}, {}", Instr::LoadBool, reg, *b);
             },
             Atom::Integer(i) => {
                 let opcode = OpCode::new_dest(Instr::LoadInt, reg);
                 let _ = self.cursor.write(&opcode.get_data());
                 let _ = self.cursor.write(&i.to_le_bytes());
+                //println!("{} {}, {}", Instr::LoadInt, reg, *i);
             }
             Atom::Float(f) => {
                 let opcode = OpCode::new_dest(Instr::LoadFloat, reg);
                 let _ = self.cursor.write(&opcode.get_data());
                 let _ = self.cursor.write(&f.to_le_bytes());
+                //println!("{} {}, {}", Instr::LoadFloat, reg, *f);
             },
             Atom::String(s) => {
-                let opcode = OpCode::new_dest(Instr::LoadFloat, reg);
+                let opcode = OpCode::new_dest(Instr::LoadString, reg);
                 let _ = self.cursor.write(&opcode.get_data());
                 let _ = self.cursor.write(&s.len().to_le_bytes());
                 let _ = self.cursor.write(s.as_bytes());
+                //println!("{} {}, {}", Instr::LoadString, reg, s);
             },
         }
     }
@@ -75,10 +79,14 @@ impl BytecodeBuilder {
     fn store_opcode(&mut self, instr: Instr, dest_reg: u8, r1: u8, r2: u8) {
         let opcode = [instr as u8, dest_reg, r1, r2];
         let _ = self.cursor.write(&opcode);
+
+        //println!("{} {}, {}, {}", instr, dest_reg, r1, r2);
     }
 
     fn store_value(&mut self, val: &[u8]) {
         let _ = self.cursor.write(&val);
+
+        //println!("[data; {}]", val.len());
     }
 
     fn store_at(&mut self, pos: u64, val: &[u8]) {
@@ -96,6 +104,8 @@ impl BytecodeBuilder {
     fn store_string(&mut self, val: &str) {
         let _ = self.cursor.write(&val.len().to_le_bytes());
         let _ = self.cursor.write(val.as_bytes());
+
+        //println!("[string: {}]", val);
     }
 
     fn position(&self) -> u64 {
@@ -109,12 +119,14 @@ impl BytecodeBuilder {
 
 struct CompilationScope {
     last_used_reg: u8,
+    fixed_registers: u8,
     symbols: CaseInsensitiveHashMap<u8>
 }
 
 pub struct Compiler {
     bytecode: BytecodeBuilder,
     last_used_reg: u8,
+    fixed_registers: u8,
     symbols: CaseInsensitiveHashMap<u8>,
 
     scope_stack: Vec<CompilationScope>
@@ -124,13 +136,13 @@ impl Compiler {
     const MAX_REG: u8 = 255;
 
     pub fn new() -> Compiler {
-        Compiler{bytecode: BytecodeBuilder::new(), last_used_reg: 0, symbols: CaseInsensitiveHashMap::new(), scope_stack: Vec::new()}
+        Compiler{bytecode: BytecodeBuilder::new(), last_used_reg: 0, fixed_registers: 0, symbols: CaseInsensitiveHashMap::new(), scope_stack: Vec::new()}
     }
 
     fn begin_scope(&mut self) {
         let mut new_symbols = CaseInsensitiveHashMap::new();
         std::mem::swap(&mut self.symbols, &mut new_symbols);
-        let current_scope = CompilationScope{last_used_reg: self.last_used_reg, symbols: new_symbols};
+        let current_scope = CompilationScope{last_used_reg: self.last_used_reg, fixed_registers: self.fixed_registers, symbols: new_symbols};
         self.scope_stack.push(current_scope);
         self.last_used_reg = 0;
 
@@ -139,6 +151,7 @@ impl Compiler {
     fn end_scope(&mut self) {
         if let Some(last_scope) = self.scope_stack.pop() {
             self.last_used_reg = last_scope.last_used_reg;
+            self.fixed_registers = last_scope.fixed_registers;
             self.symbols = last_scope.symbols;
         }
     }
@@ -176,7 +189,9 @@ impl Compiler {
     }
 
     fn reset_reg(&mut self, reg: u8) {
-        self.last_used_reg = reg;
+        if reg >= self.fixed_registers {
+            self.last_used_reg = reg;
+        }
     }
 
     pub fn compile(&mut self, root: &SExpression) -> Result<VirtualProgram, CompilationError> {
@@ -218,6 +233,7 @@ impl Compiler {
                 SExpression::Atom(_) => todo!(),
                 SExpression::BuiltIn(b) => self.compile_builtin(b, &list[1..]),
                 SExpression::Symbol(s) => {
+                    let result_reg = self.allocate_reg()?;
                     let sym_reg; //register for symbol
                     if let Some(reg) = self.find_symbol(s.as_str()) {
                         sym_reg = reg;
@@ -231,10 +247,15 @@ impl Compiler {
                     //evaluate all other expressions as arguments
                     let start_reg = self.last_used_reg;
                     for expr in list.iter().skip(1) {
-                        self.compile_expr(expr, &[])?;
+                        let reg = self.compile_expr(expr, &[])?;
+                        //hack: copy parameters into new registers
+                        if reg <= self.fixed_registers {
+                            let target_reg = self.allocate_reg()?;
+                            self.bytecode.store_opcode(Instr::CopyReg, target_reg, reg, 0);
+                        }
                     }
-                    let result_reg = self.allocate_reg()?;
                     self.bytecode.store_opcode(Instr::CallSymbol, sym_reg, start_reg, result_reg);
+                    self.reset_reg(result_reg + 1);
                     Ok(result_reg)
                 },
                 SExpression::List(l) => {
@@ -294,6 +315,9 @@ impl Compiler {
                             }
                         }
                     }
+                    let used_registers = (self.symbols.len() + 1 - symbols_before) as u8;
+                    self.fixed_registers = used_registers;
+                    self.last_used_reg = self.fixed_registers;
 
                     let mut last_reg = 0;
                     for expr in args.iter().skip(1) {
@@ -303,7 +327,7 @@ impl Compiler {
                     self.reset_reg(last_reg + 1); //keep the result reg of the last expression
                     self.bytecode.store_opcode(Instr::Ret, 0, 0, 0);
 
-                    let header = FunctionHeader{register_count: (self.symbols.len() + 1 - symbols_before) as u8, result_reg: last_reg};
+                    let header = FunctionHeader{register_count: used_registers + 20, result_reg: last_reg};
                     self.bytecode.store_and_reset_pos(header_addr, header.as_u8_slice());
 
                     self.end_scope();
@@ -449,11 +473,13 @@ impl Compiler {
 
     fn compile_binary_op(&mut self, args: &[SExpression], instr: Instr) -> Result<u8, CompilationError> {
         if args.len() >= 2 {
-            let result_reg = self.compile_expr(&args[0], &[])?;
+            let result_reg = self.allocate_reg()?;
+            let mut r1 = self.compile_expr(&args[0], &[])?;
             for i in 1..args.len() {
                 let rnext = self.compile_expr(&args[i], &[])?;
-                self.bytecode.store_opcode(instr, result_reg, result_reg, rnext);
+                self.bytecode.store_opcode(instr, result_reg, r1, rnext);
                 self.reset_reg(result_reg + 1);
+                r1 = result_reg;
             }
             self.reset_reg(result_reg + 1);
             Ok(result_reg)

@@ -1,7 +1,9 @@
 use std::{io::{Read, Cursor}, mem::size_of};
 
+use enum_display::EnumDisplay;
+
 #[repr(u8)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, EnumDisplay)]
 pub(super) enum Instr {
     //register handling
     LoadInt,

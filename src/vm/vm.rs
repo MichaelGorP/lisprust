@@ -193,8 +193,9 @@ impl Vm {
 
                     let func = func.clone(); //because of possible resize
                     let param_start = opcode[2];
-                    if (param_start + func.header.register_count) as usize > self.registers.len() {
-                        self.registers.resize((param_start + func.header.register_count) as usize, empty_value());
+                    let size = param_start as usize + func.header.register_count as usize + self.window_start;
+                    if size >= self.registers.len() {
+                        self.registers.resize(size, empty_value());
                     }
                     let state = CallState{window_start: self.window_start, result_reg: func.header.result_reg, target_reg: opcode[3], return_addr: prog.current_address()};
                     self.call_states.push(state);
