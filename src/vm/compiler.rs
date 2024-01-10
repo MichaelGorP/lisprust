@@ -119,6 +119,7 @@ impl BytecodeBuilder {
 
 struct CompilationScope {
     last_used_reg: u8,
+    max_used_registers: u8,
     fixed_registers: u8,
     symbols: CaseInsensitiveHashMap<u8>
 }
@@ -142,6 +143,7 @@ pub struct Compiler {
     bytecode: BytecodeBuilder,
     last_used_reg: u8,
     fixed_registers: u8,
+    max_used_registers: u8,
     symbols: CaseInsensitiveHashMap<u8>,
     interner: SymbolInterner, //for global symbols
     scope_stack: Vec<CompilationScope>
@@ -151,22 +153,23 @@ impl Compiler {
     const MAX_REG: u8 = 255;
 
     pub fn new() -> Compiler {
-        Compiler{bytecode: BytecodeBuilder::new(), last_used_reg: 0, fixed_registers: 0, symbols: CaseInsensitiveHashMap::new(), interner: SymbolInterner::new(), scope_stack: Vec::new()}
+        Compiler{bytecode: BytecodeBuilder::new(), last_used_reg: 0, fixed_registers: 0, max_used_registers: 0, symbols: CaseInsensitiveHashMap::new(), interner: SymbolInterner::new(), scope_stack: Vec::new()}
     }
 
     fn begin_scope(&mut self) {
         let mut new_symbols = CaseInsensitiveHashMap::new();
         std::mem::swap(&mut self.symbols, &mut new_symbols);
-        let current_scope = CompilationScope{last_used_reg: self.last_used_reg, fixed_registers: self.fixed_registers, symbols: new_symbols};
+        let current_scope = CompilationScope{last_used_reg: self.last_used_reg, fixed_registers: self.fixed_registers, max_used_registers: self.max_used_registers, symbols: new_symbols};
         self.scope_stack.push(current_scope);
         self.last_used_reg = 0;
-
+        self.max_used_registers = 0;
     }
 
     fn end_scope(&mut self) {
         if let Some(last_scope) = self.scope_stack.pop() {
             self.last_used_reg = last_scope.last_used_reg;
             self.fixed_registers = last_scope.fixed_registers;
+            self.max_used_registers = last_scope.max_used_registers;
             self.symbols = last_scope.symbols;
         }
     }
@@ -196,6 +199,7 @@ impl Compiler {
         if self.last_used_reg < Compiler::MAX_REG {
             let reg = self.last_used_reg;
             self.last_used_reg += 1;
+            self.max_used_registers = std::cmp::max(self.max_used_registers, self.last_used_reg);
             Ok(reg)
         }
         else {
@@ -346,7 +350,7 @@ impl Compiler {
                     self.reset_reg(last_reg + 1); //keep the result reg of the last expression
                     self.bytecode.store_opcode(Instr::Ret, 0, 0, 0);
 
-                    let header = FunctionHeader{register_count: used_registers + 20, result_reg: last_reg};
+                    let header = FunctionHeader{register_count: self.max_used_registers, result_reg: last_reg};
                     self.bytecode.store_and_reset_pos(header_addr, header.as_u8_slice());
 
                     self.end_scope();
