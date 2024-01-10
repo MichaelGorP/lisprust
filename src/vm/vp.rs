@@ -19,6 +19,7 @@ pub(super) enum Instr {
     Div,
     //comparisons
     Eq,
+    Neq,
     Lt,
     Gt,
     Leq,
@@ -58,6 +59,7 @@ impl TryFrom<u8> for Instr {
             x if x == Instr::Mul as u8 => Ok(Instr::Mul),
             x if x == Instr::Div as u8 => Ok(Instr::Div),
             x if x == Instr::Eq as u8 => Ok(Instr::Eq),
+            x if x == Instr::Neq as u8 => Ok(Instr::Neq),
             x if x == Instr::Lt as u8 => Ok(Instr::Lt),
             x if x == Instr::Gt as u8 => Ok(Instr::Gt),
             x if x == Instr::Leq as u8 => Ok(Instr::Leq),

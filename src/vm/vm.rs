@@ -157,6 +157,7 @@ impl Vm {
                 Ok(Instr::Mul) => binary_op!(self, opcode, *),
                 Ok(Instr::Div) => binary_op!(self, opcode, /),
                 Ok(Instr::Eq) => comparison_op!(self, opcode, prog, ==),
+                Ok(Instr::Neq) => comparison_op!(self, opcode, prog, !=),
                 Ok(Instr::Lt) => comparison_op!(self, opcode, prog, <),
                 Ok(Instr::Gt) => comparison_op!(self, opcode, prog, >),
                 Ok(Instr::Leq) => comparison_op!(self, opcode, prog, <=),

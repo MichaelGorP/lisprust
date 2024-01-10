@@ -402,9 +402,37 @@ impl Compiler {
                     Err(CompilationError::from("Expected 1 argument"))
                 }
                 else {
-                    let reg = self.compile_expr(&args[0], &[])?;
-                    self.bytecode.store_opcode(Instr::Not, reg, reg, 0);
-                    Ok(reg)
+                    //try to optimize check into one comparison
+                    let inverted = match &args[0] {
+                        SExpression::List(list) if !list.is_empty() => {
+                            match &list[0] {
+                                SExpression::BuiltIn(b) => {
+                                    match b {
+                                        Instruction::Eq => Some(Instr::Neq),
+                                        Instruction::Lt => Some(Instr::Geq),
+                                        Instruction::Gt => Some(Instr::Leq),
+                                        Instruction::Leq => Some(Instr::Gt),
+                                        Instruction::Geq => Some(Instr::Lt),
+                                        _ => None
+                                    }
+                                },
+                                _ => None
+                            }
+                        },
+                        _ => None
+                    };
+
+                    if let Some(instr) = inverted {
+                        let SExpression::List(list) = &args[0] else {
+                            return Err(CompilationError::from("Expected a list")); //cannot happen, checked above
+                        };
+                        self.compile_comparison_op(&list[1..], instr)
+                    }
+                    else {
+                        let reg = self.compile_expr(&args[0], &[])?;
+                        self.bytecode.store_opcode(Instr::Not, reg, reg, 0);
+                        Ok(reg)
+                    }
                 }
             },
             Instruction::And => {
