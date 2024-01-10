@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::parser::{SExpression, Atom};
 
-use super::vp::{VirtualProgram, Instr, JumpCondition, FunctionHeader};
+use super::vp::{VirtualProgram, Instr, JumpCondition, FunctionHeader, OpCode};
 
 macro_rules! binary_op {
     ($self:ident, $opcode:ident, $op:tt) => {
@@ -22,7 +22,7 @@ macro_rules! binary_op {
 }
 
 macro_rules! comparison_op {
-    ($self:ident, $opcode:ident, $op:tt) => {
+    ($self:ident, $opcode:ident, $prog:ident, $op:tt) => {
         {
             let r1 = &$self.registers[$opcode[2] as usize + $self.window_start];
             let r2 = &$self.registers[$opcode[3] as usize + $self.window_start];
@@ -39,6 +39,28 @@ macro_rules! comparison_op {
                 if (b && !matches) {
                     $self.registers[res_reg] = Value::Boolean(matches);
                 }
+            }
+
+            //try if the next instruction is a jump
+            let Some(opcode) = $prog.read_opcode() else {
+                break;
+            };
+            if let Ok(Instr::Jump) = opcode[0].try_into() {
+                let Some(distance) = $prog.read_int() else {
+                    break;
+                };
+                if opcode[2] == JumpCondition::Jump as u8 {
+                    $prog.jump(distance);
+                    continue;
+                }
+                //everything that is not false, is true
+                let check = $self.registers[opcode[1] as usize + $self.window_start].is_true();
+                if (check && opcode[2] == JumpCondition::JumpTrue as u8) || (!check && opcode[2] == JumpCondition::JumpFalse as u8) {
+                    $prog.jump(distance);
+                }
+            }
+            else {
+                $prog.jump(-4);
             }
         }
     };
@@ -134,16 +156,38 @@ impl Vm {
                 Ok(Instr::Sub) => binary_op!(self, opcode, -),
                 Ok(Instr::Mul) => binary_op!(self, opcode, *),
                 Ok(Instr::Div) => binary_op!(self, opcode, /),
-                Ok(Instr::Eq) => comparison_op!(self, opcode, ==),
-                Ok(Instr::Lt) => comparison_op!(self, opcode, <),
-                Ok(Instr::Gt) => comparison_op!(self, opcode, >),
-                Ok(Instr::Leq) => comparison_op!(self, opcode, <=),
-                Ok(Instr::Geq) => comparison_op!(self, opcode, >=),
+                Ok(Instr::Eq) => comparison_op!(self, opcode, prog, ==),
+                Ok(Instr::Lt) => comparison_op!(self, opcode, prog, <),
+                Ok(Instr::Gt) => comparison_op!(self, opcode, prog, >),
+                Ok(Instr::Leq) => comparison_op!(self, opcode, prog, <=),
+                Ok(Instr::Geq) => comparison_op!(self, opcode, prog, >=),
                 Ok(Instr::Not) => {
                     let value = &self.registers[opcode[2] as usize + self.window_start];
                     match value {
                         Value::Boolean(b) => self.registers[opcode[1] as usize + self.window_start] = Value::Boolean(!*b),
                         _ => self.registers[opcode[1] as usize] = Value::Boolean(false)
+                    };
+
+                    //try if the next instruction is a jump
+                    let Some(opcode) = prog.read_opcode() else {
+                        break;
+                    };
+                    if let Ok(Instr::Jump) = opcode[0].try_into() {
+                        let Some(distance) = prog.read_int() else {
+                            break;
+                        };
+                        if opcode[2] == JumpCondition::Jump as u8 {
+                            prog.jump(distance);
+                            continue;
+                        }
+                        //everything that is not false, is true
+                        let check = self.registers[opcode[1] as usize + self.window_start].is_true();
+                        if (check && opcode[2] == JumpCondition::JumpTrue as u8) || (!check && opcode[2] == JumpCondition::JumpFalse as u8) {
+                            prog.jump(distance);
+                        }
+                    }
+                    else {
+                        prog.jump(-4);
                     }
                 }
                 Ok(Instr::Jump) => {
