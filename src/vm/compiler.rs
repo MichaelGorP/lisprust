@@ -39,12 +39,14 @@ impl From<fmt::Error> for CompilationError {
 }
 
 struct BytecodeBuilder {
-    cursor: Cursor<Vec<u8>>
+    cursor: Cursor<Vec<u8>>,
+    listing: String,
+    generate_asm: bool
 }
 
 impl BytecodeBuilder {
-    fn new() -> BytecodeBuilder {
-        BytecodeBuilder{cursor: Cursor::new(vec![])}
+    fn new(generate_asm: bool) -> BytecodeBuilder {
+        BytecodeBuilder{cursor: Cursor::new(vec![]), listing: String::new(), generate_asm}
     }
 
     fn load_atom(&mut self, atom: &Atom, reg: u8) {
@@ -52,26 +54,38 @@ impl BytecodeBuilder {
             Atom::Boolean(b) => {
                 let opcode = OpCode::new(Instr::LoadBool, reg, *b as u8, 0);
                 let _ = self.cursor.write(&opcode.get_data());
-                //println!("{} {}, {}", Instr::LoadBool, reg, *b);
+
+                if self.generate_asm {
+                    self.listing += &format!("{} {}, {}\n", Instr::LoadBool, reg, *b);
+                }
             },
             Atom::Integer(i) => {
                 let opcode = OpCode::new_dest(Instr::LoadInt, reg);
                 let _ = self.cursor.write(&opcode.get_data());
                 let _ = self.cursor.write(&i.to_le_bytes());
-                //println!("{} {}, {}", Instr::LoadInt, reg, *i);
+
+                if self.generate_asm {
+                    self.listing += &format!("{} {}, {}\n", Instr::LoadInt, reg, *i);
+                }
             }
             Atom::Float(f) => {
                 let opcode = OpCode::new_dest(Instr::LoadFloat, reg);
                 let _ = self.cursor.write(&opcode.get_data());
                 let _ = self.cursor.write(&f.to_le_bytes());
-                //println!("{} {}, {}", Instr::LoadFloat, reg, *f);
+                
+                if self.generate_asm {
+                    self.listing += &format!("{} {}, {}\n", Instr::LoadFloat, reg, *f);
+                }
             },
             Atom::String(s) => {
                 let opcode = OpCode::new_dest(Instr::LoadString, reg);
                 let _ = self.cursor.write(&opcode.get_data());
                 let _ = self.cursor.write(&s.len().to_le_bytes());
                 let _ = self.cursor.write(s.as_bytes());
-                //println!("{} {}, {}", Instr::LoadString, reg, s);
+
+                if self.generate_asm {
+                    self.listing += &format!("{} {}, {}\n", Instr::LoadString, reg, s);
+                }
             },
         }
     }
@@ -80,13 +94,17 @@ impl BytecodeBuilder {
         let opcode = [instr as u8, dest_reg, r1, r2];
         let _ = self.cursor.write(&opcode);
 
-        //println!("{} {}, {}, {}", instr, dest_reg, r1, r2);
+        if self.generate_asm {
+            self.listing += &format!("{} {}, {}, {}\n", instr, dest_reg, r1, r2);
+        }
     }
 
     fn store_value(&mut self, val: &[u8]) {
         let _ = self.cursor.write(&val);
 
-        //println!("[data; {}]", val.len());
+        if self.generate_asm {
+            self.listing += &format!("[data; {}]", val.len());
+        }
     }
 
     fn store_at(&mut self, pos: u64, val: &[u8]) {
@@ -140,6 +158,7 @@ impl SymbolInterner {
 }
 
 pub struct Compiler {
+    generate_asm: bool,
     bytecode: BytecodeBuilder,
     last_used_reg: u8,
     fixed_registers: u8,
@@ -152,8 +171,8 @@ pub struct Compiler {
 impl Compiler {
     const MAX_REG: u8 = 255;
 
-    pub fn new() -> Compiler {
-        Compiler{bytecode: BytecodeBuilder::new(), last_used_reg: 0, fixed_registers: 0, max_used_registers: 0, symbols: CaseInsensitiveHashMap::new(), interner: SymbolInterner::new(), scope_stack: Vec::new()}
+    pub fn new(generate_asm: bool) -> Compiler {
+        Compiler{generate_asm, bytecode: BytecodeBuilder::new(generate_asm), last_used_reg: 0, fixed_registers: 0, max_used_registers: 0, symbols: CaseInsensitiveHashMap::new(), interner: SymbolInterner::new(), scope_stack: Vec::new()}
     }
 
     fn begin_scope(&mut self) {
@@ -215,9 +234,9 @@ impl Compiler {
 
     pub fn compile(&mut self, root: &SExpression) -> Result<VirtualProgram, CompilationError> {
         let reg = self.compile_expr(root, &[], false)?;
-        let mut new_builder = BytecodeBuilder::new();
+        let mut new_builder = BytecodeBuilder::new(self.generate_asm);
         std::mem::swap(&mut self.bytecode, &mut new_builder);
-        let prog = VirtualProgram::new(new_builder.cursor.into_inner(), reg);
+        let prog = VirtualProgram::new(new_builder.listing, new_builder.cursor.into_inner(), reg);
         Ok(prog)
     }
 

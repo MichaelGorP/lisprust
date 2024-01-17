@@ -118,26 +118,31 @@ impl FunctionHeader {
 }
 
 pub struct VirtualProgram {
+    listing: String,
     cursor: Cursor<Vec<u8>>,
     result_reg: u8
 }
 
 
 impl VirtualProgram {
-    pub(super) fn new(bytecode: Vec<u8>, result_reg: u8) -> VirtualProgram {
-        let prog = VirtualProgram{cursor: Cursor::new(bytecode), result_reg};
+    pub(super) fn new(listing: String, bytecode: Vec<u8>, result_reg: u8) -> VirtualProgram {
+        let prog = VirtualProgram{listing, cursor: Cursor::new(bytecode), result_reg};
         prog
     }
 
-    pub fn get_result_reg(&self) -> u8 {
+    pub fn get_listing(&self) -> String {
+        self.listing.clone()
+    }
+
+    pub(super) fn get_result_reg(&self) -> u8 {
         self.result_reg
     }
 
-    pub fn current_address(&self) -> u64 {
+    pub(super) fn current_address(&self) -> u64 {
         self.cursor.position()
     }
 
-    pub fn read_opcode(&mut self) -> Option<[u8; 4]> {
+    pub(super) fn read_opcode(&mut self) -> Option<[u8; 4]> {
         let mut buffer = [0 as u8; 4];
         if let Ok(()) = self.cursor.read_exact(&mut buffer) {
             Some(buffer)
@@ -147,7 +152,7 @@ impl VirtualProgram {
         }
     }
 
-    pub fn read_int(&mut self) -> Option<i64> {
+    pub(super) fn read_int(&mut self) -> Option<i64> {
         let mut buffer = [0 as u8; size_of::<i64>()];
         if let Ok(()) = self.cursor.read_exact(&mut buffer) {
             Some(i64::from_le_bytes(buffer))
@@ -157,7 +162,7 @@ impl VirtualProgram {
         }
     }
 
-    pub fn read_float(&mut self) -> Option<f64> {
+    pub(super) fn read_float(&mut self) -> Option<f64> {
         let mut buffer = [0 as u8; size_of::<f64>()];
         if let Ok(()) = self.cursor.read_exact(&mut buffer) {
             Some(f64::from_le_bytes(buffer))
@@ -167,7 +172,7 @@ impl VirtualProgram {
         }
     }
 
-    pub fn read_string(&mut self) -> Option<String> {
+    pub(super) fn read_string(&mut self) -> Option<String> {
         let mut buffer = [0 as u8; size_of::<usize>()];
         if let Ok(()) = self.cursor.read_exact(&mut buffer) {
             let size = usize::from_le_bytes(buffer);
@@ -190,12 +195,12 @@ impl VirtualProgram {
         Some(header)
     }
 
-    pub fn jump(&mut self, distance: i64) {
+    pub(super) fn jump(&mut self, distance: i64) {
         let pos = (self.cursor.position() as i64) + distance;
         self.cursor.set_position(pos as u64);
     }
 
-    pub fn jump_to(&mut self, pos: u64) {
+    pub(super) fn jump_to(&mut self, pos: u64) {
         self.cursor.set_position(pos);
     }
 }

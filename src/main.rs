@@ -1,3 +1,5 @@
+use std::env;
+
 use crate::{parser::SExpression, expr_interpreter::Interpreter};
 
 mod lexer;
@@ -36,10 +38,22 @@ fn main() {
     }
     */
 
-    let mut compiler = Compiler::new();
+    let args: Vec<String> = env::args().collect();
+    let mut generate_asm = false;
+    if args.len() == 2 {
+        generate_asm = &args[1] == "--asm";
+    }
+
+    let mut compiler = Compiler::new(generate_asm);
     let Ok(mut prog) = compiler.compile(&list.0) else {
         return;
     };
+
+    if generate_asm {
+        let listing = prog.get_listing();
+        print!("{}", listing);
+    }
+
     let mut vm = Vm::new();
     let res = vm.run(&mut prog);
     if let Some(SExpression::Atom(lit)) = res {
