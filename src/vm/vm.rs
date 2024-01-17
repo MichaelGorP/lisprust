@@ -256,7 +256,7 @@ impl Vm {
                     };
 
                     let param_start = opcode[2];
-                    for i in self.window_start .. self.window_start + func.header.register_count as usize {
+                    for i in self.window_start .. self.window_start + func.header.param_count as usize {
                         let source_reg = i;
                         let target_reg = i + param_start as usize;
                         self.registers.swap(source_reg, target_reg);

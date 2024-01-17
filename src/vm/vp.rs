@@ -99,6 +99,7 @@ impl OpCode {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(packed)]
 pub(super) struct FunctionHeader {
+    pub param_count: u8,
     pub register_count: u8,
     pub result_reg: u8
 }

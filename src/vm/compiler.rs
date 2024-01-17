@@ -356,7 +356,7 @@ impl Compiler {
                     self.reset_reg(last_reg + 1); //keep the result reg of the last expression
                     self.bytecode.store_opcode(Instr::Ret, 0, 0, 0);
 
-                    let header = FunctionHeader{register_count: self.max_used_registers, result_reg: last_reg};
+                    let header = FunctionHeader{param_count: self.fixed_registers, register_count: self.max_used_registers, result_reg: last_reg};
                     self.bytecode.store_and_reset_pos(header_addr, header.as_u8_slice());
 
                     self.end_scope();
