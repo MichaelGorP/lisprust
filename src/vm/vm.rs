@@ -232,11 +232,12 @@ impl Vm {
                     self.registers[opcode[1] as usize + self.window_start] = Value::FuncRef(FunctionData{header, address: func_addr as u64});
                 },
                 Ok(Instr::CallSymbol) => {
-                    let Value::FuncRef(func) = &self.registers[opcode[1] as usize + self.window_start] else {
+                    let mut func = empty_value();
+                    std::mem::swap(&mut func, &mut self.registers[opcode[1] as usize + self.window_start]);
+                    let Value::FuncRef(func) = func else {
                         break;
                     };
 
-                    let func = func.clone(); //because of possible resize
                     let param_start = opcode[2];
                     let size = param_start as usize + func.header.register_count as usize + self.window_start;
                     if size >= self.registers.len() {
@@ -245,6 +246,26 @@ impl Vm {
                     let state = CallState{window_start: self.window_start, result_reg: func.header.result_reg, target_reg: opcode[3], return_addr: prog.current_address()};
                     self.call_states.push(state);
                     self.window_start += param_start as usize;
+                    prog.jump_to(func.address);
+                },
+                Ok(Instr::TailCallSymbol) => {
+                    let mut func = empty_value();
+                    std::mem::swap(&mut func, &mut self.registers[opcode[1] as usize + self.window_start]);
+                    let Value::FuncRef(func) = func else {
+                        break;
+                    };
+
+                    let param_start = opcode[2];
+                    for i in self.window_start .. self.window_start + func.header.register_count as usize {
+                        let source_reg = i;
+                        let target_reg = i + param_start as usize;
+                        self.registers.swap(source_reg, target_reg);
+                    }
+
+                    if let Some(last_frame) = self.call_states.last_mut() {
+                        last_frame.result_reg = func.header.result_reg;
+                    }
+                    
                     prog.jump_to(func.address);
                 },
                 Ok(Instr::Ret) => {

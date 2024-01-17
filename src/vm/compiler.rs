@@ -214,21 +214,21 @@ impl Compiler {
     }
 
     pub fn compile(&mut self, root: &SExpression) -> Result<VirtualProgram, CompilationError> {
-        let reg = self.compile_expr(root, &[])?;
+        let reg = self.compile_expr(root, &[], false)?;
         let mut new_builder = BytecodeBuilder::new();
         std::mem::swap(&mut self.bytecode, &mut new_builder);
         let prog = VirtualProgram::new(new_builder.cursor.into_inner(), reg);
         Ok(prog)
     }
 
-    fn compile_expr(&mut self, root: &SExpression, args: &[SExpression]) -> Result<u8, CompilationError> {
+    fn compile_expr(&mut self, root: &SExpression, args: &[SExpression], is_tail: bool) -> Result<u8, CompilationError> {
         match root {
             SExpression::Atom(a) => {
                 let reg = self.allocate_reg()?;
                 self.bytecode.load_atom(a, reg);
                 Ok(reg)
             },
-            SExpression::BuiltIn(b) => self.compile_builtin(b, args),
+            SExpression::BuiltIn(b) => self.compile_builtin(b, args, is_tail),
             SExpression::Symbol(s) => {
                 let sym_reg;
                 if let Some(reg) = self.find_symbol(s.as_str()) {
@@ -242,17 +242,17 @@ impl Compiler {
                 }
                 Ok(sym_reg)
             },
-            SExpression::List(l) => self.compile_list(l),
+            SExpression::List(l) => self.compile_list(l, is_tail),
             SExpression::Lambda(_) => todo!(),
         }
     }
 
-    fn compile_list(&mut self, list: &[SExpression]) -> Result<u8, CompilationError> {
+    fn compile_list(&mut self, list: &[SExpression], is_tail: bool) -> Result<u8, CompilationError> {
         if !list.is_empty() {
             let expr = &list[0];
             match expr {
                 SExpression::Atom(_) => todo!(),
-                SExpression::BuiltIn(b) => self.compile_builtin(b, &list[1..]),
+                SExpression::BuiltIn(b) => self.compile_builtin(b, &list[1..], is_tail),
                 SExpression::Symbol(s) => {
                     let result_reg = self.allocate_reg()?;
                     let sym_reg; //register for symbol
@@ -269,24 +269,30 @@ impl Compiler {
                     //evaluate all other expressions as arguments
                     let start_reg = self.last_used_reg;
                     for expr in list.iter().skip(1) {
-                        let reg = self.compile_expr(expr, &[])?;
+                        let reg = self.compile_expr(expr, &[], false)?;
                         //hack: copy parameters into new registers
                         if reg <= self.fixed_registers {
                             let target_reg = self.allocate_reg()?;
                             self.bytecode.store_opcode(Instr::CopyReg, target_reg, reg, 0);
                         }
                     }
-                    self.bytecode.store_opcode(Instr::CallSymbol, sym_reg, start_reg, result_reg);
+
+                    if is_tail {
+                        self.bytecode.store_opcode(Instr::TailCallSymbol, sym_reg, start_reg, result_reg);
+                    }
+                    else {
+                        self.bytecode.store_opcode(Instr::CallSymbol, sym_reg, start_reg, result_reg);
+                    }
                     self.reset_reg(result_reg + 1);
                     Ok(result_reg)
                 },
                 SExpression::List(l) => {
-                    let ret = self.compile_list(l)?;
+                    let ret = self.compile_list(l, is_tail)?;
                     if list.len() == 1 {
                         Ok(ret)
                     }
                     else {
-                        self.compile_list(&list[1..])
+                        self.compile_list(&list[1..], is_tail)
                     }
                 },
                 SExpression::Lambda(_) => todo!(),
@@ -297,7 +303,7 @@ impl Compiler {
         }
     }
 
-    fn compile_builtin(&mut self, instr: &Instruction, args: &[SExpression]) -> Result<u8, CompilationError> {
+    fn compile_builtin(&mut self, instr: &Instruction, args: &[SExpression], is_tail: bool) -> Result<u8, CompilationError> {
         match instr {
             Instruction::Define => {
                 if args.len() != 2 {
@@ -305,7 +311,7 @@ impl Compiler {
                 }
                 else {
                     if let SExpression::Symbol(sym) = &args[0] {
-                        let reg = self.compile_expr(&args[1], &[])?;
+                        let reg = self.compile_expr(&args[1], &[], false)?;
                         self.bytecode.store_opcode(Instr::Define, reg, 0, 0);
                         let symbol_id = self.interner.get_or_intern(sym);
                         self.bytecode.store_value(&symbol_id.to_le_bytes());
@@ -343,8 +349,8 @@ impl Compiler {
                     self.last_used_reg = self.fixed_registers;
 
                     let mut last_reg = 0;
-                    for expr in args.iter().skip(1) {
-                        last_reg = self.compile_expr(expr, &[])?;
+                    for (index, expr) in args.iter().skip(1).enumerate() {
+                        last_reg = self.compile_expr(expr, &[], index == args.len() - 2)?;
                         self.reset_reg(last_reg);
                     }
                     self.reset_reg(last_reg + 1); //keep the result reg of the last expression
@@ -369,14 +375,14 @@ impl Compiler {
                     Err(CompilationError::from("Expected 2 or 3 arguments"))
                 }
                 else {
-                    let reg = self.compile_expr(&args[0], &[])?;
+                    let reg = self.compile_expr(&args[0], &[], false)?;
                     self.bytecode.store_opcode(Instr::Jump, reg, JumpCondition::JumpFalse as u8, 0);
                     self.reset_reg(reg); //not needed after the check
                     let target_pos = self.bytecode.position();
                     self.bytecode.store_value(&[0; size_of::<i64>()]);
                     //compile_expr might return an existing register, so no code is generated. But we need some code for now, so copy to a target register
                     let target_reg = self.allocate_reg()?;
-                    let ok_reg = self.compile_expr(&args[1], &[])?;
+                    let ok_reg = self.compile_expr(&args[1], &[], is_tail)?;
                     self.bytecode.store_opcode(Instr::CopyReg, target_reg, ok_reg, 0);
                     self.reset_reg(target_reg + 1); //not needed, copied
                     //update jump target
@@ -388,7 +394,7 @@ impl Compiler {
                         self.bytecode.store_value(&[0; size_of::<i64>()]);
                         false_jump_target += 4 + size_of::<i64>() as u64;
                         //compile else expression
-                        let ok_reg = self.compile_expr(&args[2], &[])?;
+                        let ok_reg = self.compile_expr(&args[2], &[], is_tail)?;
                         self.bytecode.store_opcode(Instr::CopyReg, target_reg, ok_reg, 0);
                         self.bytecode.store_and_reset_pos(target_pos, &(self.bytecode.position() - target_pos - std::mem::size_of::<i64>() as u64).to_le_bytes());
                         self.reset_reg(target_reg + 1)
@@ -429,7 +435,7 @@ impl Compiler {
                         self.compile_comparison_op(&list[1..], instr)
                     }
                     else {
-                        let reg = self.compile_expr(&args[0], &[])?;
+                        let reg = self.compile_expr(&args[0], &[], false)?;
                         self.bytecode.store_opcode(Instr::Not, reg, reg, 0);
                         Ok(reg)
                     }
@@ -446,7 +452,7 @@ impl Compiler {
                 //positions of jump marks
                 let mut jump_marks : Vec<u64> = vec![];
                 for (i, expr) in args.iter().enumerate() {
-                    result_reg = self.compile_expr(expr, &[])?;
+                    result_reg = self.compile_expr(expr, &[], false)?;
                     if i == args.len() - 1 {
                         //after the last check, write false into target register. If the check succeeded, skip it
                         self.bytecode.store_opcode(Instr::Jump, result_reg, JumpCondition::JumpTrue as u8, 0);
@@ -486,7 +492,7 @@ impl Compiler {
                 //positions of jump marks
                 let mut jump_marks : Vec<u64> = vec![];
                 for (i, expr) in args.iter().enumerate() {
-                    result_reg = self.compile_expr(expr, &[])?;
+                    result_reg = self.compile_expr(expr, &[], false)?;
                     if i == args.len() - 1 {
                         //now, we have the jump target for all other jumps
                         let jump_target = self.bytecode.position();
@@ -525,9 +531,9 @@ impl Compiler {
     fn compile_binary_op(&mut self, args: &[SExpression], instr: Instr) -> Result<u8, CompilationError> {
         if args.len() >= 2 {
             let result_reg = self.allocate_reg()?;
-            let mut r1 = self.compile_expr(&args[0], &[])?;
+            let mut r1 = self.compile_expr(&args[0], &[], false)?;
             for i in 1..args.len() {
-                let rnext = self.compile_expr(&args[i], &[])?;
+                let rnext = self.compile_expr(&args[i], &[], false)?;
                 self.bytecode.store_opcode(instr, result_reg, r1, rnext);
                 self.reset_reg(result_reg + 1);
                 r1 = result_reg;
@@ -547,10 +553,10 @@ impl Compiler {
             Ok(result_reg)
         }
         else {
-            let r1 = self.compile_expr(&args[0], &[])?;
+            let r1 = self.compile_expr(&args[0], &[], false)?;
             if args.len() >= 2 {
                 for i in 1..args.len() {
-                    let rnext = self.compile_expr(&args[i], &[])?;
+                    let rnext = self.compile_expr(&args[i], &[], false)?;
                     self.bytecode.store_opcode(instr, result_reg, r1, rnext);
                     if i < args.len() - 1 {
                         self.bytecode.store_opcode(Instr::CopyReg, r1, rnext, 0)

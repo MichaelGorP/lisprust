@@ -32,6 +32,7 @@ pub(super) enum Instr {
     LoadGlobal,
     LoadFuncRef,
     CallSymbol,
+    TailCallSymbol, //does a call without creating a new call frame
     Ret
 }
 
@@ -70,6 +71,7 @@ impl TryFrom<u8> for Instr {
             x if x == Instr::LoadGlobal as u8 => Ok(Instr::LoadGlobal),
             x if x == Instr::LoadFuncRef as u8 => Ok(Instr::LoadFuncRef),
             x if x == Instr::CallSymbol as u8 => Ok(Instr::CallSymbol),
+            x if x == Instr::TailCallSymbol as u8 => Ok(Instr::TailCallSymbol),
             x if x == Instr::Ret as u8 => Ok(Instr::Ret),
             _ => Err(())
         }
