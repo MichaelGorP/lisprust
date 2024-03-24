@@ -46,7 +46,7 @@ fn main() {
     }
 
     let mut vm = Vm::new();
-    let res = vm.run(&mut prog);
+    let res = vm.run2(&mut prog);
     if let Some(SExpression::Atom(lit)) = res {
         println!("VM result: {}", lit)
     }

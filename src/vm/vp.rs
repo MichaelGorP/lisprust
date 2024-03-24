@@ -1,4 +1,4 @@
-use std::{io::{Read, Cursor}, mem::size_of};
+use std::{io::{Read, Cursor}, mem::size_of, collections::HashMap};
 
 use enum_display::EnumDisplay;
 
@@ -120,13 +120,14 @@ impl FunctionHeader {
 pub struct VirtualProgram {
     listing: String,
     cursor: Cursor<Vec<u8>>,
+    data_blocks: HashMap<u64, usize>,
     result_reg: u8
 }
 
 
 impl VirtualProgram {
-    pub(super) fn new(listing: String, bytecode: Vec<u8>, result_reg: u8) -> VirtualProgram {
-        let prog = VirtualProgram{listing, cursor: Cursor::new(bytecode), result_reg};
+    pub(super) fn new(listing: String, bytecode: Vec<u8>, data_blocks: HashMap<u64, usize>, result_reg: u8) -> VirtualProgram {
+        let prog = VirtualProgram{listing, cursor: Cursor::new(bytecode), data_blocks, result_reg};
         prog
     }
 
@@ -143,6 +144,10 @@ impl VirtualProgram {
     }
 
     pub(super) fn read_opcode(&mut self) -> Option<[u8; 4]> {
+        let entry = self.data_blocks.get(&self.cursor.position());
+        if let Some(data_size) = entry {
+            self.cursor.set_position(self.cursor.position() + *data_size as u64);
+        }
         let mut buffer = [0 as u8; 4];
         if let Ok(()) = self.cursor.read_exact(&mut buffer) {
             Some(buffer)
@@ -202,5 +207,9 @@ impl VirtualProgram {
 
     pub(super) fn jump_to(&mut self, pos: u64) {
         self.cursor.set_position(pos);
+    }
+
+    pub(super) fn get_data(&self) -> Vec<u8> {
+        self.cursor.get_ref().clone()
     }
 }

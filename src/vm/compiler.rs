@@ -2,6 +2,7 @@ use case_insensitive_hashmap::CaseInsensitiveHashMap;
 
 use crate::instructions::Instruction;
 use crate::parser::{SExpression, Atom};
+use std::collections::HashMap;
 use std::io::Write;
 use std::mem::size_of;
 use std::{fmt, io::Cursor};
@@ -40,13 +41,14 @@ impl From<fmt::Error> for CompilationError {
 
 struct BytecodeBuilder {
     cursor: Cursor<Vec<u8>>,
+    data_blocks: HashMap<u64, usize>,
     listing: String,
     generate_asm: bool
 }
 
 impl BytecodeBuilder {
     fn new(generate_asm: bool) -> BytecodeBuilder {
-        BytecodeBuilder{cursor: Cursor::new(vec![]), listing: String::new(), generate_asm}
+        BytecodeBuilder{cursor: Cursor::new(vec![]), data_blocks: HashMap::new(), listing: String::new(), generate_asm}
     }
 
     fn load_atom(&mut self, atom: &Atom, reg: u8) {
@@ -112,11 +114,14 @@ impl BytecodeBuilder {
         let _ = self.cursor.write(val);
     }
 
-    fn store_and_reset_pos(&mut self, pos: u64, val: &[u8]) {
+    fn store_and_reset_pos(&mut self, pos: u64, val: &[u8], is_data: bool) {
         let cur_pos = self.cursor.position();
         self.cursor.set_position(pos);
         let _ = self.cursor.write(val);
         self.cursor.set_position(cur_pos);
+        if is_data {
+            self.data_blocks.insert(pos, val.len());
+        }
     }
 
     fn store_string(&mut self, val: &str) {
@@ -236,7 +241,7 @@ impl Compiler {
         let reg = self.compile_expr(root, &[], false)?;
         let mut new_builder = BytecodeBuilder::new(self.generate_asm);
         std::mem::swap(&mut self.bytecode, &mut new_builder);
-        let prog = VirtualProgram::new(new_builder.listing, new_builder.cursor.into_inner(), reg);
+        let prog = VirtualProgram::new(new_builder.listing, new_builder.cursor.into_inner(), new_builder.data_blocks, reg);
         Ok(prog)
     }
 
@@ -376,11 +381,11 @@ impl Compiler {
                     self.bytecode.store_opcode(Instr::Ret, 0, 0, 0);
 
                     let header = FunctionHeader{param_count: self.fixed_registers, register_count: self.max_used_registers, result_reg: last_reg};
-                    self.bytecode.store_and_reset_pos(header_addr, header.as_u8_slice());
+                    self.bytecode.store_and_reset_pos(header_addr, header.as_u8_slice(), true);
 
                     self.end_scope();
 
-                    self.bytecode.store_and_reset_pos(jump_addr, &(self.bytecode.position() - jump_addr - std::mem::size_of::<i64>() as u64).to_le_bytes());
+                    self.bytecode.store_and_reset_pos(jump_addr, &(self.bytecode.position() - jump_addr - std::mem::size_of::<i64>() as u64).to_le_bytes(), false);
                     //the return of a compiled lambda is a function reference
                     let reg = self.allocate_reg()?;
                     self.bytecode.store_opcode(Instr::LoadFuncRef, reg, 0, 0);
@@ -415,10 +420,10 @@ impl Compiler {
                         //compile else expression
                         let ok_reg = self.compile_expr(&args[2], &[], is_tail)?;
                         self.bytecode.store_opcode(Instr::CopyReg, target_reg, ok_reg, 0);
-                        self.bytecode.store_and_reset_pos(target_pos, &(self.bytecode.position() - target_pos - std::mem::size_of::<i64>() as u64).to_le_bytes());
+                        self.bytecode.store_and_reset_pos(target_pos, &(self.bytecode.position() - target_pos - std::mem::size_of::<i64>() as u64).to_le_bytes(), false);
                         self.reset_reg(target_reg + 1)
                     }
-                    self.bytecode.store_and_reset_pos(target_pos, &false_jump_target.to_le_bytes());
+                    self.bytecode.store_and_reset_pos(target_pos, &false_jump_target.to_le_bytes(), false);
                     Ok(target_reg)
                 }
             },
