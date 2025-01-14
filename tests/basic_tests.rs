@@ -48,17 +48,25 @@ fn compile_and_run(prog: &str) -> Option<SExpression> {
     vm.run(&mut prog)
 }
 
+macro_rules! matches_into {
+    ($pattern:pat, $value:expr) => {
+        match <SExpression>::from($value) {
+            $pattern => true,
+            _ => false,
+        }
+    };
+}
+
 #[test]
 fn test_binary_operations() {
     let res = parse_and_exec("(+ 1 2 2.5)");
-    let expected: SExpression = 5.5.into();
-    assert!(matches!(res, expected));
+    assert!(matches_into!(res, 5.5));
     let res = parse_and_exec("(- 10 3)");
-    assert!(matches!(res, SExpression::Atom(Atom::Integer(7))));
+    assert!(matches_into!(res, 7));
     let res = parse_and_exec("(* 2 2 3)");
-    assert!(matches!(res, SExpression::Atom(Atom::Integer(12))));
+    assert!(matches_into!(res, 12));
     let res = parse_and_exec("(/ 8 2)");
-    assert!(matches!(res, SExpression::Atom(Atom::Integer(4))));
+    assert!(matches_into!(res, 4));
 }
 
 #[test]
