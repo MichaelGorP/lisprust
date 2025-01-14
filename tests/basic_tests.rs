@@ -51,7 +51,8 @@ fn compile_and_run(prog: &str) -> Option<SExpression> {
 #[test]
 fn test_binary_operations() {
     let res = parse_and_exec("(+ 1 2 2.5)");
-    assert!(matches!(res, SExpression::Atom(Atom::Float(5.5))));
+    let expected: SExpression = 5.5.into();
+    assert!(matches!(res, expected));
     let res = parse_and_exec("(- 10 3)");
     assert!(matches!(res, SExpression::Atom(Atom::Integer(7))));
     let res = parse_and_exec("(* 2 2 3)");

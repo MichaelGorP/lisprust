@@ -22,6 +22,30 @@ impl fmt::Display for Atom {
     }
 }
 
+impl From<bool> for Atom {
+    fn from(value: bool) -> Self {
+        Atom::Boolean(value)
+    }
+}
+
+impl From<i64> for Atom {
+    fn from(value: i64) -> Self {
+        Atom::Integer(value)
+    }
+}
+
+impl From<f64> for Atom {
+    fn from(value: f64) -> Self {
+        Atom::Float(value)
+    }
+}
+
+impl From<String> for Atom {
+    fn from(value: String) -> Self {
+        Atom::String(value)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Lambda {
     pub args: Vec<String>,
@@ -46,6 +70,14 @@ impl fmt::Display for SExpression {
             SExpression::List(l) => write!(f, "{:?}", l),
             SExpression::Lambda(_) => write!(f, "Lambda")
         }
+    }
+}
+
+impl<T> From<T> for SExpression
+    where T: Into<Atom>,
+{
+    fn from(value: T) -> Self {
+        SExpression::Atom(value.into())
     }
 }
 
