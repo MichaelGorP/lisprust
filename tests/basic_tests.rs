@@ -5,6 +5,10 @@ use lisp::expr_interpreter::Interpreter;
 use lisp::vm::compiler::Compiler;
 use lisp::vm::vm::Vm;
 
+fn compare_expr<T>(expr: SExpression, value: T) -> bool where T: Into<Atom> {
+    expr == <SExpression>::from(value)
+}
+
 fn parse_and_eval(prog: &str) -> SExpression {
     let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
     let parser = Parser::new();
@@ -48,57 +52,48 @@ fn compile_and_run(prog: &str) -> Option<SExpression> {
     vm.run(&mut prog)
 }
 
-macro_rules! matches_into {
-    ($pattern:pat, $value:expr) => {
-        match <SExpression>::from($value) {
-            $pattern => true,
-            _ => false,
-        }
-    };
-}
-
 #[test]
 fn test_binary_operations() {
     let res = parse_and_exec("(+ 1 2 2.5)");
-    assert!(matches_into!(res, 5.5));
+    assert!(compare_expr(res, 5.5));
     let res = parse_and_exec("(- 10 3)");
-    assert!(matches_into!(res, 7));
+    assert!(compare_expr(res, 7));
     let res = parse_and_exec("(* 2 2 3)");
-    assert!(matches_into!(res, 12));
+    assert!(compare_expr(res, 12));
     let res = parse_and_exec("(/ 8 2)");
-    assert!(matches_into!(res, 4));
+    assert!(compare_expr(res, 4));
 }
 
 #[test]
 fn test_comparisons() {
     let res = parse_and_exec("(= 2 2");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+    assert!(compare_expr(res, true));
     let res = parse_and_exec("(< 1 2");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+    assert!(compare_expr(res, true));
     let res = parse_and_exec("(> 1 2");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(false))));
+    assert!(compare_expr(res, false));
     let res = parse_and_exec("(>= 2 2");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+    assert!(compare_expr(res, true));
     let res = parse_and_exec("(<= 2 2");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+    assert!(compare_expr(res, true));
 
     let res = parse_and_exec("(=)");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+    assert!(compare_expr(res, true));
 
     let res = parse_and_exec("(> 5)");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+    assert!(compare_expr(res, true));
 
     let res = parse_might_fail("> \"a\")");
     assert!(matches!(res, None));
 
     let res = parse_and_exec("(= 2 2 2");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+    assert!(compare_expr(res, true));
 
     let res = parse_and_exec("(< 2 3 4");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+    assert!(compare_expr(res, true));
 
     let res = parse_and_exec("(> 2 3 1");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(false))));
+    assert!(compare_expr(res, false));
 }
 
 #[test]
@@ -107,48 +102,48 @@ fn test_lambda() {
     (* x x)))
     (define five (lambda () 5))
     (+ 2 (square 4) (five))");
-    assert!(matches!(res, SExpression::Atom(Atom::Integer(23))));
+    assert!(compare_expr(res, 23));
 }
 
 #[test]
 fn test_and() {
     let res = parse_and_exec("(and");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+    assert!(compare_expr(res, true));
     let res = parse_and_exec("(and 1");
-    assert!(matches!(res, SExpression::Atom(Atom::Integer(1))));
+    assert!(compare_expr(res, 1));
     let res = parse_and_exec("(and 1 2");
-    assert!(matches!(res, SExpression::Atom(Atom::Integer(2))));
+    assert!(compare_expr(res, 2));
     let res = parse_and_exec("(and (> 2 1) (> 3 2) (> 3 4)");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(false))));
+    assert!(compare_expr(res, false));
 }
 
 #[test]
 fn test_or() {
     let res = parse_and_exec("(or");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(false))));
+    assert!(compare_expr(res, false));
     let res = parse_and_exec("(or 1");
-    assert!(matches!(res, SExpression::Atom(Atom::Integer(1))));
+    assert!(compare_expr(res, 1));
     let res = parse_and_exec("(or false 2");
-    assert!(matches!(res, SExpression::Atom(Atom::Integer(2))));
+    assert!(compare_expr(res, 2));
     let res = parse_and_exec("(or false false");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(false))));
+    assert!(compare_expr(res, false));
     let res = parse_and_exec("(or (> 2 1) (> 3 2) (> 3 4)");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+    assert!(compare_expr(res, true));
 }
 
 #[test]
 fn test_not() {
     let res = parse_and_exec("(not 1)");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(false))));
+    assert!(compare_expr(res, false));
 
     let res = parse_and_exec("(not false)");
-    assert!(matches!(res, SExpression::Atom(Atom::Boolean(true))));
+    assert!(compare_expr(res, true));
 }
 
 #[test]
 fn test_if() {
     let res = parse_and_exec("(if 10 20 30");
-    assert!(matches!(res, SExpression::Atom(Atom::Integer(20))));
+    assert!(compare_expr(res, 20));
 }
 
 #[test]

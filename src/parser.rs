@@ -1,8 +1,9 @@
 use std::fmt;
 use crate::{lexer::Token, instructions};
 use case_insensitive_hashmap::CaseInsensitiveHashMap;
+use derive_more::derive::From;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, From)]
 pub enum Atom {
     Boolean(bool),
     Integer(i64),
@@ -19,30 +20,6 @@ impl fmt::Display for Atom {
             Atom::Float(d) => write!(f, "{}", d),
             Atom::String(s) => write!(f, "{}", s),
         }
-    }
-}
-
-impl From<bool> for Atom {
-    fn from(value: bool) -> Self {
-        Atom::Boolean(value)
-    }
-}
-
-impl From<i64> for Atom {
-    fn from(value: i64) -> Self {
-        Atom::Integer(value)
-    }
-}
-
-impl From<f64> for Atom {
-    fn from(value: f64) -> Self {
-        Atom::Float(value)
-    }
-}
-
-impl From<String> for Atom {
-    fn from(value: String) -> Self {
-        Atom::String(value)
     }
 }
 
