@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::parser::{SExpression, Atom};
 
-use super::vp::{VirtualProgram, Instr, JumpCondition, FunctionHeader, OpCode};
+use super::vp::{FunctionData, FunctionHeader, Instr, JumpCondition, Value, VirtualProgram};
 
 macro_rules! binary_op {
     ($self:ident, $opcode:ident, $op:tt) => {
@@ -64,32 +64,6 @@ macro_rules! comparison_op {
             }
         }
     };
-}
-
-#[derive(PartialEq, Clone, Debug)]
-struct FunctionData {
-    header: FunctionHeader,
-    address: u64
-}
-
-#[derive(PartialEq, Clone, Debug)]
-enum Value {
-    Empty,
-    Boolean(bool),
-    Integer(i64),
-    Float(f64),
-    String(String),
-    List(Vec<Value>),
-    FuncRef(FunctionData)
-}
-
-impl Value {
-    fn is_true(&self) -> bool {
-        match self {
-            Self::Boolean(b) if !b => false,
-            _ => true
-        }
-    }
 }
 
 const fn empty_value() -> Value {
@@ -268,6 +242,17 @@ impl Vm {
                     
                     prog.jump_to(func.address);
                 },
+                Ok(Instr::CallFunction) => {
+                    let Some(func_id) = prog.read_int() else {
+                        break;
+                    };
+                    let Some(function) = prog.get_function(func_id) else {
+                        break;
+                    };
+                    let start_reg = opcode[2] as usize;
+                    let reg_count = opcode[3] as usize;
+                    self.registers[opcode[1] as usize + self.window_start] = function(&self.registers[self.window_start + start_reg.. self.window_start + start_reg + reg_count]);
+                }
                 Ok(Instr::Ret) => {
                     let Some(state) = self.call_states.pop() else {
                         break; //nothing to return from

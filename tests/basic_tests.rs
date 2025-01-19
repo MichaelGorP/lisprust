@@ -3,19 +3,11 @@ use lisp::parser::{SExpression, Atom, Parser};
 use lisp::lexer;
 use lisp::expr_interpreter::Interpreter;
 use lisp::vm::compiler::Compiler;
+use lisp::vm::math_functions;
 use lisp::vm::vm::Vm;
 
 fn compare_expr<T>(expr: SExpression, value: T) -> bool where T: Into<Atom> {
     expr == <SExpression>::from(value)
-}
-
-fn parse_and_eval(prog: &str) -> SExpression {
-    let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
-    let parser = Parser::new();
-    let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
-    let interpreter = Interpreter::new();
-    let res = interpreter.execute(&list.0);
-    res.expect("Failed to execute")
 }
 
 fn parse_and_exec(prog: &str) -> SExpression {
@@ -44,6 +36,7 @@ fn parse_might_fail(prog: &str) -> Option<SExpression> {
 
 fn compile_and_run(prog: &str) -> Option<SExpression> {
     let mut compiler = Compiler::new(false);
+    math_functions::register_functions(&mut compiler);
     let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
     let parser = Parser::new();
     let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
@@ -153,4 +146,10 @@ fn test_compiler_comparisons() {
 
     let res = compile_and_run("(< 4 (+ 2 3) (* 2 6)))");
     assert!(matches!(res, Some(SExpression::Atom(Atom::Boolean(true)))));
+}
+
+#[test]
+fn test_trigonometric_functions() {
+    let res = compile_and_run("(sin 1.0)").unwrap();
+    assert!(compare_expr(res, (1.0 as f64).sin()));
 }

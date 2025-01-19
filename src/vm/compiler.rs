@@ -2,12 +2,13 @@ use case_insensitive_hashmap::CaseInsensitiveHashMap;
 
 use crate::instructions::Instruction;
 use crate::parser::{SExpression, Atom};
+use std::collections::HashMap;
 use std::io::Write;
 use std::mem::size_of;
 use std::{fmt, io::Cursor};
 use std::error::Error;
 
-use super::vp::{VirtualProgram, Instr, OpCode, JumpCondition, FunctionHeader};
+use super::vp::{FunctionHeader, Instr, JumpCondition, OpCode, VirtualProgram, VmCallableFunction};
 
 #[derive(Debug)]
 pub struct CompilationError {
@@ -159,6 +160,9 @@ impl SymbolInterner {
 
 pub struct Compiler {
     generate_asm: bool,
+    registered_functions: HashMap<String, VmCallableFunction>,
+    used_functions: Vec<VmCallableFunction>,
+    function_lookup: HashMap<String, usize>,
     bytecode: BytecodeBuilder,
     last_used_reg: u8,
     fixed_registers: u8,
@@ -172,7 +176,11 @@ impl Compiler {
     const MAX_REG: u8 = 255;
 
     pub fn new(generate_asm: bool) -> Compiler {
-        Compiler{generate_asm, bytecode: BytecodeBuilder::new(generate_asm), last_used_reg: 0, fixed_registers: 0, max_used_registers: 0, symbols: CaseInsensitiveHashMap::new(), interner: SymbolInterner::new(), scope_stack: Vec::new()}
+        Compiler{generate_asm, registered_functions: HashMap::new(), used_functions: Vec::new(), function_lookup: HashMap::new(), bytecode: BytecodeBuilder::new(generate_asm), last_used_reg: 0, fixed_registers: 0, max_used_registers: 0, symbols: CaseInsensitiveHashMap::new(), interner: SymbolInterner::new(), scope_stack: Vec::new()}
+    }
+
+    pub fn register_function(&mut self, name: &str, func: VmCallableFunction) {
+        self.registered_functions.insert(name.into(), func);
     }
 
     fn begin_scope(&mut self) {
@@ -236,7 +244,10 @@ impl Compiler {
         let reg = self.compile_expr(root, &[], false)?;
         let mut new_builder = BytecodeBuilder::new(self.generate_asm);
         std::mem::swap(&mut self.bytecode, &mut new_builder);
-        let prog = VirtualProgram::new(new_builder.listing, new_builder.cursor.into_inner(), reg);
+        let mut new_functions = Vec::new();
+        std::mem::swap(&mut self.used_functions, &mut new_functions);
+        self.function_lookup.clear();
+        let prog = VirtualProgram::new(new_builder.listing, new_builder.cursor.into_inner(), reg, new_functions);
         Ok(prog)
     }
 
@@ -274,33 +285,50 @@ impl Compiler {
                 SExpression::BuiltIn(b) => self.compile_builtin(b, &list[1..], is_tail),
                 SExpression::Symbol(s) => {
                     let result_reg = self.allocate_reg()?;
-                    let sym_reg; //register for symbol
-                    if let Some(reg) = self.find_symbol(s.as_str()) {
-                        sym_reg = reg;
-                    }
-                    else {
-                        sym_reg = self.allocate_reg()?;
-                        let symbol_id = self.interner.get_or_intern(s);
-                        self.bytecode.store_opcode(Instr::LoadGlobal, sym_reg, 0, 0);
-                        self.bytecode.store_value(&symbol_id.to_le_bytes());
-                    }
-
-                    //evaluate all other expressions as arguments
-                    let start_reg = self.last_used_reg;
-                    for expr in list.iter().skip(1) {
-                        let reg = self.compile_expr(expr, &[], false)?;
-                        //hack: copy parameters into new registers
-                        if reg <= self.fixed_registers {
-                            let target_reg = self.allocate_reg()?;
-                            self.bytecode.store_opcode(Instr::CopyReg, target_reg, reg, 0);
+                    //try registered functions first, not overwritable so far
+                    let opt_func = self.registered_functions.get(s).copied();
+                    if let Some(func) = opt_func {
+                        //evaluate all other expressions as arguments
+                        let start_reg = self.last_used_reg;
+                        for expr in list.iter().skip(1) {
+                            self.compile_expr(expr, &[], false)?;
                         }
-                    }
 
-                    if is_tail {
-                        self.bytecode.store_opcode(Instr::TailCallSymbol, sym_reg, start_reg, result_reg);
+                        let reg_count = self.last_used_reg - start_reg;
+                        let func_id = self.function_lookup.entry(s.to_string()).or_insert_with(|| {self.used_functions.push(func); self.used_functions.len()});
+                        self.bytecode.store_opcode(Instr::CallFunction, result_reg, start_reg, reg_count);
+                        let id: i64 = *func_id as i64;
+                        self.bytecode.store_value(&id.to_le_bytes());
                     }
                     else {
-                        self.bytecode.store_opcode(Instr::CallSymbol, sym_reg, start_reg, result_reg);
+                        let sym_reg; //register for symbol
+                        if let Some(reg) = self.find_symbol(s.as_str()) {
+                            sym_reg = reg;
+                        }
+                        else {
+                            sym_reg = self.allocate_reg()?;
+                            let symbol_id = self.interner.get_or_intern(s);
+                            self.bytecode.store_opcode(Instr::LoadGlobal, sym_reg, 0, 0);
+                            self.bytecode.store_value(&symbol_id.to_le_bytes());
+                        }
+
+                        //evaluate all other expressions as arguments
+                        let start_reg = self.last_used_reg;
+                        for expr in list.iter().skip(1) {
+                            let reg = self.compile_expr(expr, &[], false)?;
+                            //hack: copy parameters into new registers
+                            if reg <= self.fixed_registers {
+                                let target_reg = self.allocate_reg()?;
+                                self.bytecode.store_opcode(Instr::CopyReg, target_reg, reg, 0);
+                            }
+                        }
+
+                        if is_tail {
+                            self.bytecode.store_opcode(Instr::TailCallSymbol, sym_reg, start_reg, result_reg);
+                        }
+                        else {
+                            self.bytecode.store_opcode(Instr::CallSymbol, sym_reg, start_reg, result_reg);
+                        }
                     }
                     self.reset_reg(result_reg + 1);
                     Ok(result_reg)

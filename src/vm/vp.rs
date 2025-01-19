@@ -33,6 +33,7 @@ pub(super) enum Instr {
     LoadFuncRef,
     CallSymbol,
     TailCallSymbol, //does a call without creating a new call frame
+    CallFunction,
     Ret
 }
 
@@ -72,6 +73,7 @@ impl TryFrom<u8> for Instr {
             x if x == Instr::LoadFuncRef as u8 => Ok(Instr::LoadFuncRef),
             x if x == Instr::CallSymbol as u8 => Ok(Instr::CallSymbol),
             x if x == Instr::TailCallSymbol as u8 => Ok(Instr::TailCallSymbol),
+            x if x == Instr::CallFunction as u8 => Ok(Instr::CallFunction),
             x if x == Instr::Ret as u8 => Ok(Instr::Ret),
             _ => Err(())
         }
@@ -117,16 +119,45 @@ impl FunctionHeader {
     }
 }
 
+#[derive(PartialEq, Clone, Debug)]
+pub struct FunctionData {
+    pub header: FunctionHeader,
+    pub address: u64
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub enum Value {
+    Empty,
+    Boolean(bool),
+    Integer(i64),
+    Float(f64),
+    String(String),
+    List(Vec<Value>),
+    FuncRef(FunctionData)
+}
+
+impl Value {
+    pub fn is_true(&self) -> bool {
+        match self {
+            Self::Boolean(b) if !b => false,
+            _ => true
+        }
+    }
+}
+
+pub type VmCallableFunction = fn(&[Value]) -> Value;
+
 pub struct VirtualProgram {
     listing: String,
     cursor: Cursor<Vec<u8>>,
+    functions: Vec<VmCallableFunction>,
     result_reg: u8
 }
 
 
 impl VirtualProgram {
-    pub(super) fn new(listing: String, bytecode: Vec<u8>, result_reg: u8) -> VirtualProgram {
-        let prog = VirtualProgram{listing, cursor: Cursor::new(bytecode), result_reg};
+    pub(super) fn new(listing: String, bytecode: Vec<u8>, result_reg: u8, functions: Vec<VmCallableFunction>) -> VirtualProgram {
+        let prog = VirtualProgram{listing, cursor: Cursor::new(bytecode), result_reg, functions};
         prog
     }
 
@@ -202,5 +233,9 @@ impl VirtualProgram {
 
     pub(super) fn jump_to(&mut self, pos: u64) {
         self.cursor.set_position(pos);
+    }
+
+    pub(super) fn get_function(&self, id: i64) -> Option<VmCallableFunction> {
+        self.functions.get(id as usize - 1).copied()
     }
 }
