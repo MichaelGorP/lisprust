@@ -272,14 +272,27 @@ impl Vm {
         self.registers.shrink_to_fit();
 
         //convert result
-        match &self.registers[prog.get_result_reg() as usize + self.window_start] {
-            Value::Empty => None,
-            Value::Boolean(b) => Some(SExpression::Atom(Atom::Boolean(*b))),
-            Value::Integer(i) => Some(SExpression::Atom(Atom::Integer(*i))),
-            Value::Float(f) => Some(SExpression::Atom(Atom::Float(*f))),
-            Value::String(s) => Some(SExpression::Atom(Atom::String(s.clone()))),
-            Value::List(_) => todo!(),
-            Value::FuncRef(_) => todo!()
+        value_to_sexpr(&self.registers[prog.get_result_reg() as usize + self.window_start])
+    }
+
+}
+
+fn value_to_sexpr(value: &Value) -> Option<SExpression> {
+    match value {
+        Value::Empty => None,
+        Value::Boolean(b) => Some(SExpression::Atom(Atom::Boolean(*b))),
+        Value::Integer(i) => Some(SExpression::Atom(Atom::Integer(*i))),
+        Value::Float(f) => Some(SExpression::Atom(Atom::Float(*f))),
+        Value::String(s) => Some(SExpression::Atom(Atom::String(s.clone()))),
+        Value::List(l) => {
+            let mut expressions = Vec::with_capacity(l.len());
+            let data_ref = l.values();
+            for value in &data_ref[l.offset() .. l.offset() + l.len()] {
+                let sexpr = value_to_sexpr(value);
+                expressions.push(sexpr.unwrap_or(SExpression::Atom(Atom::Integer(0))));
+            }
+            Some(SExpression::List(expressions))
         }
+        Value::FuncRef(_) => todo!()
     }
 }

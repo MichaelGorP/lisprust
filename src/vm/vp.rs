@@ -1,4 +1,4 @@
-use std::{io::{Read, Cursor}, mem::size_of};
+use std::{cell::{Ref, RefCell}, io::{Cursor, Read}, mem::size_of, rc::{Rc}};
 
 use enum_display::EnumDisplay;
 
@@ -126,13 +126,38 @@ pub struct FunctionData {
 }
 
 #[derive(PartialEq, Clone, Debug)]
+pub struct ListSlice {
+    data_ptr: Rc<RefCell<Vec<Value>>>,
+    offset: usize,
+    length: usize
+}
+
+impl ListSlice {
+    pub fn new(input: &[Value]) -> ListSlice {
+        ListSlice { data_ptr: Rc::new(RefCell::new(input.to_vec())), offset: 0, length: input.len() }
+    }
+
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    pub fn len(&self) -> usize {
+        self.length
+    }
+
+    pub fn values(&self) -> Ref<Vec<Value>> {
+        self.data_ptr.borrow()
+    }
+}
+
+#[derive(PartialEq, Clone, Debug)]
 pub enum Value {
     Empty,
     Boolean(bool),
     Integer(i64),
     Float(f64),
     String(String),
-    List(Vec<Value>),
+    List(ListSlice),
     FuncRef(FunctionData)
 }
 
