@@ -314,6 +314,131 @@ impl Interpreter {
                     _ => return self.execute_expr(&remainder[1], &[], env)
                 }
             },
+            instructions::Instruction::Let => {
+                if remainder.len() < 2 {
+                    return Err(ExecutionError::from("Expected at least 2 arguments"));
+                }
+                let bindings = &remainder[0];
+                let body = &remainder[1..];
+                if let SExpression::List(bindings_list) = bindings {
+                    //evaluate all inits in outer env
+                    let mut values = Vec::new();
+                    let mut symbols = Vec::new();
+                    for binding in bindings_list {
+                        if let SExpression::List(ref pair) = binding {
+                            if pair.len() != 2 {
+                                return Err(ExecutionError::from("Binding must be (var init)"));
+                            }
+                            if let SExpression::Symbol(ref sym) = &pair[0] {
+                                let value = self.execute_expr(&pair[1], &[], env)?;
+                                values.push(value);
+                                symbols.push(sym.clone());
+                            }
+                            else {
+                                return Err(ExecutionError::from("First element of binding must be a symbol"));
+                            }
+                        }
+                        else {
+                            return Err(ExecutionError::from("Binding must be a list"));
+                        }
+                    }
+                    //now create new env
+                    let mut new_env = Env{symbols: CaseInsensitiveHashMap::new(), parent: Some(env)};
+                    for (sym, val) in symbols.into_iter().zip(values.into_iter()) {
+                        new_env.put(sym, val);
+                    }
+                    //execute body in new env
+                    let mut result = SExpression::List(vec![]);
+                    for expr in body {
+                        result = self.execute_expr(expr, &[], &mut new_env)?;
+                    }
+                    Ok(result)
+                }
+                else {
+                    Err(ExecutionError::from("First argument must be a list of bindings"))
+                }
+            },
+            instructions::Instruction::LetStar => {
+                if remainder.len() < 2 {
+                    return Err(ExecutionError::from("Expected at least 2 arguments"));
+                }
+                let bindings = &remainder[0];
+                let body = &remainder[1..];
+                if let SExpression::List(bindings_list) = bindings {
+                    let mut new_env = Env{symbols: CaseInsensitiveHashMap::new(), parent: Some(env)};
+                    for binding in bindings_list {
+                        if let SExpression::List(ref pair) = binding {
+                            if pair.len() != 2 {
+                                return Err(ExecutionError::from("Binding must be (var init)"));
+                            }
+                            if let SExpression::Symbol(ref sym) = &pair[0] {
+                                let value = self.execute_expr(&pair[1], &[], &mut new_env)?;
+                                new_env.put(sym.clone(), value);
+                            }
+                            else {
+                                return Err(ExecutionError::from("First element of binding must be a symbol"));
+                            }
+                        }
+                        else {
+                            return Err(ExecutionError::from("Binding must be a list"));
+                        }
+                    }
+                    //execute body in new env
+                    let mut result = SExpression::List(vec![]);
+                    for expr in body {
+                        result = self.execute_expr(expr, &[], &mut new_env)?;
+                    }
+                    Ok(result)
+                }
+                else {
+                    Err(ExecutionError::from("First argument must be a list of bindings"))
+                }
+            },
+            instructions::Instruction::Letrec => {
+                if remainder.len() < 2 {
+                    return Err(ExecutionError::from("Expected at least 2 arguments"));
+                }
+                let bindings = &remainder[0];
+                let body = &remainder[1..];
+                if let SExpression::List(bindings_list) = bindings {
+                    let mut new_env = Env{symbols: CaseInsensitiveHashMap::new(), parent: Some(env)};
+                    //first, bind all vars to undefined
+                    for binding in bindings_list {
+                        if let SExpression::List(ref pair) = binding {
+                            if pair.len() != 2 {
+                                return Err(ExecutionError::from("Binding must be (var init)"));
+                            }
+                            if let SExpression::Symbol(ref sym) = &pair[0] {
+                                new_env.put(sym.clone(), SExpression::Atom(Atom::Boolean(false))); //undefined
+                            }
+                            else {
+                                return Err(ExecutionError::from("First element of binding must be a symbol"));
+                            }
+                        }
+                        else {
+                            return Err(ExecutionError::from("Binding must be a list"));
+                        }
+                    }
+                    //now evaluate inits
+                    for binding in bindings_list {
+                        if let SExpression::List(ref pair) = binding {
+                            if let SExpression::Symbol(ref sym) = &pair[0] {
+                                let value = self.execute_expr(&pair[1], &[], &mut new_env)?;
+                                new_env.put(sym.clone(), value);
+                            }
+                        }
+                    }
+                    //execute body
+                    let mut result = SExpression::List(vec![]);
+                    for expr in body {
+                        result = self.execute_expr(expr, &[], &mut new_env)?;
+                    }
+                    Ok(result)
+                }
+                else {
+                    Err(ExecutionError::from("First argument must be a list of bindings"))
+                }
+            },
             instructions::Instruction::Not => {
                 if remainder.len() != 1 {
                     return Err(ExecutionError::from("Expected 1 argument"));

@@ -316,8 +316,9 @@ impl Compiler {
                         let start_reg = self.last_used_reg;
                         for expr in list.iter().skip(1) {
                             let reg = self.compile_expr(expr, &[], false)?;
-                            //hack: copy parameters into new registers
-                            if reg <= self.fixed_registers {
+                            // If the compiled expression is a parameter (allocated in fixed registers),
+                            // copy it into a fresh register so parameters are contiguous starting at `start_reg`.
+                            if reg < self.fixed_registers {
                                 let target_reg = self.allocate_reg()?;
                                 self.bytecode.store_opcode(Instr::CopyReg, target_reg, reg, 0);
                             }
@@ -382,17 +383,17 @@ impl Compiler {
                     self.begin_scope();
                     let header_addr = self.bytecode.position();
                     self.bytecode.store_value(&[0; std::mem::size_of::<FunctionHeader>()]);
-                    let symbols_before = self.symbols.len();
                     //register parameters
+                    let mut param_count: u8 = 0;
                     if let SExpression::List(arg_list) = &args[0] {
                         for param in arg_list {
                             if let SExpression::Symbol(sym) = param {
                                 self.find_or_alloc(sym.as_str())?;
+                                param_count = param_count.saturating_add(1);
                             }
                         }
                     }
-                    let used_registers = (self.symbols.len() + 1 - symbols_before) as u8;
-                    self.fixed_registers = used_registers;
+                    self.fixed_registers = param_count;
                     self.last_used_reg = self.fixed_registers;
 
                     let mut last_reg = 0;
@@ -448,6 +449,170 @@ impl Compiler {
                     }
                     self.bytecode.store_and_reset_pos(target_pos, &false_jump_target.to_le_bytes());
                     Ok(target_reg)
+                }
+            },
+            Instruction::Let => {
+                if args.len() < 2 {
+                    Err(CompilationError::from("Expected at least 2 arguments"))
+                }
+                else {
+                    //parse bindings
+                    let bindings = &args[0];
+                    let body = &args[1..];
+                    if let SExpression::List(bindings_list) = bindings {
+                        //collect init expressions
+                        let mut init_regs = Vec::new();
+                        for binding in bindings_list {
+                            if let SExpression::List(ref pair) = binding {
+                                if pair.len() != 2 {
+                                    return Err(CompilationError::from("Binding must be (var init)"));
+                                }
+                                if let SExpression::Symbol(_) = &pair[0] {
+                                    let init_reg = self.compile_expr(&pair[1], &[], false)?;
+                                    init_regs.push(init_reg);
+                                }
+                                else {
+                                    return Err(CompilationError::from("First element of binding must be a symbol"));
+                                }
+                            }
+                            else {
+                                return Err(CompilationError::from("Binding must be a list"));
+                            }
+                        }
+                        //now begin scope and allocate vars
+                        self.begin_scope();
+                        // preserve outer register allocation so nested lexical scopes don't reuse registers
+                        if let Some(prev) = self.scope_stack.last() {
+                            self.last_used_reg = prev.last_used_reg;
+                            self.max_used_registers = prev.max_used_registers;
+                        }
+                        // preserve outer register allocation so nested lexical scopes don't reuse registers
+                        if let Some(prev) = self.scope_stack.last() {
+                            self.last_used_reg = prev.last_used_reg;
+                            self.max_used_registers = prev.max_used_registers;
+                        }
+                        let mut var_regs = Vec::new();
+                        for binding in bindings_list {
+                            if let SExpression::List(ref pair) = binding {
+                                if let SExpression::Symbol(ref sym) = &pair[0] {
+                                    let var_reg = self.find_or_alloc(sym)?;
+                                    var_regs.push(var_reg);
+                                }
+                            }
+                        }
+                        //copy from init_regs to var_regs
+                        for (init_reg, var_reg) in init_regs.iter().zip(var_regs.iter()) {
+                            self.bytecode.store_opcode(Instr::CopyReg, *var_reg, *init_reg, 0);
+                        }
+                        //compile body
+                        let mut last_reg = 0;
+                        for (index, expr) in body.iter().enumerate() {
+                            last_reg = self.compile_expr(expr, &[], is_tail && index == body.len() - 1)?;
+                        }
+                        self.end_scope();
+                        Ok(last_reg)
+                    }
+                    else {
+                        Err(CompilationError::from("First argument must be a list of bindings"))
+                    }
+                }
+            },
+            Instruction::LetStar => {
+                if args.len() < 2 {
+                    Err(CompilationError::from("Expected at least 2 arguments"))
+                }
+                else {
+                    let bindings = &args[0];
+                    let body = &args[1..];
+                        if let SExpression::List(bindings_list) = bindings {
+                        self.begin_scope();
+                        // preserve outer register allocation for letrec
+                        if let Some(prev) = self.scope_stack.last() {
+                            self.last_used_reg = prev.last_used_reg;
+                            self.max_used_registers = prev.max_used_registers;
+                        }
+                        // preserve outer register allocation for sequential let* bindings
+                        if let Some(prev) = self.scope_stack.last() {
+                            self.last_used_reg = prev.last_used_reg;
+                            self.max_used_registers = prev.max_used_registers;
+                        }
+                        for binding in bindings_list {
+                            if let SExpression::List(ref pair) = binding {
+                                if pair.len() != 2 {
+                                    return Err(CompilationError::from("Binding must be (var init)"));
+                                }
+                                if let SExpression::Symbol(ref sym) = &pair[0] {
+                                    let init_reg = self.compile_expr(&pair[1], &[], false)?;
+                                    let var_reg = self.find_or_alloc(sym)?;
+                                    self.bytecode.store_opcode(Instr::CopyReg, var_reg, init_reg, 0);
+                                }
+                                else {
+                                    return Err(CompilationError::from("First element of binding must be a symbol"));
+                                }
+                            }
+                            else {
+                                return Err(CompilationError::from("Binding must be a list"));
+                            }
+                        }
+                        //compile body
+                        let mut last_reg = 0;
+                        for (index, expr) in body.iter().enumerate() {
+                            last_reg = self.compile_expr(expr, &[], is_tail && index == body.len() - 1)?;
+                        }
+                        self.end_scope();
+                        Ok(last_reg)
+                    }
+                    else {
+                        Err(CompilationError::from("First argument must be a list of bindings"))
+                    }
+                }
+            },
+            Instruction::Letrec => {
+                if args.len() < 2 {
+                    Err(CompilationError::from("Expected at least 2 arguments"))
+                }
+                else {
+                    let bindings = &args[0];
+                    let body = &args[1..];
+                    if let SExpression::List(bindings_list) = bindings {
+                        self.begin_scope();
+                        //allocate all vars first
+                        let mut var_regs = Vec::new();
+                        for binding in bindings_list {
+                            if let SExpression::List(ref pair) = binding {
+                                if pair.len() != 2 {
+                                    return Err(CompilationError::from("Binding must be (var init)"));
+                                }
+                                if let SExpression::Symbol(ref sym) = &pair[0] {
+                                    let var_reg = self.find_or_alloc(sym)?;
+                                    var_regs.push(var_reg);
+                                }
+                                else {
+                                    return Err(CompilationError::from("First element of binding must be a symbol"));
+                                }
+                            }
+                            else {
+                                return Err(CompilationError::from("Binding must be a list"));
+                            }
+                        }
+                        //now compile inits
+                        for (i, binding) in bindings_list.iter().enumerate() {
+                            if let SExpression::List(ref pair) = binding {
+                                let init_reg = self.compile_expr(&pair[1], &[], false)?;
+                                self.bytecode.store_opcode(Instr::CopyReg, var_regs[i], init_reg, 0);
+                            }
+                        }
+                        //compile body
+                        let mut last_reg = 0;
+                        for (index, expr) in body.iter().enumerate() {
+                            last_reg = self.compile_expr(expr, &[], is_tail && index == body.len() - 1)?;
+                        }
+                        self.end_scope();
+                        Ok(last_reg)
+                    }
+                    else {
+                        Err(CompilationError::from("First argument must be a list of bindings"))
+                    }
                 }
             },
             Instruction::Not => {
@@ -563,15 +728,15 @@ impl Compiler {
                 self.reset_reg(result_reg + 1);
                 Ok(result_reg)
             },
-            Instruction::Plus => self.compile_binary_op(args, Instr::Add),
-            Instruction::Minus => self.compile_binary_op(args, Instr::Sub),
-            Instruction::Multiply => self.compile_binary_op(args, Instr::Mul),
-            Instruction::Divide => self.compile_binary_op(args, Instr::Div),
             Instruction::Eq => self.compile_comparison_op(args, Instr::Eq),
             Instruction::Lt => self.compile_comparison_op(args, Instr::Lt),
             Instruction::Gt => self.compile_comparison_op(args, Instr::Gt),
             Instruction::Leq => self.compile_comparison_op(args, Instr::Leq),
             Instruction::Geq => self.compile_comparison_op(args, Instr::Geq),
+            Instruction::Plus => self.compile_binary_op(args, Instr::Add),
+            Instruction::Minus => self.compile_binary_op(args, Instr::Sub),
+            Instruction::Multiply => self.compile_binary_op(args, Instr::Mul),
+            Instruction::Divide => self.compile_binary_op(args, Instr::Div),
         }
     }
 

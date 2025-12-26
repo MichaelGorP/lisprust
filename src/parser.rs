@@ -74,6 +74,9 @@ impl Parser {
         parser.instructions.insert("define", instructions::Instruction::Define);
         parser.instructions.insert("lambda", instructions::Instruction::Lambda);
         parser.instructions.insert("if", instructions::Instruction::If);
+        parser.instructions.insert("let", instructions::Instruction::Let);
+        parser.instructions.insert("let*", instructions::Instruction::LetStar);
+        parser.instructions.insert("letrec", instructions::Instruction::Letrec);
         parser.instructions.insert("not", instructions::Instruction::Not);
         parser.instructions.insert("and", instructions::Instruction::And);
         parser.instructions.insert("or", instructions::Instruction::Or);

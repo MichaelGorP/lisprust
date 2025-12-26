@@ -18,6 +18,7 @@ fn parse_and_exec(prog: &str) -> SExpression {
     let res = interpreter.execute(&list.0).expect("Failed to execute");
 
     let mut compiler = Compiler::new(false);
+    math_functions::register_functions(&mut compiler);
     let mut prog = compiler.compile(&list.0).unwrap();
     let mut vm = Vm::new();
     let res2 = vm.run(&mut prog).expect("Failed to execute");
@@ -140,6 +141,15 @@ fn test_if() {
 }
 
 #[test]
+fn test_let() {
+    let res = parse_and_exec("(let ((x 1)) (let ((y 2)) (+ x y)))");
+    assert!(compare_expr(res, 3));
+
+    let res = parse_and_exec("(let ((x 1) (y 2)) (+ x y)))");
+    assert!(compare_expr(res, 3));
+}
+
+#[test]
 fn test_compiler_comparisons() {
     let res = compile_and_run("(> 10 (+ 2 3) (* 2 2)))");
     assert!(matches!(res, Some(SExpression::Atom(Atom::Boolean(true)))));
@@ -153,3 +163,37 @@ fn test_trigonometric_functions() {
     let res = compile_and_run("(sin 1.0)").unwrap();
     assert!(compare_expr(res, (1.0 as f64).sin()));
 }
+
+#[test]
+fn test_let_star() {
+    let res = parse_and_exec("(let* ((x 1) (y (+ x 2))) (+ x y))");
+    assert!(compare_expr(res, 4));
+}
+
+#[test]
+fn test_letrec_factorial() {
+    let tokens = lexer::tokenize("(letrec ((fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))) (fact 5))").unwrap_or(vec![]);
+    let parser = Parser::new();
+    let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
+    let interpreter = Interpreter::new();
+    let res = interpreter.execute(&list.0).expect("Interpreter failed");
+    assert!(compare_expr(res, 120));
+}
+
+#[test]
+fn test_let_negative_unbound() {
+    let res = compile_and_run("(let ((f (lambda () (g))) (g (lambda () (f)))) (f))");
+    assert!(matches!(res, None));
+}
+
+#[test]
+fn test_letrec_even_odd() {
+    let tokens = lexer::tokenize("(letrec ((even (lambda (n) (if (= n 0) true (odd (- n 1))))) (odd (lambda (n) (if (= n 0) false (even (- n 1)))))) (even 4))").unwrap_or(vec![]);
+    let parser = Parser::new();
+    let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
+    let interpreter = Interpreter::new();
+    let res = interpreter.execute(&list.0).expect("Interpreter failed");
+    assert!(compare_expr(res, true));
+}
+
+ 
