@@ -1,20 +1,23 @@
 use std::collections::HashMap;
+use std::rc::Rc;
+use std::cell::RefCell;
 
 use crate::parser::{SExpression, Atom};
 
-use super::vp::{FunctionData, FunctionHeader, Instr, JumpCondition, Value, VirtualProgram};
+use super::vp::{ClosureData, FunctionData, FunctionHeader, Instr, JumpCondition, Value, VirtualProgram};
 
 macro_rules! binary_op {
     ($self:ident, $opcode:ident, $op:tt) => {
         {
-            let r1 = &$self.registers[$opcode[2] as usize + $self.window_start];
-            let r2 = &$self.registers[$opcode[3] as usize + $self.window_start];
+            let v1 = $self.resolve_value(&$self.registers[$opcode[2] as usize + $self.window_start]);
+            let v2 = $self.resolve_value(&$self.registers[$opcode[3] as usize + $self.window_start]);
+            
             let res_reg = $opcode[1] as usize + $self.window_start;
-            match (r1, r2) {
-                (Value::Integer(lhs), Value::Integer(rhs)) => $self.registers[res_reg] = Value::Integer(*lhs $op *rhs),
-                (Value::Integer(lhs), Value::Float(rhs)) => $self.registers[res_reg] = Value::Float(*lhs as f64 $op *rhs),
-                (Value::Float(lhs), Value::Float(rhs)) => $self.registers[res_reg] = Value::Float(*lhs $op *rhs),
-                (Value::Float(lhs), Value::Integer(rhs)) => $self.registers[res_reg] = Value::Float(*lhs $op *rhs as f64),
+            match (v1, v2) {
+                (Value::Integer(lhs), Value::Integer(rhs)) => $self.registers[res_reg] = Value::Integer(lhs $op rhs),
+                (Value::Integer(lhs), Value::Float(rhs)) => $self.registers[res_reg] = Value::Float(lhs as f64 $op rhs),
+                (Value::Float(lhs), Value::Float(rhs)) => $self.registers[res_reg] = Value::Float(lhs $op rhs),
+                (Value::Float(lhs), Value::Integer(rhs)) => $self.registers[res_reg] = Value::Float(lhs $op rhs as f64),
                 _ => break,
             }
         }
@@ -24,14 +27,15 @@ macro_rules! binary_op {
 macro_rules! comparison_op {
     ($self:ident, $opcode:ident, $prog:ident, $op:tt) => {
         {
-            let r1 = &$self.registers[$opcode[2] as usize + $self.window_start];
-            let r2 = &$self.registers[$opcode[3] as usize + $self.window_start];
+            let v1 = $self.resolve_value(&$self.registers[$opcode[2] as usize + $self.window_start]);
+            let v2 = $self.resolve_value(&$self.registers[$opcode[3] as usize + $self.window_start]);
+
             let res_reg = $opcode[1] as usize + $self.window_start;
-            let matches = match (r1, r2) {
-                (Value::Integer(lhs), Value::Integer(rhs)) => *lhs $op *rhs,
-                (Value::Integer(lhs), Value::Float(rhs)) => (*lhs as f64) $op *rhs,
-                (Value::Float(lhs), Value::Float(rhs)) => *lhs $op *rhs,
-                (Value::Float(lhs), Value::Integer(rhs)) => *lhs $op *rhs as f64,
+            let matches = match (v1, v2) {
+                (Value::Integer(lhs), Value::Integer(rhs)) => lhs $op rhs,
+                (Value::Integer(lhs), Value::Float(rhs)) => (lhs as f64) $op rhs,
+                (Value::Float(lhs), Value::Float(rhs)) => lhs $op rhs,
+                (Value::Float(lhs), Value::Integer(rhs)) => lhs $op rhs as f64,
                 _ => break,
             };
             //only override register, if it is true
@@ -89,9 +93,16 @@ impl Vm {
         Vm {registers: vec![EMPTY; 256], call_states: Vec::new(), window_start: 0}
     }
 
+    fn resolve_value(&self, val: &Value) -> Value {
+        if let Value::Ref(r) = val {
+            r.borrow().clone()
+        } else {
+            val.clone()
+        }
+    }
+
     pub fn run(&mut self, prog: &mut VirtualProgram) -> Option<SExpression> {
         let mut global_vars = HashMap::new();
-
 
         loop {
             let Some(opcode) = prog.read_opcode() else {
@@ -117,7 +128,7 @@ impl Vm {
                     let Some(val) = prog.read_string() else {
                         return None;
                     };
-                    self.registers[opcode[1] as usize + self.window_start] = Value::String(val.clone());
+                    self.registers[opcode[1] as usize + self.window_start] = Value::String(Rc::new(val));
                 },
                 Ok(Instr::CopyReg) => {
                     self.registers[opcode[1] as usize + self.window_start] = self.registers[opcode[2] as usize + self.window_start].clone();
@@ -127,7 +138,9 @@ impl Vm {
                     let target_reg = self.window_start + opcode[2] as usize;
                     self.registers.swap(src_reg, target_reg);
                 },
-                Ok(Instr::Add) => binary_op!(self, opcode, +),
+                Ok(Instr::Add) => {
+                    binary_op!(self, opcode, +)
+                },
                 Ok(Instr::Sub) => binary_op!(self, opcode, -),
                 Ok(Instr::Mul) => binary_op!(self, opcode, *),
                 Ok(Instr::Div) => binary_op!(self, opcode, /),
@@ -209,49 +222,96 @@ impl Vm {
                 Ok(Instr::CallSymbol) => {
                     let mut func = empty_value();
                     std::mem::swap(&mut func, &mut self.registers[opcode[1] as usize + self.window_start]);
-                    let Value::FuncRef(func) = func else {
-                        break;
+                    
+                    // Handle Ref dereferencing
+                    let resolved_func = if let Value::Ref(r) = &func {
+                        r.borrow().clone()
+                    } else {
+                        func
+                    };
+
+                    let (header, address, captures) = match resolved_func {
+                        Value::FuncRef(f) => (f.header, f.address, None),
+                        Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone())),
+                        _ => {
+                            break;
+                        }
                     };
 
                     let param_start = opcode[2];
-                    let size = param_start as usize + func.header.register_count as usize + self.window_start;
+                    let size = param_start as usize + header.register_count as usize + self.window_start;
                     if size >= self.registers.len() {
                         self.registers.resize(size, empty_value());
                     }
                     let old_ws = self.window_start;
-                    let state = CallState{window_start: old_ws, result_reg: func.header.result_reg, target_reg: opcode[3], return_addr: prog.current_address()};
+                    let ret_addr = prog.current_address();
+                    let state = CallState{window_start: old_ws, result_reg: header.result_reg, target_reg: opcode[3], return_addr: ret_addr};
                     self.call_states.push(state);
                     self.window_start += param_start as usize;
-                    prog.jump_to(func.address);
+                    
+                    // Copy captures into registers
+                    if let Some(caps) = captures {
+                        let start_reg = header.param_count as usize;
+                        for (i, val) in caps.into_iter().enumerate() {
+                            self.registers[self.window_start + start_reg + i] = val;
+                        }
+                    }
+                    
+                    prog.jump_to(address);
                 },
                 Ok(Instr::TailCallSymbol) => {
                     // For tail-calls, clone the function value instead of swapping it out.
-                    // Swapping can clear the function register that subsequent callee
-                    // CopyReg instructions expect to read; cloning preserves the source.
                     let func_val = self.registers[opcode[1] as usize + self.window_start].clone();
-                    let Value::FuncRef(func) = func_val else {
-                        break;
+                    
+                    let resolved_func = if let Value::Ref(r) = &func_val {
+                        r.borrow().clone()
+                    } else {
+                        func_val
+                    };
+
+                    let (header, address, captures) = match resolved_func {
+                        Value::FuncRef(f) => (f.header, f.address, None),
+                        Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone())),
+                        _ => break
                     };
 
                     let param_start = opcode[2];
                     // Copy parameters into the target area for tail-call instead of swapping.
-                    // Swapping can overwrite registers holding closures or captured values;
-                    // copying preserves source values until all targets are written.
                     let mut params: Vec<Value> = Vec::new();
-                    for i in 0..(func.header.param_count as usize) {
-                        let idx = self.window_start + i;
+                    for i in 0..(header.param_count as usize) {
+                        let idx = self.window_start + param_start as usize + i;
                         params.push(self.registers[idx].clone());
                     }
-                    for i in 0..params.len() {
-                        let target_reg = self.window_start + param_start as usize + i;
-                        self.registers[target_reg] = params[i].clone();
+                    for (i, param) in params.into_iter().enumerate() {
+                        let target_reg = self.window_start + i;
+                        self.registers[target_reg] = param;
                     }
 
                     if let Some(last_frame) = self.call_states.last_mut() {
-                        last_frame.result_reg = func.header.result_reg;
+                        last_frame.result_reg = header.result_reg;
                     }
                     
-                    prog.jump_to(func.address);
+                    // Copy captures into registers (after parameters)
+                    if let Some(caps) = captures {
+                        let start_reg = header.param_count as usize;
+                        for (i, val) in caps.into_iter().enumerate() {
+                            // Note: For tail calls, we are writing into the *current* window (which is reused)
+                            // But we shifted parameters to `param_start`? 
+                            // Wait, `TailCallSymbol` logic in this VM is:
+                            // 1. Copy params from current window to `param_start` (which is usually 0).
+                            // 2. Jump.
+                            // So the new frame starts at `self.window_start + param_start`.
+                            // But `TailCall` implies we reuse the current frame?
+                            // The current implementation of `TailCallSymbol` does NOT change `self.window_start`.
+                            // It assumes `param_start` is 0 (or where the new frame starts relative to current).
+                            // Usually `param_start` is 0 for tail calls.
+                            // So we write captures to `self.window_start + param_count + i`.
+                            let target = self.window_start + start_reg + i;
+                            self.registers[target] = val;
+                        }
+                    }
+
+                    prog.jump_to(address);
                 },
                 Ok(Instr::CallFunction) => {
                     let Some(func_id) = prog.read_int() else {
@@ -264,6 +324,53 @@ impl Vm {
                     let reg_count = opcode[3] as usize;
                     self.registers[opcode[1] as usize + self.window_start] = function(&self.registers[self.window_start + start_reg.. self.window_start + start_reg + reg_count]);
                 }
+                Ok(Instr::MakeClosure) => {
+                    let dest_reg = opcode[1] as usize + self.window_start;
+                    let func_reg = opcode[2] as usize + self.window_start;
+                    let count = opcode[3] as usize;
+                    
+                    let mut captures = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let Some(reg_idx) = prog.read_byte() else { break; };
+                        let val = self.registers[reg_idx as usize + self.window_start].clone();
+                        captures.push(val);
+                    }
+                    
+                    let func_val = &self.registers[func_reg];
+
+                    if let Value::FuncRef(fd) = func_val {
+                        self.registers[dest_reg] = Value::Closure(Rc::new(ClosureData{function: fd.clone(), captures}));
+                    } else {
+                        self.registers[dest_reg] = Value::Empty; 
+                    }
+                },
+                Ok(Instr::MakeRef) => {
+                    let reg = opcode[1] as usize + self.window_start;
+                    let val = self.registers[reg].clone();
+                    self.registers[reg] = Value::Ref(Rc::new(RefCell::new(val)));
+                },
+                Ok(Instr::SetRef) => {
+                    let dest_reg = opcode[1] as usize + self.window_start;
+                    let src_reg = opcode[2] as usize + self.window_start;
+                    if let Value::Ref(r) = &self.registers[dest_reg] {
+                        *r.borrow_mut() = self.registers[src_reg].clone();
+                    }
+                },
+                Ok(Instr::Deref) => {
+                    let dest_reg = opcode[1] as usize + self.window_start;
+                    let src_reg = opcode[2] as usize + self.window_start;
+                    let val = if let Value::Ref(r) = &self.registers[src_reg] {
+                        Some(r.borrow().clone())
+                    } else {
+                        None
+                    };
+                    
+                    if let Some(v) = val {
+                        self.registers[dest_reg] = v;
+                    } else {
+                        self.registers[dest_reg] = self.registers[src_reg].clone();
+                    }
+                },
                 Ok(Instr::Ret) => {
                     let Some(state) = self.call_states.pop() else {
                         break; //nothing to return from
@@ -297,7 +404,7 @@ fn value_to_sexpr(value: &Value) -> Option<SExpression> {
         Value::Boolean(b) => Some(SExpression::Atom(Atom::Boolean(*b))),
         Value::Integer(i) => Some(SExpression::Atom(Atom::Integer(*i))),
         Value::Float(f) => Some(SExpression::Atom(Atom::Float(*f))),
-        Value::String(s) => Some(SExpression::Atom(Atom::String(s.clone()))),
+        Value::String(s) => Some(SExpression::Atom(Atom::String(s.as_ref().clone()))),
         Value::List(l) => {
             let mut expressions = Vec::with_capacity(l.len());
             let data_ref = l.values();
@@ -307,6 +414,8 @@ fn value_to_sexpr(value: &Value) -> Option<SExpression> {
             }
             Some(SExpression::List(expressions))
         }
-        Value::FuncRef(_) => todo!()
+        Value::FuncRef(_) => None,
+        Value::Closure(_) => None,
+        Value::Ref(r) => value_to_sexpr(&r.borrow())
     }
 }

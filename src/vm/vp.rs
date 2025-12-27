@@ -34,7 +34,11 @@ pub(super) enum Instr {
     CallSymbol,
     TailCallSymbol, //does a call without creating a new call frame
     CallFunction,
-    Ret
+    Ret,
+    MakeClosure,
+    MakeRef,
+    SetRef,
+    Deref
 }
 
 #[repr(u8)]
@@ -75,6 +79,10 @@ impl TryFrom<u8> for Instr {
             x if x == Instr::TailCallSymbol as u8 => Ok(Instr::TailCallSymbol),
             x if x == Instr::CallFunction as u8 => Ok(Instr::CallFunction),
             x if x == Instr::Ret as u8 => Ok(Instr::Ret),
+            x if x == Instr::MakeClosure as u8 => Ok(Instr::MakeClosure),
+            x if x == Instr::MakeRef as u8 => Ok(Instr::MakeRef),
+            x if x == Instr::SetRef as u8 => Ok(Instr::SetRef),
+            x if x == Instr::Deref as u8 => Ok(Instr::Deref),
             _ => Err(())
         }
     }
@@ -151,14 +159,22 @@ impl ListSlice {
 }
 
 #[derive(PartialEq, Clone, Debug)]
+pub struct ClosureData {
+    pub function: FunctionData,
+    pub captures: Vec<Value>
+}
+
+#[derive(PartialEq, Clone, Debug)]
 pub enum Value {
     Empty,
     Boolean(bool),
     Integer(i64),
     Float(f64),
-    String(String),
+    String(Rc<String>),
     List(ListSlice),
-    FuncRef(FunctionData)
+    FuncRef(FunctionData),
+    Closure(Rc<ClosureData>),
+    Ref(Rc<RefCell<Value>>)
 }
 
 impl Value {
@@ -202,6 +218,16 @@ impl VirtualProgram {
         let mut buffer = [0 as u8; 4];
         if let Ok(()) = self.cursor.read_exact(&mut buffer) {
             Some(buffer)
+        }
+        else {
+            None
+        }
+    }
+
+    pub(super) fn read_byte(&mut self) -> Option<u8> {
+        let mut buffer = [0 as u8; 1];
+        if let Ok(()) = self.cursor.read_exact(&mut buffer) {
+            Some(buffer[0])
         }
         else {
             None
