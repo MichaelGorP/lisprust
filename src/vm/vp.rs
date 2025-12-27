@@ -100,7 +100,7 @@ impl OpCode {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(packed)]
-pub(super) struct FunctionHeader {
+pub struct FunctionHeader {
     pub param_count: u8,
     pub register_count: u8,
     pub result_reg: u8
@@ -232,6 +232,10 @@ impl VirtualProgram {
         let mut buffer = [0 as u8; size_of::<usize>()];
         if let Ok(()) = self.cursor.read_exact(&mut buffer) {
             let size = usize::from_le_bytes(buffer);
+            // guard against bogus sizes to avoid huge allocations when disassembling
+            if size > 1_000_000 {
+                return None;
+            }
             let mut str_buf: Vec<u8> = Vec::with_capacity(size);
             str_buf.resize(size, 0);
             if let Ok(()) = self.cursor.read_exact(&mut str_buf) {
@@ -252,7 +256,8 @@ impl VirtualProgram {
     }
 
     pub(super) fn jump(&mut self, distance: i64) {
-        let pos = (self.cursor.position() as i64) + distance;
+        let old = self.cursor.position();
+        let pos = (old as i64) + distance;
         self.cursor.set_position(pos as u64);
     }
 

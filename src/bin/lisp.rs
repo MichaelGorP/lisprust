@@ -31,8 +31,10 @@ fn main() {
 
     let args: Vec<String> = env::args().collect();
     let mut generate_asm = false;
-    if args.len() == 2 {
-        generate_asm = &args[1] == "--asm";
+    for a in args.iter().skip(1) {
+        if a == "--asm" {
+            generate_asm = true;
+        }
     }
 
     let mut compiler = Compiler::new(generate_asm);

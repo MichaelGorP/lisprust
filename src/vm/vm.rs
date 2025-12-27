@@ -92,6 +92,7 @@ impl Vm {
     pub fn run(&mut self, prog: &mut VirtualProgram) -> Option<SExpression> {
         let mut global_vars = HashMap::new();
 
+
         loop {
             let Some(opcode) = prog.read_opcode() else {
                 break;
@@ -116,7 +117,7 @@ impl Vm {
                     let Some(val) = prog.read_string() else {
                         return None;
                     };
-                    self.registers[opcode[1] as usize + self.window_start] = Value::String(val);
+                    self.registers[opcode[1] as usize + self.window_start] = Value::String(val.clone());
                 },
                 Ok(Instr::CopyReg) => {
                     self.registers[opcode[1] as usize + self.window_start] = self.registers[opcode[2] as usize + self.window_start].clone();
@@ -217,23 +218,33 @@ impl Vm {
                     if size >= self.registers.len() {
                         self.registers.resize(size, empty_value());
                     }
-                    let state = CallState{window_start: self.window_start, result_reg: func.header.result_reg, target_reg: opcode[3], return_addr: prog.current_address()};
+                    let old_ws = self.window_start;
+                    let state = CallState{window_start: old_ws, result_reg: func.header.result_reg, target_reg: opcode[3], return_addr: prog.current_address()};
                     self.call_states.push(state);
                     self.window_start += param_start as usize;
                     prog.jump_to(func.address);
                 },
                 Ok(Instr::TailCallSymbol) => {
-                    let mut func = empty_value();
-                    std::mem::swap(&mut func, &mut self.registers[opcode[1] as usize + self.window_start]);
-                    let Value::FuncRef(func) = func else {
+                    // For tail-calls, clone the function value instead of swapping it out.
+                    // Swapping can clear the function register that subsequent callee
+                    // CopyReg instructions expect to read; cloning preserves the source.
+                    let func_val = self.registers[opcode[1] as usize + self.window_start].clone();
+                    let Value::FuncRef(func) = func_val else {
                         break;
                     };
 
                     let param_start = opcode[2];
-                    for i in self.window_start .. self.window_start + func.header.param_count as usize {
-                        let source_reg = i;
-                        let target_reg = i + param_start as usize;
-                        self.registers.swap(source_reg, target_reg);
+                    // Copy parameters into the target area for tail-call instead of swapping.
+                    // Swapping can overwrite registers holding closures or captured values;
+                    // copying preserves source values until all targets are written.
+                    let mut params: Vec<Value> = Vec::new();
+                    for i in 0..(func.header.param_count as usize) {
+                        let idx = self.window_start + i;
+                        params.push(self.registers[idx].clone());
+                    }
+                    for i in 0..params.len() {
+                        let target_reg = self.window_start + param_start as usize + i;
+                        self.registers[target_reg] = params[i].clone();
                     }
 
                     if let Some(last_frame) = self.call_states.last_mut() {
@@ -263,8 +274,11 @@ impl Vm {
                     self.window_start = state.window_start;
                     prog.jump_to(state.return_addr);
                 },
-                _ => break,
+                _ => {
+                    break;
+                },
             }
+
         }
 
         //cleanup

@@ -15,13 +15,19 @@ fn parse_and_exec(prog: &str) -> SExpression {
     let parser = Parser::new();
     let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
     let interpreter = Interpreter::new();
-    let res = interpreter.execute(&list.0).expect("Failed to execute");
+    let res = match interpreter.execute(&list.0) {
+        Ok(r) => r,
+        Err(e) => panic!("Interpreter failed: {}", e)
+    };
 
     let mut compiler = Compiler::new(false);
     math_functions::register_functions(&mut compiler);
     let mut prog = compiler.compile(&list.0).unwrap();
     let mut vm = Vm::new();
-    let res2 = vm.run(&mut prog).expect("Failed to execute");
+    let res2 = match vm.run(&mut prog) {
+        Some(r) => r,
+        None => panic!("VM failed to execute")
+    };
     assert!(res == res2);
     res
 }
@@ -172,11 +178,7 @@ fn test_let_star() {
 
 #[test]
 fn test_letrec_factorial() {
-    let tokens = lexer::tokenize("(letrec ((fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))) (fact 5))").unwrap_or(vec![]);
-    let parser = Parser::new();
-    let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
-    let interpreter = Interpreter::new();
-    let res = interpreter.execute(&list.0).expect("Interpreter failed");
+    let res = parse_and_exec("(letrec ((fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))) (fact 5))");
     assert!(compare_expr(res, 120));
 }
 
@@ -188,12 +190,28 @@ fn test_let_negative_unbound() {
 
 #[test]
 fn test_letrec_even_odd() {
-    let tokens = lexer::tokenize("(letrec ((even (lambda (n) (if (= n 0) true (odd (- n 1))))) (odd (lambda (n) (if (= n 0) false (even (- n 1)))))) (even 4))").unwrap_or(vec![]);
-    let parser = Parser::new();
-    let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
-    let interpreter = Interpreter::new();
-    let res = interpreter.execute(&list.0).expect("Interpreter failed");
+    let res = parse_and_exec("(letrec ((even (lambda (n) (if (= n 0) true (odd (- n 1))))) (odd (lambda (n) (if (= n 0) false (even (- n 1)))))) (even 4))");
     assert!(compare_expr(res, true));
 }
+
+#[test]
+fn debug_compiled_letrec_simple() {
+    let prog_str = "(letrec ((fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))) (fact 5))";
+    let tokens = lexer::tokenize(prog_str).unwrap_or(vec![]);
+    let parser = Parser::new();
+    let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
+    let mut compiler = Compiler::new(true);
+    math_functions::register_functions(&mut compiler);
+    let mut prog = compiler.compile(&list.0).unwrap();
+    println!("ASM:\n{}", prog.get_listing());
+    let mut vm = Vm::new();
+    let res = vm.run(&mut prog);
+    println!("VM result: {:?}", res);
+    let interp = Interpreter::new();
+    let res2 = interp.execute(&list.0).unwrap();
+    println!("Interpreter result: {:?}", res2);
+}
+
+ 
 
  
