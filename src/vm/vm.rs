@@ -38,12 +38,8 @@ macro_rules! comparison_op {
                 (Value::Float(lhs), Value::Integer(rhs)) => lhs $op rhs as f64,
                 _ => break,
             };
-            //only override register, if it is true
-            if let Value::Boolean(b) = $self.registers[res_reg] {
-                if (b && !matches) {
-                    $self.registers[res_reg] = Value::Boolean(matches);
-                }
-            }
+            
+            $self.registers[res_reg] = Value::Boolean(matches);
 
             //try if the next instruction is a jump
             let Some(opcode) = $prog.read_opcode() else {
@@ -220,8 +216,7 @@ impl Vm {
                     self.registers[opcode[1] as usize + self.window_start] = Value::FuncRef(FunctionData{header, address: func_addr as u64});
                 },
                 Ok(Instr::CallSymbol) => {
-                    let mut func = empty_value();
-                    std::mem::swap(&mut func, &mut self.registers[opcode[1] as usize + self.window_start]);
+                    let func = self.registers[opcode[1] as usize + self.window_start].clone();
                     
                     // Handle Ref dereferencing
                     let resolved_func = if let Value::Ref(r) = &func {
@@ -275,6 +270,11 @@ impl Vm {
                         _ => break
                     };
 
+                    let size = self.window_start + header.register_count as usize;
+                    if size >= self.registers.len() {
+                        self.registers.resize(size, empty_value());
+                    }
+
                     let param_start = opcode[2];
                     // Copy parameters into the target area for tail-call instead of swapping.
                     let mut params: Vec<Value> = Vec::new();
@@ -295,17 +295,6 @@ impl Vm {
                     if let Some(caps) = captures {
                         let start_reg = header.param_count as usize;
                         for (i, val) in caps.into_iter().enumerate() {
-                            // Note: For tail calls, we are writing into the *current* window (which is reused)
-                            // But we shifted parameters to `param_start`? 
-                            // Wait, `TailCallSymbol` logic in this VM is:
-                            // 1. Copy params from current window to `param_start` (which is usually 0).
-                            // 2. Jump.
-                            // So the new frame starts at `self.window_start + param_start`.
-                            // But `TailCall` implies we reuse the current frame?
-                            // The current implementation of `TailCallSymbol` does NOT change `self.window_start`.
-                            // It assumes `param_start` is 0 (or where the new frame starts relative to current).
-                            // Usually `param_start` is 0 for tail calls.
-                            // So we write captures to `self.window_start + param_count + i`.
                             let target = self.window_start + start_reg + i;
                             self.registers[target] = val;
                         }

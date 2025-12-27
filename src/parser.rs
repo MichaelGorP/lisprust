@@ -63,6 +63,11 @@ pub struct ParseError {
     error: String
 }
 
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
 
 pub struct Parser {
     instructions: CaseInsensitiveHashMap<instructions::Instruction>

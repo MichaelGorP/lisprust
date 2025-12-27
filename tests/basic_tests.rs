@@ -212,6 +212,41 @@ fn debug_compiled_letrec_simple() {
     println!("Interpreter result: {:?}", res2);
 }
 
- 
+#[test]
+fn test_variadic_arithmetic() {
+    let res = parse_and_exec("(+ 1 2 3 4)");
+    assert!(compare_expr(res, 10));
 
- 
+    let res = parse_and_exec("(* 2 3 4)");
+    assert!(compare_expr(res, 24));
+
+    let res = parse_and_exec("(- 10 2 1)");
+    assert!(compare_expr(res, 7));
+
+    let res = parse_and_exec("(/ 20 2 2)");
+    assert!(compare_expr(res, 5));
+}
+
+#[test]
+fn test_variadic_comparisons() {
+    let res = parse_and_exec("(< 1 2 3 4)");
+    assert!(compare_expr(res, true));
+
+    let res = parse_and_exec("(< 1 2 5 4)");
+    assert!(compare_expr(res, false));
+
+    let res = parse_and_exec("(= 2 2 2)");
+    assert!(compare_expr(res, true));
+
+    let res = parse_and_exec("(= 2 2 3)");
+    assert!(compare_expr(res, false));
+}
+
+#[test]
+fn test_short_circuit_logic() {
+    let res = parse_and_exec("(and true true false true)");
+    assert!(compare_expr(res, false));
+
+    let res = parse_and_exec("(or false false true false)");
+    assert!(compare_expr(res, true));
+}
