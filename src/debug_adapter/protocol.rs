@@ -93,6 +93,10 @@ pub struct StackFrame {
     pub source: Option<Source>,
     pub line: i64,
     pub column: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_column: Option<i64>,
 }
 
 #[derive(Serialize, Debug)]

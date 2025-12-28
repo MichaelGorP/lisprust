@@ -287,6 +287,9 @@ impl DebugAdapter {
                                 paused: stop_on_entry,
                                 step_mode: StepMode::None,
                                 program_path,
+                                step_start_line: 0,
+                                step_start_col: 0,
+                                step_start_depth: 0,
                             };
                             
                             if stop_on_entry {
@@ -478,6 +481,9 @@ struct VmDebugger {
     paused: bool,
     step_mode: StepMode,
     program_path: String,
+    step_start_line: i64,
+    step_start_col: i64,
+    step_start_depth: usize,
 }
 
 impl VmDebugger {
@@ -502,16 +508,28 @@ impl VmDebugger {
             VmCommand::StepIn => {
                 self.paused = false;
                 self.step_mode = StepMode::StepIn;
+                let (line, col, _, _) = self.get_location_from_addr(prog.current_address() as usize, prog);
+                self.step_start_line = line;
+                self.step_start_col = col;
+                self.step_start_depth = vm.call_stack().len();
                 true
             },
             VmCommand::StepOver => {
                 self.paused = false;
                 self.step_mode = StepMode::StepOver;
+                let (line, col, _, _) = self.get_location_from_addr(prog.current_address() as usize, prog);
+                self.step_start_line = line;
+                self.step_start_col = col;
+                self.step_start_depth = vm.call_stack().len();
                 true
             },
             VmCommand::StepOut => {
                 self.paused = false;
                 self.step_mode = StepMode::StepOut;
+                let (line, col, _, _) = self.get_location_from_addr(prog.current_address() as usize, prog);
+                self.step_start_line = line;
+                self.step_start_col = col;
+                self.step_start_depth = vm.call_stack().len();
                 true
             },
             VmCommand::Pause => {
@@ -540,30 +558,45 @@ impl VmDebugger {
         }
     }
     
-    fn get_line_from_addr(&self, addr: usize, prog: &VirtualProgram) -> i64 {
+    fn get_line_col(&self, offset: usize) -> (i64, i64) {
+        for (i, &line_start) in self.source_lines.iter().enumerate() {
+            if line_start > offset {
+                let line_idx = i - 1;
+                let line_start_offset = self.source_lines[line_idx];
+                let col = offset - line_start_offset + 1;
+                return ((line_idx + 1) as i64, col as i64);
+            }
+        }
+        if let Some(&last_start) = self.source_lines.last() {
+             let col = offset - last_start + 1;
+             return (self.source_lines.len() as i64, col as i64);
+        }
+        (0, 0)
+    }
+
+    fn get_location_from_addr(&self, addr: usize, prog: &VirtualProgram) -> (i64, i64, Option<i64>, Option<i64>) {
         let mut best_span = None;
-        for (map_addr, span) in &prog.source_map {
+        // Source map is sorted by address. We want the last entry where map_addr <= addr.
+        for (map_addr, span) in prog.source_map.iter().rev() {
             if *map_addr <= addr {
                 best_span = Some(span.clone());
+                break;
             }
         }
         
         if let Some(span) = best_span {
-            for (i, &offset) in self.source_lines.iter().enumerate() {
-                if offset > span.start {
-                    return i as i64; 
-                }
-            }
-            return self.source_lines.len() as i64;
+            let (line, col) = self.get_line_col(span.start);
+            let (end_line, end_col) = self.get_line_col(span.end);
+            return (line, col, Some(end_line), Some(end_col));
         }
-        0
+        (0, 0, None, None)
     }
 
     fn create_stack_trace(&self, vm: &Vm, prog: &VirtualProgram) -> Vec<StackFrame> {
         let mut frames = Vec::new();
         
         // Current frame
-        let current_line = self.get_line_from_addr(prog.current_address() as usize, prog);
+        let (line, col, end_line, end_col) = self.get_location_from_addr(prog.current_address() as usize, prog);
         frames.push(StackFrame {
             id: 0,
             name: "current".to_string(),
@@ -571,8 +604,10 @@ impl VmDebugger {
                 name: Some("main.lisp".to_string()),
                 path: Some(self.program_path.clone()),
             }),
-            line: current_line,
-            column: 0,
+            line,
+            column: col,
+            end_line,
+            end_column: end_col,
         });
 
         // Call stack
@@ -580,7 +615,7 @@ impl VmDebugger {
         // We need to iterate backwards?
         // Vm call_stack is a Vec.
         for (i, call) in vm.call_stack().iter().rev().enumerate() {
-             let line = self.get_line_from_addr(call.return_addr as usize, prog);
+             let (line, col, end_line, end_col) = self.get_location_from_addr(call.return_addr as usize, prog);
              frames.push(StackFrame {
                 id: (i + 1) as i64,
                 name: format!("frame {}", i + 1),
@@ -589,7 +624,9 @@ impl VmDebugger {
                     path: Some(self.program_path.clone()),
                 }),
                 line,
-                column: 0,
+                column: col,
+                end_line,
+                end_column: end_col,
             });
         }
         
@@ -679,7 +716,7 @@ impl Debugger for VmDebugger {
             return;
         }
 
-        let current_line = self.get_line_from_addr(prog.current_address() as usize, prog);
+        let (current_line, current_col, _, _) = self.get_location_from_addr(prog.current_address() as usize, prog);
 
         // Check breakpoints
         // We check if the current line is in the breakpoints list for the current file.
@@ -715,24 +752,38 @@ impl Debugger for VmDebugger {
         }
 
         // Step logic
+        let current_depth = vm.call_stack().len();
         match self.step_mode {
             StepMode::StepIn => {
-                self.paused = true;
-                self.adapter_tx.send(AdapterMessage::Vm(VmEvent::Stopped("step".to_string()))).unwrap();
-                self.wait_for_command(vm, prog);
+                // Stop if we entered a new frame, or returned, or changed line/col in same frame
+                if current_depth != self.step_start_depth || current_line != self.step_start_line || current_col != self.step_start_col {
+                    self.paused = true;
+                    self.adapter_tx.send(AdapterMessage::Vm(VmEvent::Stopped("step".to_string()))).unwrap();
+                    self.wait_for_command(vm, prog);
+                }
             },
             StepMode::StepOver => {
-                // TODO: Implement proper step over (track stack depth)
-                // For now, just step
-                self.paused = true;
-                self.adapter_tx.send(AdapterMessage::Vm(VmEvent::Stopped("step".to_string()))).unwrap();
-                self.wait_for_command(vm, prog);
+                // Stop if we returned (depth < start), or same depth and changed line/col.
+                // If depth > start, we are inside a call, so don't stop.
+                if current_depth < self.step_start_depth {
+                     self.paused = true;
+                     self.adapter_tx.send(AdapterMessage::Vm(VmEvent::Stopped("step".to_string()))).unwrap();
+                     self.wait_for_command(vm, prog);
+                } else if current_depth == self.step_start_depth {
+                    if current_line != self.step_start_line || current_col != self.step_start_col {
+                        self.paused = true;
+                        self.adapter_tx.send(AdapterMessage::Vm(VmEvent::Stopped("step".to_string()))).unwrap();
+                        self.wait_for_command(vm, prog);
+                    }
+                }
             },
             StepMode::StepOut => {
-                // TODO: Implement proper step out
-                self.paused = true;
-                self.adapter_tx.send(AdapterMessage::Vm(VmEvent::Stopped("step".to_string()))).unwrap();
-                self.wait_for_command(vm, prog);
+                // Stop if we returned (depth < start)
+                if current_depth < self.step_start_depth {
+                    self.paused = true;
+                    self.adapter_tx.send(AdapterMessage::Vm(VmEvent::Stopped("step".to_string()))).unwrap();
+                    self.wait_for_command(vm, prog);
+                }
             },
             StepMode::None => {}
         }
