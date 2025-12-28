@@ -51,8 +51,11 @@ pub enum Token {
     Symbol(String),
 }
 
-pub fn tokenize(prog: &str) -> Result<Vec<Token>, TokenizingError> {
+pub fn tokenize(prog: &str) -> Result<Vec<(Token, std::ops::Range<usize>)>, TokenizingError> {
     let lexer = Token::lexer(prog);
-    let tokens = lexer.collect();
+    let tokens: Result<Vec<(Token, std::ops::Range<usize>)>, TokenizingError> = lexer.spanned().map(|(token, span)| match token {
+        Ok(t) => Ok((t, span)),
+        Err(e) => Err(e)
+    }).collect();
     tokens
 }

@@ -2,6 +2,7 @@ use std::fmt;
 use crate::{lexer::Token, instructions};
 use case_insensitive_hashmap::CaseInsensitiveHashMap;
 use derive_more::derive::From;
+use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq, From)]
 pub enum Atom {
@@ -27,6 +28,21 @@ impl fmt::Display for Atom {
 pub struct Lambda {
     pub args: Vec<String>,
     pub body: SExpression
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SourceMap {
+    Leaf(Range<usize>),
+    List(Range<usize>, Vec<SourceMap>)
+}
+
+impl SourceMap {
+    pub fn span(&self) -> Range<usize> {
+        match self {
+            SourceMap::Leaf(r) => r.clone(),
+            SourceMap::List(r, _) => r.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,43 +113,69 @@ impl Parser {
         parser
     }
 
-    pub fn parse(&self, tokens: &[Token]) -> Result<(SExpression, usize), ParseError> {
+    pub fn parse(&self, tokens: &[(Token, std::ops::Range<usize>)]) -> Result<(SExpression, SourceMap, usize), ParseError> {
         if tokens.is_empty() {
             return Err(ParseError{error: "Empty list".to_string()});
         }
         
         let mut list: Vec<SExpression> = Vec::new();
+        let mut map_list: Vec<SourceMap> = Vec::new();
         let mut i = 0;
+        let start_span = tokens[0].1.start;
+
         while i < tokens.len() {
-            let token = &tokens[i];
+            let (token, span) = &tokens[i];
+            let current_span = span.clone();
+            
             match token {
-                Token::Integer(n) => list.push(SExpression::Atom(Atom::Integer(*n))),
-                Token::Float(f) => list.push(SExpression::Atom(Atom::Float(*f))),
-                Token::Boolean(b) => list.push(SExpression::Atom(Atom::Boolean(*b))),
-                Token::String(s) => list.push(SExpression::Atom(Atom::String(s.clone()))),
+                Token::Integer(n) => {
+                    list.push(SExpression::Atom(Atom::Integer(*n)));
+                    map_list.push(SourceMap::Leaf(current_span));
+                },
+                Token::Float(f) => {
+                    list.push(SExpression::Atom(Atom::Float(*f)));
+                    map_list.push(SourceMap::Leaf(current_span));
+                },
+                Token::Boolean(b) => {
+                    list.push(SExpression::Atom(Atom::Boolean(*b)));
+                    map_list.push(SourceMap::Leaf(current_span));
+                },
+                Token::String(s) => {
+                    list.push(SExpression::Atom(Atom::String(s.clone())));
+                    map_list.push(SourceMap::Leaf(current_span));
+                },
                 Token::LParen => {
-                    let sub_list = self.parse(&tokens[i + 1..])?;
-                    i += sub_list.1;
-                    if i == tokens.len() && list.is_empty() {
-                        return Ok((sub_list.0, i));
-                    }
-                    else {
-                        list.push(sub_list.0);
-                    }
+                    let sub_list_res = self.parse(&tokens[i + 1..])?;
+                    let sub_list = sub_list_res.0;
+                    let sub_map = sub_list_res.1;
+                    let consumed = sub_list_res.2;
+                    
+                    list.push(sub_list);
+                    map_list.push(sub_map);
+
+                    i += consumed;
                 }
                 Token::RParen => { 
-                    return Ok((SExpression::List(list), i + 1));
+                    let end_span = span.end;
+                    return Ok((SExpression::List(list), SourceMap::List(start_span..end_span, map_list), i + 1));
                 },
                 Token::Symbol(s) => {
                     let it = self.instructions.get(s.as_str());
                     match it {
-                        Some(&instr) => list.push(SExpression::BuiltIn(instr)),
-                        None => list.push(SExpression::Symbol(s.clone()))
+                        Some(&instr) => {
+                            list.push(SExpression::BuiltIn(instr));
+                            map_list.push(SourceMap::Leaf(current_span));
+                        },
+                        None => {
+                            list.push(SExpression::Symbol(s.clone()));
+                            map_list.push(SourceMap::Leaf(current_span));
+                        }
                     }
                 }
             }
             i += 1;
         }
-        Ok((SExpression::List(list), tokens.len()))
+        let end_span = if tokens.len() > 0 { tokens[tokens.len()-1].1.end } else { 0 };
+        Ok((SExpression::List(list), SourceMap::List(start_span..end_span, map_list), tokens.len()))
     }
 }

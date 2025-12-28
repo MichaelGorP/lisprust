@@ -25,7 +25,7 @@ macro_rules! binary_op {
 }
 
 macro_rules! comparison_op {
-    ($self:ident, $opcode:ident, $prog:ident, $op:tt) => {
+    ($self:ident, $opcode:ident, $prog:ident, $debugger:ident, $op:tt) => {
         {
             let v1 = $self.resolve_value(&$self.registers[$opcode[2] as usize + $self.window_start]);
             let v2 = $self.resolve_value(&$self.registers[$opcode[3] as usize + $self.window_start]);
@@ -41,26 +41,31 @@ macro_rules! comparison_op {
             
             $self.registers[res_reg] = Value::Boolean(matches);
 
-            //try if the next instruction is a jump
-            let Some(opcode) = $prog.read_opcode() else {
-                break;
-            };
-            if let Ok(Instr::Jump) = opcode[0].try_into() {
-                let Some(distance) = $prog.read_int() else {
+            if $debugger.is_none() {
+                //try if the next instruction is a jump
+                if let Some(opcode) = $prog.read_opcode() {
+                    if let Ok(Instr::Jump) = opcode[0].try_into() {
+                        if let Some(distance) = $prog.read_int() {
+                            if opcode[2] == JumpCondition::Jump as u8 {
+                                $prog.jump(distance);
+                                continue;
+                            }
+                            //everything that is not false, is true
+                            let check = $self.registers[opcode[1] as usize + $self.window_start].is_true();
+                            if (check && opcode[2] == JumpCondition::JumpTrue as u8) || (!check && opcode[2] == JumpCondition::JumpFalse as u8) {
+                                $prog.jump(distance);
+                            }
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
+                    else {
+                        $prog.jump(-4);
+                    }
+                } else {
                     break;
-                };
-                if opcode[2] == JumpCondition::Jump as u8 {
-                    $prog.jump(distance);
-                    continue;
                 }
-                //everything that is not false, is true
-                let check = $self.registers[opcode[1] as usize + $self.window_start].is_true();
-                if (check && opcode[2] == JumpCondition::JumpTrue as u8) || (!check && opcode[2] == JumpCondition::JumpFalse as u8) {
-                    $prog.jump(distance);
-                }
-            }
-            else {
-                $prog.jump(-4);
             }
         }
     };
@@ -70,23 +75,37 @@ const fn empty_value() -> Value {
     Value::Empty
 }
 
-struct CallState {
-    window_start: usize,
-    result_reg: u8,
-    target_reg: u8,
-    return_addr: u64
+#[derive(Debug, Clone)]
+pub struct CallState {
+    pub window_start: usize,
+    pub result_reg: u8,
+    pub target_reg: u8,
+    pub return_addr: u64
+}
+
+pub trait Debugger {
+    fn on_step(&mut self, vm: &Vm, prog: &VirtualProgram);
 }
 
 pub struct Vm {
-    registers: Vec<Value>,
+    pub registers: Vec<Value>,
     call_states: Vec<CallState>,
-    window_start: usize
+    pub window_start: usize
 }
 
 impl Vm {
     pub fn new() -> Vm {
         const EMPTY : Value = empty_value();
         Vm {registers: vec![EMPTY; 256], call_states: Vec::new(), window_start: 0}
+    }
+
+    pub fn registers(&self) -> &Vec<Value> {
+        &self.registers
+    }
+
+
+    pub fn call_stack(&self) -> &[CallState] {
+        &self.call_states
     }
 
     fn resolve_value(&self, val: &Value) -> Value {
@@ -98,9 +117,17 @@ impl Vm {
     }
 
     pub fn run(&mut self, prog: &mut VirtualProgram) -> Option<SExpression> {
+        self.run_debug(prog, None)
+    }
+
+    pub fn run_debug(&mut self, prog: &mut VirtualProgram, mut debugger: Option<&mut dyn Debugger>) -> Option<SExpression> {
         let mut global_vars = HashMap::new();
 
         loop {
+            if let Some(dbg) = &mut debugger {
+                dbg.on_step(self, prog);
+            }
+
             let Some(opcode) = prog.read_opcode() else {
                 break;
             };
@@ -140,12 +167,12 @@ impl Vm {
                 Ok(Instr::Sub) => binary_op!(self, opcode, -),
                 Ok(Instr::Mul) => binary_op!(self, opcode, *),
                 Ok(Instr::Div) => binary_op!(self, opcode, /),
-                Ok(Instr::Eq) => comparison_op!(self, opcode, prog, ==),
-                Ok(Instr::Neq) => comparison_op!(self, opcode, prog, !=),
-                Ok(Instr::Lt) => comparison_op!(self, opcode, prog, <),
-                Ok(Instr::Gt) => comparison_op!(self, opcode, prog, >),
-                Ok(Instr::Leq) => comparison_op!(self, opcode, prog, <=),
-                Ok(Instr::Geq) => comparison_op!(self, opcode, prog, >=),
+                Ok(Instr::Eq) => comparison_op!(self, opcode, prog, debugger, ==),
+                Ok(Instr::Neq) => comparison_op!(self, opcode, prog, debugger, !=),
+                Ok(Instr::Lt) => comparison_op!(self, opcode, prog, debugger, <),
+                Ok(Instr::Gt) => comparison_op!(self, opcode, prog, debugger, >),
+                Ok(Instr::Leq) => comparison_op!(self, opcode, prog, debugger, <=),
+                Ok(Instr::Geq) => comparison_op!(self, opcode, prog, debugger, >=),
                 Ok(Instr::Not) => {
                     let value = &self.registers[opcode[2] as usize + self.window_start];
                     match value {

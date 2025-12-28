@@ -1,9 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::fmt;
 use std::error::Error;
 
 use crate::instructions::Instruction;
-use crate::parser::SExpression;
+use crate::parser::{SExpression, SourceMap};
 use crate::vm::vp::{FunctionHeader, Instr, JumpCondition, VirtualProgram, VmCallableFunction};
 
 use super::bytecode_builder::BytecodeBuilder;
@@ -41,20 +41,24 @@ impl From<fmt::Error> for CompilationError {
     }
 }
 
-pub struct Compiler {
+pub struct Compiler<'a> {
     generate_asm: bool,
     pub(super) bytecode: BytecodeBuilder,
     pub(super) scopes: ScopeManager,
     pub(super) functions: FunctionRegistry,
+    source_map_stack: Vec<&'a SourceMap>,
+    debug_symbols: HashMap<usize, HashMap<u8, String>>
 }
 
-impl Compiler {
-    pub fn new(generate_asm: bool) -> Compiler {
+impl<'a> Compiler<'a> {
+    pub fn new(generate_asm: bool) -> Compiler<'a> {
         Compiler {
             generate_asm,
             bytecode: BytecodeBuilder::new(generate_asm),
             scopes: ScopeManager::new(),
             functions: FunctionRegistry::new(),
+            source_map_stack: Vec::new(),
+            debug_symbols: HashMap::new()
         }
     }
 
@@ -62,12 +66,21 @@ impl Compiler {
         self.functions.register_function(name, func);
     }
 
-    pub fn compile(&mut self, root: &SExpression) -> Result<VirtualProgram, CompilationError> {
+    pub fn compile(&mut self, root: &SExpression, map: &'a SourceMap) -> Result<VirtualProgram, CompilationError> {
+        self.source_map_stack.clear();
+        self.source_map_stack.push(map);
+
         let reg = if let SExpression::List(list) = root {
             let mut last_reg = 0;
-            for expr in list {
-                last_reg = self.compile_expr(expr, &[], false)?;
-                self.scopes.reset_reg(last_reg + 1);
+            if let SourceMap::List(_, map_list) = map {
+                for (expr, sub_map) in list.iter().zip(map_list.iter()) {
+                    self.source_map_stack.push(sub_map);
+                    last_reg = self.compile_expr(expr, &[], false)?;
+                    self.source_map_stack.pop();
+                    self.scopes.reset_reg(last_reg + 1);
+                }
+            } else {
+                return Err(CompilationError::from("SourceMap mismatch"));
             }
             last_reg
         } else {
@@ -79,12 +92,28 @@ impl Compiler {
         
         let new_functions = self.functions.take_used_functions();
         let bytes = new_builder.cursor.into_inner();
+        let source_map = new_builder.source_map;
+        let debug_symbols = std::mem::take(&mut self.debug_symbols);
 
-        let prog = VirtualProgram::new(new_builder.listing, bytes, reg, new_functions);
+        let prog = VirtualProgram::new(new_builder.listing, bytes, reg, new_functions, source_map, debug_symbols);
         Ok(prog)
     }
 
+    pub(super) fn current_map(&self) -> &'a SourceMap {
+        self.source_map_stack.last().expect("Source map stack underflow")
+    }
+
+    pub(super) fn push_map(&mut self, map: &'a SourceMap) {
+        self.source_map_stack.push(map);
+    }
+
+    pub(super) fn pop_map(&mut self) {
+        self.source_map_stack.pop();
+    }
+
     pub(super) fn compile_expr(&mut self, root: &SExpression, args: &[SExpression], is_tail: bool) -> Result<u8, CompilationError> {
+        let map = self.current_map();
+        self.bytecode.mark_span(map.span());
         match root {
             SExpression::Atom(a) => {
                 let reg = self.scopes.allocate_reg()?;
@@ -105,26 +134,42 @@ impl Compiler {
                 }
                 Ok(sym_reg)
             },
-            SExpression::List(l) => self.compile_list(l, is_tail),
+            SExpression::List(l) => {
+                self.compile_list(l, is_tail)
+            },
             SExpression::Lambda(_) => todo!(),
         }
     }
 
     fn compile_list(&mut self, list: &[SExpression], is_tail: bool) -> Result<u8, CompilationError> {
+        let map = self.current_map();
+        let map_list = if let SourceMap::List(_, l) = map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
+
         if !list.is_empty() {
             let expr = &list[0];
+            let expr_map = &map_list[0];
+            
+            self.push_map(expr_map);
+
             match expr {
                 SExpression::Atom(_) => todo!(),
-                SExpression::BuiltIn(b) => self.compile_builtin(b, &list[1..], is_tail),
+                SExpression::BuiltIn(b) => {
+                    self.pop_map();
+                    self.compile_builtin(b, &list[1..], is_tail)
+                },
                 SExpression::Symbol(s) => {
                     let result_reg = self.scopes.allocate_reg()?;
                     //try registered functions first, not overwritable so far
                     let opt_func = self.functions.get_registered_function(s);
                     if let Some(func) = opt_func {
+                        self.pop_map();
+
                         // evaluate all other expressions as arguments
                         let mut arg_regs = Vec::new();
-                        for expr in list.iter().skip(1) {
+                        for (expr, sub_map) in list.iter().skip(1).zip(map_list.iter().skip(1)) {
+                            self.push_map(sub_map);
                             let reg = self.compile_expr(expr, &[], false)?;
+                            self.pop_map();
                             arg_regs.push(reg);
                         }
 
@@ -158,13 +203,17 @@ impl Compiler {
                             self.bytecode.store_value(&symbol_id.to_le_bytes());
                         }
 
+                        self.pop_map();
+
                         // Resolve sym_reg through aliases to find the definition register
                         // With runtime closures, we don't need to manually copy captures here.
                         // The VM handles unpacking captures from the closure object.
                         
                         let mut arg_regs = Vec::new();
-                        for expr in list.iter().skip(1) {
+                        for (expr, sub_map) in list.iter().skip(1).zip(map_list.iter().skip(1)) {
+                            self.push_map(sub_map);
                             let reg = self.compile_expr(expr, &[], false)?;
+                            self.pop_map();
                             arg_regs.push(reg);
                         }
 
@@ -223,10 +272,13 @@ impl Compiler {
                 SExpression::List(l) => {
                     // Treat as function call: ((func-expr) args...)
                     let func_reg = self.compile_list(l, false)?;
+                    self.pop_map();
                     
                     let mut arg_regs = Vec::new();
-                    for expr in list.iter().skip(1) {
+                    for (expr, sub_map) in list.iter().skip(1).zip(map_list.iter().skip(1)) {
+                        self.push_map(sub_map);
                         let reg = self.compile_expr(expr, &[], false)?;
+                        self.pop_map();
                         arg_regs.push(reg);
                     }
 
@@ -341,9 +393,14 @@ impl Compiler {
             }
         }
 
+        let map = self.current_map();
+        let map_list = if let SourceMap::List(_, l) = map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
+
         let mut last_reg = 0;
-        for (index, expr) in args.iter().skip(1).enumerate() {
+        for (index, (expr, sub_map)) in args.iter().skip(1).zip(map_list.iter().skip(2)).enumerate() {
+            self.push_map(sub_map);
             last_reg = self.compile_expr(expr, &[], index == args.len() - 2)?;
+            self.pop_map();
             self.scopes.reset_reg(last_reg);
         }
         self.scopes.reset_reg(last_reg + 1); //keep the result reg of the last expression
@@ -351,6 +408,13 @@ impl Compiler {
 
         let header = FunctionHeader{param_count: self.scopes.fixed_registers, register_count: self.scopes.max_used_registers, result_reg: last_reg};
         self.bytecode.store_and_reset_pos(header_addr, header.as_u8_slice());
+
+        // Capture debug symbols
+        let mut symbols = HashMap::new();
+        for (name, reg) in self.scopes.symbols.iter() {
+             symbols.insert(*reg, name.to_string());
+        }
+        self.debug_symbols.insert(header_addr as usize, symbols);
 
         self.scopes.end_scope();
 

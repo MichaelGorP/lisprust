@@ -1,4 +1,4 @@
-use std::{cell::{Ref, RefCell}, io::{Cursor, Read}, mem::size_of, rc::{Rc}};
+use std::{cell::{Ref, RefCell}, io::{Cursor, Read}, mem::size_of, rc::{Rc}, ops::Range, collections::HashMap};
 
 use enum_display::EnumDisplay;
 
@@ -186,19 +186,22 @@ impl Value {
     }
 }
 
+
 pub type VmCallableFunction = fn(&[Value]) -> Value;
 
 pub struct VirtualProgram {
     listing: String,
     cursor: Cursor<Vec<u8>>,
     functions: Vec<VmCallableFunction>,
-    result_reg: u8
+    result_reg: u8,
+    pub source_map: Vec<(usize, Range<usize>)>,
+    pub debug_symbols: HashMap<usize, HashMap<u8, String>>
 }
 
 
 impl VirtualProgram {
-    pub(super) fn new(listing: String, bytecode: Vec<u8>, result_reg: u8, functions: Vec<VmCallableFunction>) -> VirtualProgram {
-        let prog = VirtualProgram{listing, cursor: Cursor::new(bytecode), result_reg, functions};
+    pub(super) fn new(listing: String, bytecode: Vec<u8>, result_reg: u8, functions: Vec<VmCallableFunction>, source_map: Vec<(usize, Range<usize>)>, debug_symbols: HashMap<usize, HashMap<u8, String>>) -> VirtualProgram {
+        let prog = VirtualProgram{listing, cursor: Cursor::new(bytecode), result_reg, functions, source_map, debug_symbols};
         prog
     }
 
@@ -206,11 +209,11 @@ impl VirtualProgram {
         self.listing.clone()
     }
 
-    pub(super) fn get_result_reg(&self) -> u8 {
+    pub fn get_result_reg(&self) -> u8 {
         self.result_reg
     }
 
-    pub(super) fn current_address(&self) -> u64 {
+    pub fn current_address(&self) -> u64 {
         self.cursor.position()
     }
 

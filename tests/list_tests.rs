@@ -1,4 +1,4 @@
-use lisp::parser::{SExpression, Atom, Parser};
+use lisp::parser::{SExpression, Atom, Parser, SourceMap};
 use lisp::lexer;
 use lisp::vm::compiler::Compiler;
 use lisp::vm::list_functions;
@@ -10,8 +10,8 @@ fn compile_and_run(prog: &str) -> Option<SExpression> {
     
     let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
     let parser = Parser::new();
-    let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
-    let mut prog = compiler.compile(&list.0).unwrap();
+    let (expr, map, _) = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), SourceMap::Leaf(0..0), 0));
+    let mut prog = compiler.compile(&expr, &map).unwrap();
     let mut vm = Vm::new();
     vm.run(&mut prog)
 }

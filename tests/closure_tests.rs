@@ -1,4 +1,4 @@
-use lisp::parser::{SExpression, Atom, Parser};
+use lisp::parser::{SExpression, Atom, Parser, SourceMap};
 use lisp::lexer;
 use lisp::vm::compiler::Compiler;
 use lisp::vm::math_functions;
@@ -11,11 +11,11 @@ fn compare_expr<T>(expr: SExpression, value: T) -> bool where T: Into<Atom> {
 fn parse_and_exec(prog: &str) -> SExpression {
     let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
     let parser = Parser::new();
-    let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
+    let (expr, map, _) = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), SourceMap::Leaf(0..0), 0));
 
     let mut compiler = Compiler::new(false);
     math_functions::register_functions(&mut compiler);
-    let mut prog = compiler.compile(&list.0).unwrap();
+    let mut prog = compiler.compile(&expr, &map).unwrap();
     let mut vm = Vm::new();
     let res = match vm.run(&mut prog) {
         Some(r) => r,

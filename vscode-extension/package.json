@@ -1,0 +1,114 @@
+{
+  "name": "lisp-debugger",
+  "displayName": "Lisp Debugger",
+  "version": "0.0.1",
+  "publisher": "user",
+  "description": "Debugging support for Lisp",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Debuggers"
+  ],
+  "activationEvents": [
+    "onLanguage:lisp",
+    "onLanguage:scheme",
+    "onDebug",
+    "onDebug:resolve:lisp"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "breakpoints": [
+      {
+        "language": "lisp"
+      },
+      {
+        "language": "scheme"
+      }
+    ],
+    "languages": [
+      {
+        "id": "lisp",
+        "aliases": [
+          "Lisp",
+          "lisp"
+        ],
+        "extensions": [
+          ".lisp",
+          ".scm"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "lisp",
+        "scopeName": "source.lisp",
+        "path": "./syntaxes/lisp.tmLanguage.json"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "lisp",
+        "label": "Lisp Debug",
+        "languages": ["lisp", "scheme"],
+        "program": "./out/extension.js",
+        "runtime": "node",
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Absolute path to a text file.",
+                "default": "${workspaceFolder}/main.lisp"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Automatically stop after launch.",
+                "default": true
+              },
+              "trace": {
+                "type": "boolean",
+                "description": "Enable logging of the Debug Adapter Protocol.",
+                "default": true
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "lisp",
+            "request": "launch",
+            "name": "Debug Lisp File",
+            "program": "${workspaceFolder}/main.lisp",
+            "stopOnEntry": true
+          }
+        ]
+      }
+    ],
+    "configuration": {
+      "title": "Lisp Debugger",
+      "properties": {
+        "lisp.debugAdapterPath": {
+          "type": "string",
+          "description": "Path to the lisp-debug executable.",
+          "default": "../target/debug/lisp-debug.exe"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^16.x",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^4.9.5"
+  }
+}

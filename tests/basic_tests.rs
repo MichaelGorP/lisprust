@@ -1,5 +1,5 @@
 
-use lisp::parser::{SExpression, Atom, Parser};
+use lisp::parser::{SExpression, Atom, Parser, SourceMap};
 use lisp::lexer;
 use lisp::expr_interpreter::Interpreter;
 use lisp::vm::compiler::Compiler;
@@ -13,16 +13,16 @@ fn compare_expr<T>(expr: SExpression, value: T) -> bool where T: Into<Atom> {
 fn parse_and_exec(prog: &str) -> SExpression {
     let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
     let parser = Parser::new();
-    let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
+    let (expr, map, _) = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), SourceMap::Leaf(0..0), 0));
     let interpreter = Interpreter::new();
-    let res = match interpreter.execute(&list.0) {
+    let res = match interpreter.execute(&expr) {
         Ok(r) => r,
         Err(e) => panic!("Interpreter failed: {}", e)
     };
 
     let mut compiler = Compiler::new(false);
     math_functions::register_functions(&mut compiler);
-    let mut prog = compiler.compile(&list.0).unwrap();
+    let mut prog = compiler.compile(&expr, &map).unwrap();
     let mut vm = Vm::new();
     let res2 = match vm.run(&mut prog) {
         Some(r) => r,
@@ -35,9 +35,9 @@ fn parse_and_exec(prog: &str) -> SExpression {
 fn parse_might_fail(prog: &str) -> Option<SExpression> {
     let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
     let parser = Parser::new();
-    let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
+    let (expr, _, _) = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), SourceMap::Leaf(0..0), 0));
     let interpreter = Interpreter::new();
-    let res = interpreter.execute(&list.0);
+    let res = interpreter.execute(&expr);
     res.ok()
 }
 
@@ -46,8 +46,8 @@ fn compile_and_run(prog: &str) -> Option<SExpression> {
     math_functions::register_functions(&mut compiler);
     let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
     let parser = Parser::new();
-    let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
-    let mut prog = compiler.compile(&list.0).unwrap();
+    let (expr, map, _) = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), SourceMap::Leaf(0..0), 0));
+    let mut prog = compiler.compile(&expr, &map).unwrap();
     let mut vm = Vm::new();
     vm.run(&mut prog)
 }
@@ -199,16 +199,16 @@ fn debug_compiled_letrec_simple() {
     let prog_str = "(letrec ((fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))) (fact 5))";
     let tokens = lexer::tokenize(prog_str).unwrap_or(vec![]);
     let parser = Parser::new();
-    let list = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), 0));
+    let (expr, map, _) = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), SourceMap::Leaf(0..0), 0));
     let mut compiler = Compiler::new(true);
     math_functions::register_functions(&mut compiler);
-    let mut prog = compiler.compile(&list.0).unwrap();
+    let mut prog = compiler.compile(&expr, &map).unwrap();
     println!("ASM:\n{}", prog.get_listing());
     let mut vm = Vm::new();
     let res = vm.run(&mut prog);
     println!("VM result: {:?}", res);
     let interp = Interpreter::new();
-    let res2 = interp.execute(&list.0).unwrap();
+    let res2 = interp.execute(&expr).unwrap();
     println!("Interpreter result: {:?}", res2);
 }
 

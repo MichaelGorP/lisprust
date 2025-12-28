@@ -1,4 +1,4 @@
-use crate::parser::SExpression;
+use crate::parser::{SExpression, SourceMap};
 use crate::vm::vp::{Instr, JumpCondition};
 use crate::vm::compiler::{Compiler, CompilationError};
 use std::mem::size_of;
@@ -8,14 +8,24 @@ pub fn compile_if(compiler: &mut Compiler, args: &[SExpression], is_tail: bool) 
         Err(CompilationError::from("Expected 2 or 3 arguments"))
     }
     else {
+        let map = compiler.current_map();
+        let map_list = if let SourceMap::List(_, l) = map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
+
+        compiler.push_map(&map_list[1]);
         let reg = compiler.compile_expr(&args[0], &[], false)?;
+        compiler.pop_map();
+
         compiler.bytecode.store_opcode(Instr::Jump, reg, JumpCondition::JumpFalse as u8, 0);
         compiler.scopes.reset_reg(reg); //not needed after the check
         let target_pos = compiler.bytecode.position();
         compiler.bytecode.store_value(&[0; size_of::<i64>()]);
         //compile_expr might return an existing register, so no code is generated. But we need some code for now, so copy to a target register
         let target_reg = compiler.scopes.allocate_reg()?;
+        
+        compiler.push_map(&map_list[2]);
         let ok_reg = compiler.compile_expr(&args[1], &[], is_tail)?;
+        compiler.pop_map();
+
         compiler.bytecode.store_opcode(Instr::CopyReg, target_reg, ok_reg, 0);
         compiler.scopes.reset_reg(target_reg + 1); //not needed, copied
         //update jump target
@@ -27,7 +37,10 @@ pub fn compile_if(compiler: &mut Compiler, args: &[SExpression], is_tail: bool) 
             compiler.bytecode.store_value(&[0; size_of::<i64>()]);
             false_jump_target += 4 + size_of::<i64>() as u64;
             //compile else expression
+            compiler.push_map(&map_list[3]);
             let ok_reg = compiler.compile_expr(&args[2], &[], is_tail)?;
+            compiler.pop_map();
+
             compiler.bytecode.store_opcode(Instr::CopyReg, target_reg, ok_reg, 0);
             compiler.bytecode.store_and_reset_pos(target_pos, &(compiler.bytecode.position() - target_pos - std::mem::size_of::<i64>() as u64).to_le_bytes());
             compiler.scopes.reset_reg(target_reg + 1)

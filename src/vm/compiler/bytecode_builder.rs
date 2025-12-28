@@ -1,16 +1,23 @@
 use std::io::{Cursor, Write};
 use crate::parser::Atom;
 use crate::vm::vp::{Instr, OpCode};
+use std::ops::Range;
 
 pub(super) struct BytecodeBuilder {
     pub cursor: Cursor<Vec<u8>>,
     pub listing: String,
-    pub generate_asm: bool
+    pub generate_asm: bool,
+    pub source_map: Vec<(usize, Range<usize>)>
 }
 
 impl BytecodeBuilder {
     pub fn new(generate_asm: bool) -> BytecodeBuilder {
-        BytecodeBuilder{cursor: Cursor::new(vec![]), listing: String::new(), generate_asm}
+        BytecodeBuilder{cursor: Cursor::new(vec![]), listing: String::new(), generate_asm, source_map: Vec::new()}
+    }
+
+    pub fn mark_span(&mut self, span: Range<usize>) {
+        let pos = self.cursor.position() as usize;
+        self.source_map.push((pos, span));
     }
 
     pub fn load_atom(&mut self, atom: &Atom, reg: u8) {

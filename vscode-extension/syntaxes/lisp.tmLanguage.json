@@ -1,0 +1,41 @@
+{
+    "name": "Lisp",
+    "scopeName": "source.lisp",
+    "fileTypes": [
+        "lisp",
+        "scm"
+    ],
+    "patterns": [
+        {
+            "name": "comment.line.semicolon.lisp",
+            "match": ";.*$"
+        },
+        {
+            "name": "string.quoted.double.lisp",
+            "begin": "\"",
+            "end": "\"",
+            "patterns": [
+                {
+                    "name": "constant.character.escape.lisp",
+                    "match": "\\\\."
+                }
+            ]
+        },
+        {
+            "name": "constant.numeric.lisp",
+            "match": "\\b\\d+(\\.\\d+)?\\b"
+        },
+        {
+            "name": "keyword.control.lisp",
+            "match": "\\b(if|while|def|lambda|let|set|print|println|do|quote)\\b"
+        },
+        {
+            "name": "support.function.lisp",
+            "match": "\\b(car|cdr|cons|list|map|filter|reduce|length|not|eq|equal|atom|null)\\b"
+        },
+        {
+            "name": "variable.parameter.lisp",
+            "match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\b"
+        }
+    ]
+}

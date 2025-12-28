@@ -1,12 +1,17 @@
-use crate::parser::{SExpression, Atom};
+use crate::parser::{SExpression, Atom, SourceMap};
 use crate::vm::vp::{Instr, JumpCondition};
 use crate::instructions::Instruction;
 use crate::vm::compiler::{Compiler, CompilationError};
 
 pub fn compile_math_op(compiler: &mut Compiler, instr: &Instruction, args: &[SExpression]) -> Result<u8, CompilationError> {
+    let map = compiler.current_map();
+    let map_list = if let SourceMap::List(_, l) = map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
+
     let mut reg_args = Vec::new();
-    for arg in args {
+    for (arg, sub_map) in args.iter().zip(map_list.iter().skip(1)) {
+        compiler.push_map(sub_map);
         let reg = compiler.compile_expr(arg, &[], false)?;
+        compiler.pop_map();
         reg_args.push(reg);
     }
     let dest_reg = compiler.scopes.allocate_reg()?;
@@ -66,9 +71,14 @@ pub fn compile_math_op(compiler: &mut Compiler, instr: &Instruction, args: &[SEx
 }
 
 pub fn compile_comparison(compiler: &mut Compiler, instr: &Instruction, args: &[SExpression]) -> Result<u8, CompilationError> {
+    let map = compiler.current_map();
+    let map_list = if let SourceMap::List(_, l) = map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
+
     let mut reg_args = Vec::new();
-    for arg in args {
+    for (arg, sub_map) in args.iter().zip(map_list.iter().skip(1)) {
+        compiler.push_map(sub_map);
         let reg = compiler.compile_expr(arg, &[], false)?;
+        compiler.pop_map();
         reg_args.push(reg);
     }
     let dest_reg = compiler.scopes.allocate_reg()?;

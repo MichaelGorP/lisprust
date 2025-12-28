@@ -1,4 +1,4 @@
-use crate::parser::SExpression;
+use crate::parser::{SExpression, SourceMap};
 use crate::vm::vp::Instr;
 use crate::vm::compiler::{Compiler, CompilationError};
 use std::collections::HashSet;
@@ -8,18 +8,29 @@ pub fn compile_let(compiler: &mut Compiler, args: &[SExpression], is_tail: bool)
         Err(CompilationError::from("Expected at least 2 arguments"))
     }
     else {
+        let map = compiler.current_map();
+        let map_list = if let SourceMap::List(_, l) = map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
+
         //parse bindings
         let bindings = &args[0];
         let body = &args[1..];
         if let SExpression::List(bindings_list) = bindings {
+            let bindings_map = &map_list[1];
+            let bindings_map_list = if let SourceMap::List(_, l) = bindings_map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
+
             //collect init expressions
             let mut init_regs = Vec::new();
-            for binding in bindings_list {
+            for (i, binding) in bindings_list.iter().enumerate() {
                 if let SExpression::List(ref pair) = binding {
                     if pair.len() != 2 {
                         return Err(CompilationError::from("Binding must be (var init)"));
                     }
+                    let pair_map = &bindings_map_list[i];
+                    let pair_map_list = if let SourceMap::List(_, l) = pair_map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
+
+                    compiler.push_map(&pair_map_list[1]);
                     let init_reg = compiler.compile_expr(&pair[1], &[], false)?;
+                    compiler.pop_map();
                     init_regs.push(init_reg);
                 }
                 else {
@@ -48,8 +59,10 @@ pub fn compile_let(compiler: &mut Compiler, args: &[SExpression], is_tail: bool)
 
             //compile body
             let mut last_reg = 0;
-            for (index, expr) in body.iter().enumerate() {
+            for (index, (expr, sub_map)) in body.iter().zip(map_list.iter().skip(2)).enumerate() {
+                compiler.push_map(sub_map);
                 last_reg = compiler.compile_expr(expr, &[], is_tail && index == body.len() - 1)?;
+                compiler.pop_map();
             }
             compiler.scopes.end_scope();
             Ok(last_reg)
@@ -65,22 +78,34 @@ pub fn compile_let_star(compiler: &mut Compiler, args: &[SExpression], is_tail: 
         Err(CompilationError::from("Expected at least 2 arguments"))
     }
     else {
+        let map = compiler.current_map();
+        let map_list = if let SourceMap::List(_, l) = map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
+
         //parse bindings
         let bindings = &args[0];
         let body = &args[1..];
         if let SExpression::List(bindings_list) = bindings {
+            let bindings_map = &map_list[1];
+            let bindings_map_list = if let SourceMap::List(_, l) = bindings_map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
+
             compiler.scopes.begin_scope();
             // preserve outer register allocation for sequential let* bindings
             if let Some(prev) = compiler.scopes.scope_stack.last() {
                 compiler.scopes.last_used_reg = prev.last_used_reg;
                 compiler.scopes.max_used_registers = prev.max_used_registers;
             }
-            for binding in bindings_list {
+            for (i, binding) in bindings_list.iter().enumerate() {
                 if let SExpression::List(ref pair) = binding {
                     if pair.len() != 2 {
                         return Err(CompilationError::from("Binding must be (var init)"));
                     }
+                    let pair_map = &bindings_map_list[i];
+                    let pair_map_list = if let SourceMap::List(_, l) = pair_map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
+
+                    compiler.push_map(&pair_map_list[1]);
                     let init_reg = compiler.compile_expr(&pair[1], &[], false)?;
+                    compiler.pop_map();
+
                     if let SExpression::Symbol(ref sym) = &pair[0] {
                         let var_reg = compiler.scopes.find_or_alloc(sym)?;
                         compiler.bytecode.store_opcode(Instr::CopyReg, var_reg, init_reg, 0);
@@ -96,8 +121,10 @@ pub fn compile_let_star(compiler: &mut Compiler, args: &[SExpression], is_tail: 
 
             //compile body
             let mut last_reg = 0;
-            for (index, expr) in body.iter().enumerate() {
+            for (index, (expr, sub_map)) in body.iter().zip(map_list.iter().skip(2)).enumerate() {
+                compiler.push_map(sub_map);
                 last_reg = compiler.compile_expr(expr, &[], is_tail && index == body.len() - 1)?;
+                compiler.pop_map();
             }
             compiler.scopes.end_scope();
             Ok(last_reg)
@@ -113,10 +140,16 @@ pub fn compile_letrec(compiler: &mut Compiler, args: &[SExpression], is_tail: bo
         Err(CompilationError::from("Expected at least 2 arguments"))
     }
     else {
+        let map = compiler.current_map();
+        let map_list = if let SourceMap::List(_, l) = map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
+
         //parse bindings
         let bindings = &args[0];
         let body = &args[1..];
         if let SExpression::List(bindings_list) = bindings {
+            let bindings_map = &map_list[1];
+            let bindings_map_list = if let SourceMap::List(_, l) = bindings_map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
+
             compiler.scopes.begin_scope();
             //allocate all vars first
             let mut var_regs = Vec::new();
@@ -147,10 +180,15 @@ pub fn compile_letrec(compiler: &mut Compiler, args: &[SExpression], is_tail: bo
 
             //compile init expressions
             let mut init_regs = Vec::new();
-            for binding in bindings_list {
+            for (i, binding) in bindings_list.iter().enumerate() {
                 if let SExpression::List(ref pair) = binding {
+                    let pair_map = &bindings_map_list[i];
+                    let pair_map_list = if let SourceMap::List(_, l) = pair_map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
+
                     // Step 3: Compile init
+                    compiler.push_map(&pair_map_list[1]);
                     let init_reg = compiler.compile_expr(&pair[1], &[], false)?;
+                    compiler.pop_map();
                     init_regs.push(init_reg);
                 }
             }
@@ -162,8 +200,10 @@ pub fn compile_letrec(compiler: &mut Compiler, args: &[SExpression], is_tail: bo
 
             //compile body
             let mut last_reg = 0;
-            for (index, expr) in body.iter().enumerate() {
+            for (index, (expr, sub_map)) in body.iter().zip(map_list.iter().skip(2)).enumerate() {
+                compiler.push_map(sub_map);
                 last_reg = compiler.compile_expr(expr, &[], is_tail && index == body.len() - 1)?;
+                compiler.pop_map();
             }
             compiler.scopes.end_scope();
             Ok(last_reg)
