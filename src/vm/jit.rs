@@ -466,23 +466,31 @@ impl Jit {
                     let tag1 = builder.ins().load(types::I8, MemFlags::trusted(), src1_ptr, tag_offset);
                     let tag2 = builder.ins().load(types::I8, MemFlags::trusted(), src2_ptr, tag_offset);
                     
-                    let is_int1 = builder.ins().icmp_imm(IntCC::Equal, tag1, 2);
-                    let is_int2 = builder.ins().icmp_imm(IntCC::Equal, tag2, 2);
-                    let both_int = builder.ins().band(is_int1, is_int2);
-                    
+                    let tag1_32 = builder.ins().uextend(types::I32, tag1);
+                    let tag2_32 = builder.ins().uextend(types::I32, tag2);
+                    let tag1_shifted = builder.ins().ishl_imm(tag1_32, 4);
+                    let combined = builder.ins().bor(tag1_shifted, tag2_32);
+                    let index = builder.ins().iadd_imm(combined, -34); // 0x22 = 34
+
                     let block_int = builder.create_block();
-                    let block_check_float = builder.create_block();
                     let block_float_exec = builder.create_block();
                     let block_slow = builder.create_block();
                     let block_done = builder.create_block();
-                    
-                    builder.ins().brif(both_int, block_int, &[], block_check_float, &[]);
-                    
-                    builder.switch_to_block(block_check_float);
-                    let is_float1 = builder.ins().icmp_imm(IntCC::Equal, tag1, 3);
-                    let is_float2 = builder.ins().icmp_imm(IntCC::Equal, tag2, 3);
-                    let both_float = builder.ins().band(is_float1, is_float2);
-                    builder.ins().brif(both_float, block_float_exec, &[], block_slow, &[]);
+
+                    let mut table = Vec::new();
+                    for i in 0..18 {
+                        if i == 0 {
+                            table.push(builder.func.dfg.block_call(block_int, &[]));
+                        } else if i == 17 {
+                            table.push(builder.func.dfg.block_call(block_float_exec, &[]));
+                        } else {
+                            table.push(builder.func.dfg.block_call(block_slow, &[]));
+                        }
+                    }
+                    let default_call = builder.func.dfg.block_call(block_slow, &[]);
+                    let jt_data = JumpTableData::new(default_call, &table);
+                    let jt = builder.create_jump_table(jt_data);
+                    builder.ins().br_table(index, jt);
                     
                     // --- Integer Path ---
                     builder.switch_to_block(block_int);
