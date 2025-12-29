@@ -191,6 +191,7 @@ impl Value {
 
 pub type VmCallableFunction = fn(&[Value]) -> Value;
 
+#[derive(Clone)]
 pub struct VirtualProgram {
     listing: String,
     cursor: Cursor<Vec<u8>>,

@@ -1,7 +1,6 @@
 
 use lisp::parser::{SExpression, Atom, Parser, SourceMap};
 use lisp::lexer;
-use lisp::expr_interpreter::Interpreter;
 use lisp::vm::compiler::Compiler;
 use lisp::vm::math_functions;
 use lisp::vm::vm::Vm;
@@ -14,31 +13,25 @@ fn parse_and_exec(prog: &str) -> SExpression {
     let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
     let parser = Parser::new();
     let (expr, map, _) = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), SourceMap::Leaf(0..0), 0));
-    let interpreter = Interpreter::new();
-    let res = match interpreter.execute(&expr) {
-        Ok(r) => r,
-        Err(e) => panic!("Interpreter failed: {}", e)
-    };
 
     let mut compiler = Compiler::new(false);
     math_functions::register_functions(&mut compiler);
     let mut prog = compiler.compile(&expr, &map).unwrap();
+    let mut prog_copy = prog.clone();
     let mut vm = Vm::new(false);
-    let res2 = match vm.run(&mut prog) {
+    let res = match vm.run(&mut prog) {
         Some(r) => r,
         None => panic!("VM failed to execute")
     };
-    assert!(res == res2);
-    res
-}
 
-fn parse_might_fail(prog: &str) -> Option<SExpression> {
-    let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
-    let parser = Parser::new();
-    let (expr, _, _) = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), SourceMap::Leaf(0..0), 0));
-    let interpreter = Interpreter::new();
-    let res = interpreter.execute(&expr);
-    res.ok()
+    let mut vm_jit = Vm::new(true);
+    let res_jit = match vm_jit.run(&mut prog_copy) {
+        Some(r) => r,
+        None => panic!("VM failed to execute")
+    };
+
+    assert!(res == res_jit);
+    res
 }
 
 fn compile_and_run(prog: &str) -> Option<SExpression> {
@@ -82,9 +75,6 @@ fn test_comparisons() {
 
     let res = parse_and_exec("(> 5)");
     assert!(compare_expr(res, true));
-
-    let res = parse_might_fail("> \"a\")");
-    assert!(matches!(res, None));
 
     let res = parse_and_exec("(= 2 2 2");
     assert!(compare_expr(res, true));
@@ -192,24 +182,6 @@ fn test_let_negative_unbound() {
 fn test_letrec_even_odd() {
     let res = parse_and_exec("(letrec ((even (lambda (n) (if (= n 0) true (odd (- n 1))))) (odd (lambda (n) (if (= n 0) false (even (- n 1)))))) (even 4))");
     assert!(compare_expr(res, true));
-}
-
-#[test]
-fn debug_compiled_letrec_simple() {
-    let prog_str = "(letrec ((fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))) (fact 5))";
-    let tokens = lexer::tokenize(prog_str).unwrap_or(vec![]);
-    let parser = Parser::new();
-    let (expr, map, _) = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), SourceMap::Leaf(0..0), 0));
-    let mut compiler = Compiler::new(true);
-    math_functions::register_functions(&mut compiler);
-    let mut prog = compiler.compile(&expr, &map).unwrap();
-    println!("ASM:\n{}", prog.get_listing());
-    let mut vm = Vm::new(false);
-    let res = vm.run(&mut prog);
-    println!("VM result: {:?}", res);
-    let interp = Interpreter::new();
-    let res2 = interp.execute(&expr).unwrap();
-    println!("Interpreter result: {:?}", res2);
 }
 
 #[test]

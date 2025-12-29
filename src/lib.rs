@@ -1,7 +1,6 @@
 pub mod lexer;
 pub mod parser;
 pub mod instructions;
-pub mod expr_interpreter;
 pub mod vm;
 pub mod debug_adapter;
 
