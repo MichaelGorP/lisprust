@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, Linkage, Module};
@@ -12,6 +13,7 @@ pub struct Jit {
     _data_ctx: DataDescription,
     module: JITModule,
     cache: HashMap<u64, *const u8>,
+    pub function_map: Arc<Mutex<Vec<(usize, usize, String)>>>,
 }
 
 impl Jit {
@@ -49,6 +51,7 @@ impl Jit {
             _data_ctx: DataDescription::new(),
             module,
             cache: HashMap::new(),
+            function_map: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -978,10 +981,23 @@ impl Jit {
             println!("{}", self.ctx.func.display());
             e.to_string()
         })?;
+        
+        // Record function size
+        let size = self.ctx.compiled_code().map(|c| c.code_buffer().len()).unwrap_or(0);
+        
         self.module.clear_context(&mut self.ctx);
         self.module.finalize_definitions().map_err(|e| e.to_string())?;
 
         let code = self.module.get_finalized_function(id);
+        
+        if size > 0 {
+            let start = code as usize;
+            let end = start + size;
+            if let Ok(mut map) = self.function_map.lock() {
+                map.push((start, end, func_name));
+            }
+        }
+
         self.cache.insert(start_addr, code);
         Ok(unsafe { std::mem::transmute(code) })
     }

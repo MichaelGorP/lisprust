@@ -13,6 +13,7 @@ fn main() {
     let mut generate_asm = false;
     let mut debug_mode = false;
     let mut use_jit = true;
+    let mut profile = false;
     let mut filename = None;
 
     for a in args.iter().skip(1) {
@@ -22,6 +23,8 @@ fn main() {
             debug_mode = true;
         } else if a == "--no-jit" {
             use_jit = false;
+        } else if a == "--profile" {
+            profile = true;
         } else {
             filename = Some(a);
         }
@@ -57,9 +60,21 @@ fn main() {
     }
 
     let mut vm = Vm::new(use_jit);
+    
+    let profiler = if profile {
+        Some(lisp::vm::profiler::Profiler::new(vm.jit.function_map.clone()))
+    } else {
+        None
+    };
+
     let start = std::time::Instant::now();
     let res = vm.run(&mut prog);
     let duration = start.elapsed();
+    
+    if let Some(mut p) = profiler {
+        p.stop();
+    }
+
     if let Some(SExpression::Atom(lit)) = res {
         println!("VM result: {}", lit)
     } else {
