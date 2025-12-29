@@ -420,7 +420,10 @@ impl<'a> Compiler<'a> {
 
         self.scopes.end_scope();
 
-        self.bytecode.store_and_reset_pos(jump_addr, &(self.bytecode.position() - jump_addr - std::mem::size_of::<i64>() as u64).to_le_bytes());
+        let pos = self.bytecode.position();
+        let dist = pos - jump_addr - std::mem::size_of::<i64>() as u64;
+        
+        self.bytecode.store_and_reset_pos(jump_addr, &dist.to_le_bytes());
         //the return of a compiled lambda is a function reference
         let reg = func_value_reg;
         self.bytecode.store_opcode(Instr::LoadFuncRef, reg, 0, 0);

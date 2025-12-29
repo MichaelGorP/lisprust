@@ -149,6 +149,12 @@ impl Vm {
                 Ok(Instr::LoadInt) | Ok(Instr::LoadFloat) => { let _ = prog.read_int(); },
                 Ok(Instr::LoadString) => { let _ = prog.read_string(); },
                 Ok(Instr::Define) | Ok(Instr::LoadGlobal) | Ok(Instr::LoadFuncRef) => { let _ = prog.read_int(); },
+                Ok(Instr::MakeClosure) => {
+                    let count = prog.read_byte().unwrap();
+                    for _ in 0..count {
+                        prog.read_byte().unwrap();
+                    }
+                },
                 Ok(Instr::Ret) => {
                     end_pos = prog.current_address();
                     break;

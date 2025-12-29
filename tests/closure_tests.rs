@@ -31,7 +31,7 @@ fn test_closure_returned() {
         (let ((add5 (make-adder 5)))
             (add5 10)))
     ";
-    let res = parse_compile_and_exec(prog, false);
+    let res = parse_compile_and_exec(prog, true);
     assert!(compare_expr(res, 15));
 }
 

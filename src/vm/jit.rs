@@ -30,6 +30,7 @@ impl Jit {
         // Register helper functions
         builder.symbol("helper_op", helper_op as *const u8);
         builder.symbol("helper_load_int", helper_load_int as *const u8);
+        builder.symbol("helper_load_float", helper_load_float as *const u8);
         builder.symbol("helper_check_condition", helper_check_condition as *const u8);
         builder.symbol("helper_load_global", helper_load_global as *const u8);
         builder.symbol("helper_define", helper_define as *const u8);
@@ -38,6 +39,7 @@ impl Jit {
         builder.symbol("helper_tail_call_symbol", helper_tail_call_symbol as *const u8);
         builder.symbol("helper_prepare_direct_call", helper_prepare_direct_call as *const u8);
         builder.symbol("helper_check_self_recursion", helper_check_self_recursion as *const u8);
+        builder.symbol("helper_make_closure", helper_make_closure as *const u8);
 
         let module = JITModule::new(builder);
         
@@ -98,22 +100,128 @@ impl Jit {
                 Instr::LoadString => {
                     prog.read_string();
                 },
+                Instr::MakeClosure => {
+                    let count = opcode[3];
+                    for _ in 0..count {
+                        prog.read_byte().unwrap();
+                    }
+                },
                 // Others have no arguments (handled by read_opcode)
                 _ => {}
             }
         }
 
+        // --- PASS 1.5: Reachability Analysis ---
+        let mut sorted_starts: Vec<u64> = block_starts.iter().cloned().collect();
+        sorted_starts.sort();
+        
+        // println!("DEBUG: Block starts: {:?}", sorted_starts);
+
+        let mut successors: HashMap<u64, Vec<u64>> = HashMap::new();
+        
+        for i in 0..sorted_starts.len() {
+            let start = sorted_starts[i];
+            if start >= end_addr { continue; }
+            
+            let next_start = if i + 1 < sorted_starts.len() {
+                sorted_starts[i+1]
+            } else {
+                end_addr
+            };
+            
+            // println!("DEBUG: Scanning block {} to {}", start, next_start);
+
+            prog.jump_to(start);
+            while prog.current_address() < next_start {
+                let opcode = prog.read_opcode().unwrap();
+                let instr: Instr = opcode[0].try_into().unwrap();
+                
+                // Advance cursor
+                 match instr {
+                    Instr::Jump => {
+                        let cond_byte = opcode[2];
+                        let distance = prog.read_int().unwrap();
+                        let after_read_pos = prog.current_address();
+                        let target = (after_read_pos as i64 + distance) as u64;
+                        
+                        if prog.current_address() == next_start {
+                            // Last instruction of the block
+                            let mut succs = Vec::new();
+                            succs.push(target);
+                            if cond_byte != JumpCondition::Jump as u8 {
+                                succs.push(after_read_pos); // Fallthrough
+                            }
+                            successors.insert(start, succs);
+                            // println!("DEBUG: Jump at {} to {}", start, target);
+                        }
+                    },
+                    Instr::Ret => {
+                        if prog.current_address() == next_start {
+                            successors.insert(start, Vec::new());
+                        }
+                    },
+                    Instr::TailCallSymbol => {
+                         // TailCallSymbol terminates the block (returns)
+                         // Arguments are in opcode
+                         if prog.current_address() == next_start {
+                             successors.insert(start, Vec::new());
+                         }
+                    },
+                    Instr::LoadInt | Instr::LoadFloat | Instr::Define | Instr::LoadGlobal | Instr::LoadFuncRef => {
+                        prog.read_int();
+                    },
+                    Instr::LoadString => {
+                        prog.read_string();
+                    },
+                    Instr::MakeClosure => {
+                        let count = opcode[3];
+                        for _ in 0..count {
+                            prog.read_byte().unwrap();
+                        }
+                    },
+                    _ => {}
+                 }
+                 
+                 if prog.current_address() == next_start {
+                     // If not handled above (fallthrough)
+                     if !successors.contains_key(&start) {
+                         successors.insert(start, vec![next_start]);
+                     }
+                 }
+            }
+        }
+        
+        let mut reachable = HashSet::new();
+        let mut queue = Vec::new();
+        queue.push(start_addr);
+        reachable.insert(start_addr);
+        
+        while let Some(addr) = queue.pop() {
+            if let Some(succs) = successors.get(&addr) {
+                for &succ in succs {
+                    if succ <= end_addr && !reachable.contains(&succ) {
+                        reachable.insert(succ);
+                        queue.push(succ);
+                    }
+                }
+            }
+        }
+        
+        // println!("DEBUG: Reachable blocks: {:?}", reachable);
+
         let mut blocks = HashMap::new();
         let loop_header = builder.create_block();
         blocks.insert(start_addr, loop_header);
-
+        
         for &start in &block_starts {
-            // Only create blocks for addresses within our function range
+            // Only create blocks for addresses within our function range AND reachable
             if start != start_addr && start >= start_addr && start <= end_addr {
-                blocks.insert(start, builder.create_block());
+                if reachable.contains(&start) {
+                    blocks.insert(start, builder.create_block());
+                }
             }
         }
-
+        
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
         builder.switch_to_block(entry_block);
@@ -125,6 +233,9 @@ impl Jit {
         // Jump to loop header
         builder.ins().jump(loop_header, &[]);
         builder.seal_block(entry_block);
+        
+        // We must switch to loop_header before declaring helpers? No, helpers are declared in the function.
+        // But we should switch to loop_header before generating code for it.
         builder.switch_to_block(loop_header);
 
         // Import helper functions
@@ -143,6 +254,14 @@ impl Jit {
         sig_helper_load_int.params.push(AbiParam::new(types::I64)); // val
         let callee_helper_load_int = self.module.declare_function("helper_load_int", Linkage::Import, &sig_helper_load_int).map_err(|e| e.to_string())?;
         let local_helper_load_int = self.module.declare_func_in_func(callee_helper_load_int, &mut builder.func);
+
+        let mut sig_helper_load_float = self.module.make_signature();
+        sig_helper_load_float.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_load_float.params.push(AbiParam::new(ptr_type)); // registers
+        sig_helper_load_float.params.push(AbiParam::new(types::I64)); // dest
+        sig_helper_load_float.params.push(AbiParam::new(types::F64)); // val
+        let callee_helper_load_float = self.module.declare_function("helper_load_float", Linkage::Import, &sig_helper_load_float).map_err(|e| e.to_string())?;
+        let local_helper_load_float = self.module.declare_func_in_func(callee_helper_load_float, &mut builder.func);
 
         let mut sig_helper_check_condition = self.module.make_signature();
         sig_helper_check_condition.params.push(AbiParam::new(ptr_type)); // vm
@@ -195,6 +314,25 @@ impl Jit {
         let callee_helper_tail_call_symbol = self.module.declare_function("helper_tail_call_symbol", Linkage::Import, &sig_helper_tail_call_symbol).map_err(|e| e.to_string())?;
         let local_helper_tail_call_symbol = self.module.declare_func_in_func(callee_helper_tail_call_symbol, &mut builder.func);
 
+        let mut sig_helper_make_closure = self.module.make_signature();
+        sig_helper_make_closure.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_make_closure.params.push(AbiParam::new(ptr_type)); // prog
+        sig_helper_make_closure.params.push(AbiParam::new(ptr_type)); // registers
+        sig_helper_make_closure.params.push(AbiParam::new(types::I64)); // dest_reg
+        sig_helper_make_closure.params.push(AbiParam::new(types::I64)); // func_reg
+        sig_helper_make_closure.params.push(AbiParam::new(types::I64)); // count
+        sig_helper_make_closure.params.push(AbiParam::new(types::I64)); // instr_addr
+        let callee_helper_make_closure = self.module.declare_function("helper_make_closure", Linkage::Import, &sig_helper_make_closure).map_err(|e| e.to_string())?;
+        let local_helper_make_closure = self.module.declare_func_in_func(callee_helper_make_closure, &mut builder.func);
+
+        let mut sig_helper_check_self_recursion = self.module.make_signature();
+        sig_helper_check_self_recursion.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_check_self_recursion.params.push(AbiParam::new(types::I64)); // func_reg
+        sig_helper_check_self_recursion.params.push(AbiParam::new(types::I64)); // start_addr
+        sig_helper_check_self_recursion.returns.push(AbiParam::new(types::I32)); // bool
+        let callee_helper_check_self_recursion = self.module.declare_function("helper_check_self_recursion", Linkage::Import, &sig_helper_check_self_recursion).map_err(|e| e.to_string())?;
+        let local_helper_check_self_recursion = self.module.declare_func_in_func(callee_helper_check_self_recursion, &mut builder.func);
+
         // --- PASS 2: Generate Code ---
         prog.jump_to(start_addr);
         
@@ -212,6 +350,17 @@ impl Jit {
                     builder.switch_to_block(block);
                     is_terminated = false;
                 }
+            } else if is_terminated {
+                // We are in dead code/data, skip to next block
+                let mut next_addr = end_addr;
+                for &s in &sorted_starts {
+                    if s > current_addr {
+                        next_addr = s;
+                        break;
+                    }
+                }
+                prog.jump_to(next_addr);
+                continue;
             }
 
             let opcode = prog.read_opcode().unwrap(); // Safe because we scanned before
@@ -224,6 +373,12 @@ impl Jit {
                     },
                     Instr::LoadString => {
                         prog.read_string().unwrap();
+                    },
+                    Instr::MakeClosure => {
+                        let count = opcode[3];
+                        for _ in 0..count {
+                            prog.read_byte().unwrap();
+                        }
                     },
                     _ => {}
                  }
@@ -281,6 +436,17 @@ impl Jit {
                     builder.ins().call(local_helper_load_int, &[vm_ptr, registers_ptr, dest_reg_const, val_const]);
                     is_terminated = false;
                 },
+                Instr::LoadFloat => {
+                    let dest_reg = opcode[1] as i64;
+                    let val_bits = prog.read_int().unwrap();
+                    let val = f64::from_bits(val_bits as u64);
+                    
+                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    let val_const = builder.ins().f64const(val);
+                    
+                    builder.ins().call(local_helper_load_float, &[vm_ptr, registers_ptr, dest_reg_const, val_const]);
+                    is_terminated = false;
+                },
                 Instr::LoadGlobal => {
                     let dest_reg = opcode[1] as i64;
                     let sym_id = prog.read_int().unwrap();
@@ -320,68 +486,7 @@ impl Jit {
                     let param_start_const = builder.ins().iconst(types::I64, param_start);
                     let target_reg_const = builder.ins().iconst(types::I64, target_reg);
                     
-                    // Try direct call
-                    let mut sig = self.module.make_signature();
-                    sig.params.push(AbiParam::new(types::I64)); // vm
-                    sig.params.push(AbiParam::new(types::I64)); // func_reg
-                    sig.params.push(AbiParam::new(types::I64)); // param_start
-                    sig.params.push(AbiParam::new(types::I64)); // result_reg_out ptr
-                    sig.returns.push(AbiParam::new(types::I64)); // code ptr
-
-                    let helper_func = self.module.declare_function("helper_prepare_direct_call", Linkage::Import, &sig).unwrap();
-                    let local_helper = self.module.declare_func_in_func(helper_func, builder.func);
-
-                    let result_reg_slot = builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
-                    let result_reg_ptr = builder.ins().stack_addr(types::I64, result_reg_slot, 0);
-
-                    let call = builder.ins().call(local_helper, &[vm_ptr, func_reg_const, param_start_const, result_reg_ptr]);
-                    let code_ptr = builder.inst_results(call)[0];
-
-                    let is_null = builder.ins().icmp_imm(IntCC::Equal, code_ptr, 0);
-                    let block_direct = builder.create_block();
-                    let block_fallback = builder.create_block();
-                    let block_cont = builder.create_block();
-
-                    builder.ins().brif(is_null, block_fallback, &[], block_direct, &[]);
-
-                    builder.switch_to_block(block_direct);
-                    // Direct call sequence
-                    let ws_offset = 48; // Offset of window_start in Vm
-                    let ws_ptr = builder.ins().iadd_imm(vm_ptr, ws_offset);
-                    let current_ws = builder.ins().load(types::I64, MemFlags::trusted(), ws_ptr, 0);
-
-                    let new_ws = builder.ins().iadd(current_ws, param_start_const);
-                    builder.ins().store(MemFlags::trusted(), new_ws, ws_ptr, 0);
-
-                    let value_size = std::mem::size_of::<Value>() as i64;
-                    let offset = builder.ins().imul_imm(param_start_const, value_size);
-                    let new_regs_ptr = builder.ins().iadd(registers_ptr, offset);
-
-                    let sig_ref = builder.import_signature(builder.func.signature.clone());
-                    builder.ins().call_indirect(sig_ref, code_ptr, &[vm_ptr, prog_ptr, new_regs_ptr]);
-
-                    builder.ins().store(MemFlags::trusted(), current_ws, ws_ptr, 0);
-
-                    let result_reg_idx = builder.ins().load(types::I64, MemFlags::trusted(), result_reg_ptr, 0);
-                    let src_offset = builder.ins().imul_imm(result_reg_idx, value_size);
-                    let src_ptr = builder.ins().iadd(new_regs_ptr, src_offset);
-
-                    let dest_offset = builder.ins().imul_imm(target_reg_const, value_size);
-                    let dest_ptr = builder.ins().iadd(registers_ptr, dest_offset);
-
-                    for i in 0..4 {
-                        let off = i * 8;
-                        let val = builder.ins().load(types::I64, MemFlags::trusted(), src_ptr, off);
-                        builder.ins().store(MemFlags::trusted(), val, dest_ptr, off);
-                    }
-
-                    builder.ins().jump(block_cont, &[]);
-
-                    builder.switch_to_block(block_fallback);
                     builder.ins().call(local_helper_call_symbol, &[vm_ptr, prog_ptr, registers_ptr, func_reg_const, param_start_const, target_reg_const]);
-                    builder.ins().jump(block_cont, &[]);
-
-                    builder.switch_to_block(block_cont);
                     is_terminated = false;
                 },
                 Instr::TailCallSymbol => {
@@ -392,17 +497,8 @@ impl Jit {
                     let param_start_const = builder.ins().iconst(types::I64, param_start);
                     
                     // Check self recursion
-                    let mut sig = self.module.make_signature();
-                    sig.params.push(AbiParam::new(types::I64)); // vm
-                    sig.params.push(AbiParam::new(types::I64)); // func_reg
-                    sig.params.push(AbiParam::new(types::I64)); // start_addr
-                    sig.returns.push(AbiParam::new(types::I32)); // bool
-
-                    let helper_func = self.module.declare_function("helper_check_self_recursion", Linkage::Import, &sig).unwrap();
-                    let local_helper = self.module.declare_func_in_func(helper_func, builder.func);
-
                     let start_addr_const = builder.ins().iconst(types::I64, start_addr as i64);
-                    let call = builder.ins().call(local_helper, &[vm_ptr, func_reg_const, start_addr_const]);
+                    let call = builder.ins().call(local_helper_check_self_recursion, &[vm_ptr, func_reg_const, start_addr_const]);
                     let is_self = builder.inst_results(call)[0];
 
                     let block_loop = builder.create_block();
@@ -727,6 +823,26 @@ impl Jit {
                     
                     builder.switch_to_block(block_done);
                 },
+                Instr::MakeClosure => {
+                    // println!("DEBUG: Generating MakeClosure at {}", current_addr);
+                    let dest_reg = opcode[1] as i64;
+                    let func_reg = opcode[2] as i64;
+                    let count = opcode[3] as i64;
+                    let instr_addr = current_addr as i64;
+                    
+                    // Skip capture registers in the stream
+                    for _ in 0..count {
+                        prog.read_byte().unwrap();
+                    }
+                    
+                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    let func_reg_const = builder.ins().iconst(types::I64, func_reg);
+                    let count_const = builder.ins().iconst(types::I64, count);
+                    let instr_addr_const = builder.ins().iconst(types::I64, instr_addr);
+                    
+                    builder.ins().call(local_helper_make_closure, &[vm_ptr, prog_ptr, registers_ptr, dest_reg_const, func_reg_const, count_const, instr_addr_const]);
+                    is_terminated = false;
+                },
                 Instr::Ret => {
                     if !is_terminated {
                         builder.ins().return_(&[]);
@@ -754,6 +870,38 @@ impl Jit {
 
         // Restore cursor
         prog.jump_to(original_pos);
+
+        // Handle implicit return at end of function if a block exists there
+        if let Some(&end_block) = blocks.get(&end_addr) {
+            // Only switch if the block was actually created and might be used
+            // If we are currently in a terminated state, we don't need to jump to it from here
+            // But we need to ensure the block itself is terminated if it's reachable
+            
+            // Check if the block is currently empty (meaning we didn't generate code for it)
+            // We can't easily check if it's empty, but we know we didn't visit it in the loop
+            // because the loop condition is `current_address < end_addr`.
+            
+            // If the previous block fell through to here, we need to connect them?
+            // The loop handles fallthrough:
+            // if !is_terminated { builder.ins().jump(block, &[]); }
+            // But that's inside the loop.
+            
+            // If the last instruction of the function was NOT a terminator, we need to jump to end_block?
+            // But wait, if the last instruction was not a terminator, `is_terminated` is false.
+            // And we are at `end_addr`.
+            // So we should fall through to `end_block`.
+            
+            if !is_terminated {
+                builder.ins().jump(end_block, &[]);
+            }
+            
+            builder.switch_to_block(end_block);
+            builder.ins().return_(&[]);
+        } else if !is_terminated {
+             // If we reached the end without a terminator and no end block (unlikely if we scanned correctly),
+             // we should return.
+             builder.ins().return_(&[]);
+        }
 
         builder.seal_all_blocks();
         builder.finalize();
@@ -794,6 +942,10 @@ unsafe extern "C" fn helper_check_self_recursion(vm: *mut Vm, func_reg: usize, s
 unsafe extern "C" fn helper_load_int(_vm: *mut Vm, registers: *mut Value, index: usize, val: i64) {
 
     *registers.add(index) = Value::Integer(val);
+}
+
+unsafe extern "C" fn helper_load_float(_vm: *mut Vm, registers: *mut Value, index: usize, val: f64) {
+    *registers.add(index) = Value::Float(val);
 }
 
 unsafe extern "C" fn helper_op(vm: *mut Vm, _prog: *mut VirtualProgram, registers: *mut Value, opcode_val: u32) {
@@ -1009,7 +1161,7 @@ unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, 
         Value::FuncRef(f) => (f.header, f.address, None, f.jit_code),
         Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code),
         _ => {
-            println!("DEBUG: CallSymbol failed: Not a function at reg {}: {:?}", func_reg, resolved_func);
+            // println!("DEBUG: CallSymbol failed: Not a function at reg {}: {:?}", func_reg, resolved_func);
             return
         }
     };
@@ -1062,9 +1214,9 @@ unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut VirtualProg
         func
     };
 
-    let (header, address, captures) = match resolved_func {
-        Value::FuncRef(f) => (f.header, f.address, None),
-        Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone())),
+    let (header, address, captures, jit_code) = match resolved_func {
+        Value::FuncRef(f) => (f.header, f.address, None, f.jit_code),
+        Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code),
         _ => return
     };
 
@@ -1095,6 +1247,57 @@ unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut VirtualProg
         }
     }
 
-    let end_addr = vm.scan_function_end(prog, address);
-    vm.run_jit_function(prog, address, end_addr);
+    if jit_code != 0 {
+         let func: unsafe extern "C" fn(*mut Vm, *mut VirtualProgram, *mut Value) = std::mem::transmute(jit_code as *const u8);
+         func(vm, prog, vm.registers.as_mut_ptr().add(vm.window_start));
+    } else {
+        let end_addr = vm.scan_function_end(prog, address);
+        vm.run_jit_function(prog, address, end_addr);
+    }
+}
+
+use super::vp::ClosureData;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+unsafe extern "C" fn helper_make_closure(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut Value, dest_reg: usize, func_reg: usize, count: usize, instr_addr: u64) {
+    let vm = &mut *vm;
+    let prog = &mut *prog;
+    
+    let old_pos = prog.current_address();
+    prog.jump_to(instr_addr + 4); // Skip opcode (4)
+    
+    let mut captures = Vec::with_capacity(count);
+    for _ in 0..count {
+        let reg_idx = prog.read_byte().unwrap();
+        let val = (*registers.add(reg_idx as usize)).clone();
+        captures.push(val);
+    }
+    
+    prog.jump_to(old_pos);
+    
+    let func_val = &*registers.add(func_reg);
+    
+    if let Value::FuncRef(fd) = func_val {
+        *registers.add(dest_reg) = Value::Closure(Rc::new(ClosureData{function: fd.clone(), captures}));
+    } else {
+        *registers.add(dest_reg) = Value::Empty;
+    }
+}
+
+unsafe extern "C" fn helper_make_ref(_vm: *mut Vm, registers: *mut Value, dest_reg: usize) {
+    let val = (*registers.add(dest_reg)).clone();
+    *registers.add(dest_reg) = Value::Ref(Rc::new(RefCell::new(val)));
+}
+
+unsafe extern "C" fn helper_set_ref(_vm: *mut Vm, registers: *mut Value, dest_reg: usize, src_reg: usize) {
+    if let Value::Ref(r) = &*registers.add(dest_reg) {
+        *r.borrow_mut() = (*registers.add(src_reg)).clone();
+    }
+}
+
+unsafe extern "C" fn helper_deref(_vm: *mut Vm, registers: *mut Value, dest_reg: usize, src_reg: usize) {
+    if let Value::Ref(r) = &*registers.add(src_reg) {
+        *registers.add(dest_reg) = r.borrow().clone();
+    }
 }
