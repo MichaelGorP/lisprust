@@ -29,8 +29,6 @@ impl Jit {
 
         // Register helper functions
         builder.symbol("helper_op", helper_op as *const u8);
-        builder.symbol("helper_load_int", helper_load_int as *const u8);
-        builder.symbol("helper_load_float", helper_load_float as *const u8);
         builder.symbol("helper_check_condition", helper_check_condition as *const u8);
         builder.symbol("helper_load_global", helper_load_global as *const u8);
         builder.symbol("helper_define", helper_define as *const u8);
@@ -249,29 +247,13 @@ impl Jit {
         let callee_helper_op = self.module.declare_function("helper_op", Linkage::Import, &sig_helper_op).map_err(|e| e.to_string())?;
         let local_helper_op = self.module.declare_func_in_func(callee_helper_op, &mut builder.func);
 
-        let mut sig_helper_load_int = self.module.make_signature();
-        sig_helper_load_int.params.push(AbiParam::new(ptr_type)); // vm
-        sig_helper_load_int.params.push(AbiParam::new(ptr_type)); // registers
-        sig_helper_load_int.params.push(AbiParam::new(types::I64)); // dest
-        sig_helper_load_int.params.push(AbiParam::new(types::I64)); // val
-        let callee_helper_load_int = self.module.declare_function("helper_load_int", Linkage::Import, &sig_helper_load_int).map_err(|e| e.to_string())?;
-        let local_helper_load_int = self.module.declare_func_in_func(callee_helper_load_int, &mut builder.func);
-
-        let mut sig_helper_load_float = self.module.make_signature();
-        sig_helper_load_float.params.push(AbiParam::new(ptr_type)); // vm
-        sig_helper_load_float.params.push(AbiParam::new(ptr_type)); // registers
-        sig_helper_load_float.params.push(AbiParam::new(types::I64)); // dest
-        sig_helper_load_float.params.push(AbiParam::new(types::F64)); // val
-        let callee_helper_load_float = self.module.declare_function("helper_load_float", Linkage::Import, &sig_helper_load_float).map_err(|e| e.to_string())?;
-        let local_helper_load_float = self.module.declare_func_in_func(callee_helper_load_float, &mut builder.func);
-
         let mut sig_helper_check_condition = self.module.make_signature();
         sig_helper_check_condition.params.push(AbiParam::new(ptr_type)); // vm
         sig_helper_check_condition.params.push(AbiParam::new(ptr_type)); // registers
         sig_helper_check_condition.params.push(AbiParam::new(types::I64)); // reg_idx
         sig_helper_check_condition.returns.push(AbiParam::new(types::I32)); // result (0 or 1)
         let callee_helper_check_condition = self.module.declare_function("helper_check_condition", Linkage::Import, &sig_helper_check_condition).map_err(|e| e.to_string())?;
-        let local_helper_check_condition = self.module.declare_func_in_func(callee_helper_check_condition, &mut builder.func);
+        let _local_helper_check_condition = self.module.declare_func_in_func(callee_helper_check_condition, &mut builder.func);
 
         let mut sig_helper_load_global = self.module.make_signature();
         sig_helper_load_global.params.push(AbiParam::new(ptr_type)); // vm
@@ -333,7 +315,7 @@ impl Jit {
         sig_helper_check_self_recursion.params.push(AbiParam::new(types::I64)); // start_addr
         sig_helper_check_self_recursion.returns.push(AbiParam::new(types::I32)); // bool
         let callee_helper_check_self_recursion = self.module.declare_function("helper_check_self_recursion", Linkage::Import, &sig_helper_check_self_recursion).map_err(|e| e.to_string())?;
-        let local_helper_check_self_recursion = self.module.declare_func_in_func(callee_helper_check_self_recursion, &mut builder.func);
+        let _local_helper_check_self_recursion = self.module.declare_func_in_func(callee_helper_check_self_recursion, &mut builder.func);
 
         let mut sig_helper_make_ref = self.module.make_signature();
         sig_helper_make_ref.params.push(AbiParam::new(ptr_type)); // vm
@@ -426,27 +408,33 @@ impl Jit {
                     } else {
                         // Conditional Jump
                         let reg_idx = opcode[1] as i64;
-                        let reg_idx_const = builder.ins().iconst(types::I64, reg_idx);
+                        let val_size = std::mem::size_of::<Value>() as i64;
+                        let reg_ptr = builder.ins().iadd_imm(registers_ptr, reg_idx * val_size);
                         
-                        let call = builder.ins().call(local_helper_check_condition, &[vm_ptr, registers_ptr, reg_idx_const]);
-                        let result = builder.inst_results(call)[0];
+                        let tag = builder.ins().load(types::I8, MemFlags::trusted(), reg_ptr, 0);
+                        let val = builder.ins().load(types::I8, MemFlags::trusted(), reg_ptr, 8);
                         
-                        // result is 1 if true, 0 if false
-                        // JumpTrue: jump if result != 0
-                        // JumpFalse: jump if result == 0
+                        // is_false = (tag == 1) && (val == 0)
+                        // Tag 1 is Boolean. Val 0 is false.
+                        let tag_is_bool = builder.ins().icmp_imm(IntCC::Equal, tag, 1);
+                        let val_is_false = builder.ins().icmp_imm(IntCC::Equal, val, 0);
+                        let is_false = builder.ins().band(tag_is_bool, val_is_false);
                         
-                        // We need the fallthrough block
-                        // Since we are in a block, and the next instruction starts a new block (because we marked it in Pass 1),
-                        // we can just use the next block.
-                        // But wait, Pass 1 marks `after_read_pos` as a block start.
                         let fallthrough_block = *blocks.get(&after_read_pos).ok_or("Fallthrough block not found")?;
 
                         if cond_byte == JumpCondition::JumpTrue as u8 {
-                            builder.ins().brif(result, target_block, &[], fallthrough_block, &[]);
+                            // Jump if !is_false (i.e. is_true)
+                            // If is_false is true (1), we fallthrough.
+                            // If is_false is false (0), we jump.
+                            // Wait. brif(c, then, else).
+                            // If is_false (it is false), we want to jump (it is true).
+                            // So if is_false is 0, we jump.
+                            // brif(is_false, fallthrough, target)
+                            builder.ins().brif(is_false, fallthrough_block, &[], target_block, &[]);
                         } else {
                             // JumpFalse
-                            let is_zero = builder.ins().icmp_imm(IntCC::Equal, result, 0);
-                            builder.ins().brif(is_zero, target_block, &[], fallthrough_block, &[]);
+                            // Jump if is_false
+                            builder.ins().brif(is_false, target_block, &[], fallthrough_block, &[]);
                         }
                     }
                     is_terminated = true;
@@ -455,10 +443,15 @@ impl Jit {
                     let dest_reg = opcode[1] as i64;
                     let val = prog.read_int().unwrap();
                     
-                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    let val_size = std::mem::size_of::<Value>() as i64;
+                    let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
+                    
+                    let const_tag = builder.ins().iconst(types::I8, 2); // Value::Integer
                     let val_const = builder.ins().iconst(types::I64, val);
                     
-                    builder.ins().call(local_helper_load_int, &[vm_ptr, registers_ptr, dest_reg_const, val_const]);
+                    builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, 0);
+                    builder.ins().store(MemFlags::trusted(), val_const, dest_ptr, 8);
+                    
                     is_terminated = false;
                 },
                 Instr::LoadFloat => {
@@ -466,10 +459,15 @@ impl Jit {
                     let val_bits = prog.read_int().unwrap();
                     let val = f64::from_bits(val_bits as u64);
                     
-                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    let val_size = std::mem::size_of::<Value>() as i64;
+                    let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
+                    
+                    let const_tag = builder.ins().iconst(types::I8, 3); // Value::Float
                     let val_const = builder.ins().f64const(val);
                     
-                    builder.ins().call(local_helper_load_float, &[vm_ptr, registers_ptr, dest_reg_const, val_const]);
+                    builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, 0);
+                    builder.ins().store(MemFlags::trusted(), val_const, dest_ptr, 8);
+                    
                     is_terminated = false;
                 },
                 Instr::LoadGlobal => {
@@ -521,14 +519,27 @@ impl Jit {
                     let func_reg_const = builder.ins().iconst(types::I64, func_reg);
                     let param_start_const = builder.ins().iconst(types::I64, param_start);
                     
-                    // Check self recursion
-                    let start_addr_const = builder.ins().iconst(types::I64, start_addr as i64);
-                    let call = builder.ins().call(local_helper_check_self_recursion, &[vm_ptr, func_reg_const, start_addr_const]);
-                    let is_self = builder.inst_results(call)[0];
-
+                    // Check self recursion inline
+                    // Load func from registers
+                    let val_size = std::mem::size_of::<Value>() as i64;
+                    let func_ptr = builder.ins().iadd_imm(registers_ptr, func_reg * val_size);
+                    
+                    let tag = builder.ins().load(types::I8, MemFlags::trusted(), func_ptr, 0);
+                    
+                    let block_check_addr = builder.create_block();
                     let block_loop = builder.create_block();
                     let block_fallback = builder.create_block();
-
+                    
+                    // Check if tag is FuncRef (6)
+                    let is_func_ref = builder.ins().icmp_imm(IntCC::Equal, tag, 6);
+                    builder.ins().brif(is_func_ref, block_check_addr, &[], block_fallback, &[]);
+                    
+                    builder.switch_to_block(block_check_addr);
+                    // Load address from offset 16 (8 + 8)
+                    // Value(8) -> FunctionData(0) -> address(8)
+                    // So offset is 8 + 8 = 16
+                    let func_addr = builder.ins().load(types::I64, MemFlags::trusted(), func_ptr, 16);
+                    let is_self = builder.ins().icmp_imm(IntCC::Equal, func_addr, start_addr as i64);
                     builder.ins().brif(is_self, block_loop, &[], block_fallback, &[]);
 
                     builder.switch_to_block(block_loop);
@@ -540,15 +551,14 @@ impl Jit {
                     let header = prog.read_function_header(header_addr).unwrap();
                     let param_count = header.param_count as i64;
                     
-                    let value_size = std::mem::size_of::<Value>() as i64;
-                    let u64_count = value_size / 8;
+                    let u64_count = val_size / 8;
                     
                     for i in 0..param_count {
                         let src_idx = param_start + i;
                         let dest_idx = i;
                         
-                        let src_offset = builder.ins().iconst(types::I64, src_idx * value_size);
-                        let dest_offset = builder.ins().iconst(types::I64, dest_idx * value_size);
+                        let src_offset = builder.ins().iconst(types::I64, src_idx * val_size);
+                        let dest_offset = builder.ins().iconst(types::I64, dest_idx * val_size);
                         
                         let src_ptr = builder.ins().iadd(registers_ptr, src_offset);
                         let dest_ptr = builder.ins().iadd(registers_ptr, dest_offset);
@@ -587,16 +597,24 @@ impl Jit {
                     let tag1 = builder.ins().load(types::I8, MemFlags::trusted(), src1_ptr, tag_offset);
                     let tag2 = builder.ins().load(types::I8, MemFlags::trusted(), src2_ptr, tag_offset);
                     
+                    let block_int = builder.create_block();
+                    let block_float_exec = builder.create_block();
+                    let block_slow = builder.create_block();
+                    let block_done = builder.create_block();
+                    let block_dispatch = builder.create_block();
+
+                    // Fast path for integers
+                    let t1_x = builder.ins().bxor_imm(tag1, 2);
+                    let t2_x = builder.ins().bxor_imm(tag2, 2);
+                    let any_non_int = builder.ins().bor(t1_x, t2_x);
+                    builder.ins().brif(any_non_int, block_dispatch, &[], block_int, &[]);
+
+                    builder.switch_to_block(block_dispatch);
                     let tag1_32 = builder.ins().uextend(types::I32, tag1);
                     let tag2_32 = builder.ins().uextend(types::I32, tag2);
                     let tag1_shifted = builder.ins().ishl_imm(tag1_32, 4);
                     let combined = builder.ins().bor(tag1_shifted, tag2_32);
                     let index = builder.ins().iadd_imm(combined, -34); // 0x22 = 34
-
-                    let block_int = builder.create_block();
-                    let block_float_exec = builder.create_block();
-                    let block_slow = builder.create_block();
-                    let block_done = builder.create_block();
 
                     let mut table = Vec::new();
                     for i in 0..18 {
@@ -972,24 +990,23 @@ impl Jit {
 unsafe extern "C" fn helper_check_self_recursion(vm: *mut Vm, func_reg: usize, start_addr: u64) -> i32 {
     let vm = &mut *vm;
     let func = &vm.registers[vm.window_start + func_reg];
-    let resolved = if let Value::Ref(r) = func { r.borrow().clone() } else { func.clone() };
     
-    let address = match resolved {
-        Value::FuncRef(f) => f.address,
-        Value::Closure(c) => c.function.address,
-        _ => return 0,
+    let address = if let Value::Ref(r) = func {
+        let inner = r.borrow();
+        match &*inner {
+            Value::FuncRef(f) => f.address,
+            Value::Closure(c) => c.function.address,
+            _ => return 0,
+        }
+    } else {
+        match func {
+            Value::FuncRef(f) => f.address,
+            Value::Closure(c) => c.function.address,
+            _ => return 0,
+        }
     };
     
     if address == start_addr { 1 } else { 0 }
-}
-
-unsafe extern "C" fn helper_load_int(_vm: *mut Vm, registers: *mut Value, index: usize, val: i64) {
-
-    *registers.add(index) = Value::Integer(val);
-}
-
-unsafe extern "C" fn helper_load_float(_vm: *mut Vm, registers: *mut Value, index: usize, val: f64) {
-    *registers.add(index) = Value::Float(val);
 }
 
 unsafe extern "C" fn helper_op(vm: *mut Vm, _prog: *mut VirtualProgram, registers: *mut Value, opcode_val: u32) {
@@ -1145,20 +1162,26 @@ unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, 
     
     // println!("DEBUG: CallSymbol func_reg={}, param_start={}, target_reg={}", func_reg, param_start, target_reg);
 
-    let func = vm.registers[func_reg + vm.window_start].clone();
+    let func = &vm.registers[func_reg + vm.window_start];
     
-    let resolved_func = if let Value::Ref(r) = &func {
-        r.borrow().clone()
+    let (header, address, captures, jit_code) = if let Value::Ref(r) = func {
+        let inner = r.borrow();
+        match &*inner {
+            Value::FuncRef(f) => (f.header, f.address, None, f.jit_code),
+            Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code),
+            _ => {
+                // println!("DEBUG: CallSymbol failed: Not a function at reg {}: {:?}", func_reg, inner);
+                return
+            }
+        }
     } else {
-        func
-    };
-
-    let (header, address, captures, jit_code) = match resolved_func {
-        Value::FuncRef(f) => (f.header, f.address, None, f.jit_code),
-        Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code),
-        _ => {
-            // println!("DEBUG: CallSymbol failed: Not a function at reg {}: {:?}", func_reg, resolved_func);
-            return
+        match func {
+            Value::FuncRef(f) => (f.header, f.address, None, f.jit_code),
+            Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code),
+            _ => {
+                // println!("DEBUG: CallSymbol failed: Not a function at reg {}: {:?}", func_reg, func);
+                return
+            }
         }
     };
 
@@ -1203,17 +1226,21 @@ unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut VirtualProg
     let vm = &mut *vm;
     let prog = &mut *prog;
 
-    let func = vm.registers[func_reg + vm.window_start].clone();
-    let resolved_func = if let Value::Ref(r) = &func {
-        r.borrow().clone()
+    let func = &vm.registers[func_reg + vm.window_start];
+    
+    let (header, address, captures, jit_code) = if let Value::Ref(r) = func {
+        let inner = r.borrow();
+        match &*inner {
+            Value::FuncRef(f) => (f.header, f.address, None, f.jit_code),
+            Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code),
+            _ => return
+        }
     } else {
-        func
-    };
-
-    let (header, address, captures, jit_code) = match resolved_func {
-        Value::FuncRef(f) => (f.header, f.address, None, f.jit_code),
-        Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code),
-        _ => return
+        match func {
+            Value::FuncRef(f) => (f.header, f.address, None, f.jit_code),
+            Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code),
+            _ => return
+        }
     };
 
     let size = vm.window_start + header.register_count as usize;
@@ -1221,14 +1248,25 @@ unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut VirtualProg
         vm.registers.resize(size, Value::Empty);
     }
 
-    let mut params: Vec<Value> = Vec::new();
-    for i in 0..(header.param_count as usize) {
-        let idx = vm.window_start + param_start + i;
-        params.push(vm.registers[idx].clone());
-    }
-    for (i, param) in params.into_iter().enumerate() {
-        let target_reg = vm.window_start + i;
-        vm.registers[target_reg] = param;
+    let param_count = header.param_count as usize;
+    
+    if param_start >= param_count {
+        // Safe to copy directly
+        for i in 0..param_count {
+            let src_idx = vm.window_start + param_start + i;
+            let dest_idx = vm.window_start + i;
+            vm.registers[dest_idx] = vm.registers[src_idx].clone();
+        }
+    } else {
+        vm.scratch_buffer.clear();
+        for i in 0..param_count {
+            let idx = vm.window_start + param_start + i;
+            vm.scratch_buffer.push(vm.registers[idx].clone());
+        }
+        for (i, param) in vm.scratch_buffer.drain(..).enumerate() {
+            let target_reg = vm.window_start + i;
+            vm.registers[target_reg] = param;
+        }
     }
 
     if let Some(last_frame) = vm.call_states.last_mut() {
@@ -1265,6 +1303,7 @@ unsafe extern "C" fn helper_make_closure(_vm: *mut Vm, prog: *mut VirtualProgram
     let mut captures = Vec::with_capacity(count);
     for _ in 0..count {
         let reg_idx = prog.read_byte().unwrap();
+        // Cloning values for capture is necessary as they escape the current scope
         let val = (*registers.add(reg_idx as usize)).clone();
         captures.push(val);
     }
@@ -1274,6 +1313,8 @@ unsafe extern "C" fn helper_make_closure(_vm: *mut Vm, prog: *mut VirtualProgram
     let func_val = &*registers.add(func_reg);
     
     if let Value::FuncRef(fd) = func_val {
+        // Avoid cloning FunctionData if possible, but it's small (copy)
+        // The main cost is Rc allocation for ClosureData
         *registers.add(dest_reg) = Value::Closure(Rc::new(ClosureData{function: fd.clone(), captures}));
     } else {
         *registers.add(dest_reg) = Value::Empty;

@@ -128,6 +128,7 @@ impl FunctionHeader {
 }
 
 #[derive(PartialEq, Clone, Debug)]
+#[repr(C)]
 pub struct FunctionData {
     pub header: FunctionHeader,
     pub address: u64,

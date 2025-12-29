@@ -90,17 +90,18 @@ pub trait Debugger {
 #[repr(C)]
 pub struct Vm {
     pub registers: Vec<Value>,
+    pub global_vars: Vec<Value>,
     pub(super) call_states: Vec<CallState>,
     pub window_start: usize,
     pub jit: Jit,
     pub jit_enabled: bool,
-    pub global_vars: Vec<Value>,
+    pub scratch_buffer: Vec<Value>,
 }
 
 impl Vm {
     pub fn new(jit_enabled: bool) -> Vm {
         const EMPTY : Value = empty_value();
-        Vm {registers: vec![EMPTY; 64000], call_states: Vec::new(), window_start: 0, jit: Jit::new(), jit_enabled, global_vars: Vec::new()}
+        Vm {registers: vec![EMPTY; 64000], global_vars: Vec::new(), call_states: Vec::new(), window_start: 0, jit: Jit::new(), jit_enabled, scratch_buffer: Vec::with_capacity(32)}
     }
 
     pub fn run_jit_function(&mut self, prog: *mut VirtualProgram, start_addr: u64, end_addr: u64) {
