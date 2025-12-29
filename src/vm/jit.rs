@@ -37,9 +37,11 @@ impl Jit {
         builder.symbol("helper_load_func_ref", helper_load_func_ref as *const u8);
         builder.symbol("helper_call_symbol", helper_call_symbol as *const u8);
         builder.symbol("helper_tail_call_symbol", helper_tail_call_symbol as *const u8);
-        builder.symbol("helper_prepare_direct_call", helper_prepare_direct_call as *const u8);
         builder.symbol("helper_check_self_recursion", helper_check_self_recursion as *const u8);
         builder.symbol("helper_make_closure", helper_make_closure as *const u8);
+        builder.symbol("helper_make_ref", helper_make_ref as *const u8);
+        builder.symbol("helper_set_ref", helper_set_ref as *const u8);
+        builder.symbol("helper_deref", helper_deref as *const u8);
 
         let module = JITModule::new(builder);
         
@@ -332,6 +334,29 @@ impl Jit {
         sig_helper_check_self_recursion.returns.push(AbiParam::new(types::I32)); // bool
         let callee_helper_check_self_recursion = self.module.declare_function("helper_check_self_recursion", Linkage::Import, &sig_helper_check_self_recursion).map_err(|e| e.to_string())?;
         let local_helper_check_self_recursion = self.module.declare_func_in_func(callee_helper_check_self_recursion, &mut builder.func);
+
+        let mut sig_helper_make_ref = self.module.make_signature();
+        sig_helper_make_ref.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_make_ref.params.push(AbiParam::new(ptr_type)); // registers
+        sig_helper_make_ref.params.push(AbiParam::new(types::I64)); // dest_reg
+        let callee_helper_make_ref = self.module.declare_function("helper_make_ref", Linkage::Import, &sig_helper_make_ref).map_err(|e| e.to_string())?;
+        let local_helper_make_ref = self.module.declare_func_in_func(callee_helper_make_ref, &mut builder.func);
+
+        let mut sig_helper_set_ref = self.module.make_signature();
+        sig_helper_set_ref.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_set_ref.params.push(AbiParam::new(ptr_type)); // registers
+        sig_helper_set_ref.params.push(AbiParam::new(types::I64)); // dest_reg
+        sig_helper_set_ref.params.push(AbiParam::new(types::I64)); // src_reg
+        let callee_helper_set_ref = self.module.declare_function("helper_set_ref", Linkage::Import, &sig_helper_set_ref).map_err(|e| e.to_string())?;
+        let local_helper_set_ref = self.module.declare_func_in_func(callee_helper_set_ref, &mut builder.func);
+
+        let mut sig_helper_deref = self.module.make_signature();
+        sig_helper_deref.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_deref.params.push(AbiParam::new(ptr_type)); // registers
+        sig_helper_deref.params.push(AbiParam::new(types::I64)); // dest_reg
+        sig_helper_deref.params.push(AbiParam::new(types::I64)); // src_reg
+        let callee_helper_deref = self.module.declare_function("helper_deref", Linkage::Import, &sig_helper_deref).map_err(|e| e.to_string())?;
+        let local_helper_deref = self.module.declare_func_in_func(callee_helper_deref, &mut builder.func);
 
         // --- PASS 2: Generate Code ---
         prog.jump_to(start_addr);
@@ -843,6 +868,25 @@ impl Jit {
                     builder.ins().call(local_helper_make_closure, &[vm_ptr, prog_ptr, registers_ptr, dest_reg_const, func_reg_const, count_const, instr_addr_const]);
                     is_terminated = false;
                 },
+                Instr::MakeRef => {
+                    let dest_reg = opcode[1] as i64;
+                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    builder.ins().call(local_helper_make_ref, &[vm_ptr, registers_ptr, dest_reg_const]);
+                },
+                Instr::SetRef => {
+                    let dest_reg = opcode[1] as i64;
+                    let src_reg = opcode[2] as i64;
+                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    let src_reg_const = builder.ins().iconst(types::I64, src_reg);
+                    builder.ins().call(local_helper_set_ref, &[vm_ptr, registers_ptr, dest_reg_const, src_reg_const]);
+                },
+                Instr::Deref => {
+                    let dest_reg = opcode[1] as i64;
+                    let src_reg = opcode[2] as i64;
+                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    let src_reg_const = builder.ins().iconst(types::I64, src_reg);
+                    builder.ins().call(local_helper_deref, &[vm_ptr, registers_ptr, dest_reg_const, src_reg_const]);
+                },
                 Instr::Ret => {
                     if !is_terminated {
                         builder.ins().return_(&[]);
@@ -1095,54 +1139,6 @@ unsafe extern "C" fn helper_load_func_ref(vm: *mut Vm, prog: *mut VirtualProgram
     *registers.add(dest_reg) = Value::FuncRef(FunctionData{header, address: func_addr as u64, jit_code});
 }
 
-unsafe extern "C" fn helper_prepare_direct_call(vm: *mut Vm, func_reg: usize, param_start: usize, result_reg_out: *mut usize) -> *const u8 {
-    let vm = &mut *vm;
-    let func = &vm.registers[vm.window_start + func_reg];
-    
-    if let Value::FuncRef(f) = func {
-        if f.jit_code != 0 {
-            let header = f.header;
-            let jit_code = f.jit_code;
-            
-            let size = vm.window_start + param_start + header.register_count as usize;
-            if size >= vm.registers.len() {
-                vm.registers.resize(size, Value::Empty);
-            }
-            *result_reg_out = header.result_reg as usize;
-            return jit_code as *const u8;
-        }
-    }
-
-    let resolved = if let Value::Ref(r) = func { r.borrow().clone() } else { func.clone() };
-
-    let (header, _address, captures, jit_code) = match resolved {
-        Value::FuncRef(f) => (f.header, f.address, None, f.jit_code),
-        Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code),
-        _ => return std::ptr::null(),
-    };
-
-    if jit_code != 0 {
-        // Resize registers
-        let size = vm.window_start + param_start + header.register_count as usize;
-        if size >= vm.registers.len() {
-            vm.registers.resize(size, Value::Empty);
-        }
-
-        // Copy captures
-        if let Some(caps) = captures {
-             let start_reg = vm.window_start + param_start + header.param_count as usize;
-             for (i, val) in caps.into_iter().enumerate() {
-                 vm.registers[start_reg + i] = val;
-             }
-        }
-        
-        *result_reg_out = header.result_reg as usize;
-        return jit_code as *const u8;
-    }
-    
-    std::ptr::null()
-}
-
 unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, _registers: *mut Value, func_reg: usize, param_start: usize, target_reg: usize) {
     let vm = &mut *vm;
     let prog = &mut *prog;
@@ -1260,8 +1256,7 @@ use super::vp::ClosureData;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-unsafe extern "C" fn helper_make_closure(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut Value, dest_reg: usize, func_reg: usize, count: usize, instr_addr: u64) {
-    let vm = &mut *vm;
+unsafe extern "C" fn helper_make_closure(_vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut Value, dest_reg: usize, func_reg: usize, count: usize, instr_addr: u64) {
     let prog = &mut *prog;
     
     let old_pos = prog.current_address();
