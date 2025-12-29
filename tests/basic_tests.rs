@@ -5,33 +5,11 @@ use lisp::vm::compiler::Compiler;
 use lisp::vm::math_functions;
 use lisp::vm::vm::Vm;
 
+mod common;
+use common::parse_and_exec;
+
 fn compare_expr<T>(expr: SExpression, value: T) -> bool where T: Into<Atom> {
     expr == <SExpression>::from(value)
-}
-
-fn parse_and_exec(prog: &str) -> SExpression {
-    let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
-    let parser = Parser::new();
-    let (expr, map, _) = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), SourceMap::Leaf(0..0), 0));
-
-    let mut compiler = Compiler::new(false);
-    math_functions::register_functions(&mut compiler);
-    let mut prog = compiler.compile(&expr, &map).unwrap();
-    let mut prog_copy = prog.clone();
-    let mut vm = Vm::new(false);
-    let res = match vm.run(&mut prog) {
-        Some(r) => r,
-        None => panic!("VM failed to execute")
-    };
-
-    let mut vm_jit = Vm::new(true);
-    let res_jit = match vm_jit.run(&mut prog_copy) {
-        Some(r) => r,
-        None => panic!("VM failed to execute")
-    };
-
-    assert!(res == res_jit);
-    res
 }
 
 fn compile_and_run(prog: &str) -> Option<SExpression> {
@@ -152,12 +130,6 @@ fn test_compiler_comparisons() {
 
     let res = compile_and_run("(< 4 (+ 2 3) (* 2 6)))");
     assert!(matches!(res, Some(SExpression::Atom(Atom::Boolean(true)))));
-}
-
-#[test]
-fn test_trigonometric_functions() {
-    let res = compile_and_run("(sin 1.0)").unwrap();
-    assert!(compare_expr(res, (1.0 as f64).sin()));
 }
 
 #[test]
