@@ -3,7 +3,7 @@ use std::{cell::{Ref, RefCell}, io::{Cursor, Read}, mem::size_of, rc::{Rc}, ops:
 use enum_display::EnumDisplay;
 
 #[repr(u8)]
-#[derive(Clone, Copy, EnumDisplay)]
+#[derive(Clone, Copy, EnumDisplay, Debug)]
 pub(super) enum Instr {
     //register handling
     LoadInt,
@@ -130,7 +130,8 @@ impl FunctionHeader {
 #[derive(PartialEq, Clone, Debug)]
 pub struct FunctionData {
     pub header: FunctionHeader,
-    pub address: u64
+    pub address: u64,
+    pub jit_code: u64 // 0 if None
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -165,6 +166,7 @@ pub struct ClosureData {
 }
 
 #[derive(PartialEq, Clone, Debug)]
+#[repr(C, u8)]
 pub enum Value {
     Empty,
     Boolean(bool),
@@ -207,6 +209,10 @@ impl VirtualProgram {
 
     pub fn get_listing(&self) -> String {
         self.listing.clone()
+    }
+
+    pub fn get_bytecode(&self) -> &[u8] {
+        self.cursor.get_ref()
     }
 
     pub fn get_result_reg(&self) -> u8 {

@@ -51,6 +51,7 @@ enum VmCommand {
 enum VmEvent {
     Stopped(String), // reason
     Terminated,
+    #[allow(dead_code)]
     Output(String),
 }
 
@@ -278,7 +279,7 @@ impl DebugAdapter {
                         let program_path = launch_args.program.clone();
                         
                         thread::spawn(move || {
-                            let mut vm = Vm::new();
+                            let mut vm = Vm::new(false);
                             let mut debugger = VmDebugger {
                                 cmd_rx: vm_rx,
                                 adapter_tx,

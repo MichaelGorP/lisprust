@@ -16,7 +16,7 @@ fn parse_and_exec(prog: &str) -> SExpression {
     let mut compiler = Compiler::new(false);
     math_functions::register_functions(&mut compiler);
     let mut prog = compiler.compile(&expr, &map).unwrap();
-    let mut vm = Vm::new();
+    let mut vm = Vm::new(false);
     let res = match vm.run(&mut prog) {
         Some(r) => r,
         None => panic!("VM failed to execute")

@@ -1,10 +1,10 @@
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::cell::RefCell;
 
 use crate::parser::{SExpression, Atom};
 
 use super::vp::{ClosureData, FunctionData, FunctionHeader, Instr, JumpCondition, Value, VirtualProgram};
+use super::jit::Jit;
 
 macro_rules! binary_op {
     ($self:ident, $opcode:ident, $op:tt) => {
@@ -87,16 +87,33 @@ pub trait Debugger {
     fn on_step(&mut self, vm: &Vm, prog: &VirtualProgram);
 }
 
+#[repr(C)]
 pub struct Vm {
     pub registers: Vec<Value>,
-    call_states: Vec<CallState>,
-    pub window_start: usize
+    pub(super) call_states: Vec<CallState>,
+    pub window_start: usize,
+    pub jit: Jit,
+    pub jit_enabled: bool,
+    pub global_vars: Vec<Value>,
 }
 
 impl Vm {
-    pub fn new() -> Vm {
+    pub fn new(jit_enabled: bool) -> Vm {
         const EMPTY : Value = empty_value();
-        Vm {registers: vec![EMPTY; 256], call_states: Vec::new(), window_start: 0}
+        Vm {registers: vec![EMPTY; 64000], call_states: Vec::new(), window_start: 0, jit: Jit::new(), jit_enabled, global_vars: Vec::new()}
+    }
+
+    pub fn run_jit_function(&mut self, prog: *mut VirtualProgram, start_addr: u64, end_addr: u64) {
+        match self.jit.compile(unsafe { &mut *prog }, start_addr, end_addr) {
+            Ok(func) => {
+                unsafe {
+                    func(self as *mut Vm, prog, self.registers.as_mut_ptr().add(self.window_start));
+                }
+            },
+            Err(e) => {
+                println!("JIT compilation failed: {}", e);
+            }
+        }
     }
 
     pub fn registers(&self) -> &Vec<Value> {
@@ -116,13 +133,38 @@ impl Vm {
         }
     }
 
+    pub(super) fn scan_function_end(&self, prog: &mut VirtualProgram, start_addr: u64) -> u64 {
+        let old_pos = prog.current_address();
+        prog.jump_to(start_addr);
+        let mut end_pos = start_addr;
+        
+        loop {
+            let Some(opcode) = prog.read_opcode() else { break; };
+            let instr: Result<Instr, _> = opcode[0].try_into();
+            
+            match instr {
+                Ok(Instr::Jump) => {
+                     let _ = prog.read_int();
+                },
+                Ok(Instr::LoadInt) | Ok(Instr::LoadFloat) => { let _ = prog.read_int(); },
+                Ok(Instr::LoadString) => { let _ = prog.read_string(); },
+                Ok(Instr::Define) | Ok(Instr::LoadGlobal) | Ok(Instr::LoadFuncRef) => { let _ = prog.read_int(); },
+                Ok(Instr::Ret) => {
+                    end_pos = prog.current_address();
+                    break;
+                },
+                _ => {}
+            }
+        }
+        prog.jump_to(old_pos);
+        end_pos
+    }
+
     pub fn run(&mut self, prog: &mut VirtualProgram) -> Option<SExpression> {
         self.run_debug(prog, None)
     }
 
     pub fn run_debug(&mut self, prog: &mut VirtualProgram, mut debugger: Option<&mut dyn Debugger>) -> Option<SExpression> {
-        let mut global_vars = HashMap::new();
-
         loop {
             if let Some(dbg) = &mut debugger {
                 dbg.on_step(self, prog);
@@ -220,13 +262,20 @@ impl Vm {
                     let Some(sym_id) = prog.read_int() else {
                         break;
                     };
-                    global_vars.insert(sym_id, self.registers[opcode[1] as usize + self.window_start].clone());
+                    if sym_id as usize >= self.global_vars.len() {
+                        self.global_vars.resize(sym_id as usize + 1, Value::Empty);
+                    }
+                    self.global_vars[sym_id as usize] = self.registers[opcode[1] as usize + self.window_start].clone();
                 },
                 Ok(Instr::LoadGlobal) => {
                     let Some(sym_id) = prog.read_int() else {
                         break;
                     };
-                    let value = global_vars.get(&sym_id);
+                    let value = if (sym_id as usize) < self.global_vars.len() {
+                        Some(&self.global_vars[sym_id as usize])
+                    } else {
+                        None
+                    };
                     match value {
                         Some(v) => self.registers[opcode[1] as usize + self.window_start] = v.clone(),
                         _ => self.registers[opcode[1] as usize + self.window_start] = empty_value()
@@ -240,7 +289,7 @@ impl Vm {
                         break;
                     };
                     let func_addr = header_addr as usize + std::mem::size_of::<FunctionHeader>();
-                    self.registers[opcode[1] as usize + self.window_start] = Value::FuncRef(FunctionData{header, address: func_addr as u64});
+                    self.registers[opcode[1] as usize + self.window_start] = Value::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: 0});
                 },
                 Ok(Instr::CallSymbol) => {
                     let func = self.registers[opcode[1] as usize + self.window_start].clone();
@@ -279,7 +328,19 @@ impl Vm {
                         }
                     }
                     
-                    prog.jump_to(address);
+                    if self.jit_enabled {
+                        let end_addr = self.scan_function_end(prog, address);
+                        self.run_jit_function(prog as *mut VirtualProgram, address, end_addr);
+                        
+                        let state = self.call_states.pop().unwrap();
+                        let source_reg = self.window_start + state.result_reg as usize;
+                        let target_reg = state.window_start + state.target_reg as usize;
+                        self.registers.swap(source_reg, target_reg);
+
+                        self.window_start = old_ws;
+                    } else {
+                        prog.jump_to(address);
+                    }
                 },
                 Ok(Instr::TailCallSymbol) => {
                     // For tail-calls, clone the function value instead of swapping it out.
@@ -327,7 +388,24 @@ impl Vm {
                         }
                     }
 
-                    prog.jump_to(address);
+                    if self.jit_enabled {
+                        let end_addr = self.scan_function_end(prog, address);
+                        self.run_jit_function(prog as *mut VirtualProgram, address, end_addr);
+                        
+                        // Simulate Ret
+                        if let Some(state) = self.call_states.pop() {
+                            let source_reg = self.window_start + state.result_reg as usize;
+                            let target_reg = state.window_start + state.target_reg as usize;
+                            self.registers.swap(source_reg, target_reg);
+
+                            self.window_start = state.window_start;
+                            prog.jump_to(state.return_addr);
+                        } else {
+                            return None; // End of program
+                        }
+                    } else {
+                        prog.jump_to(address);
+                    }
                 },
                 Ok(Instr::CallFunction) => {
                     let Some(func_id) = prog.read_int() else {
@@ -408,8 +486,10 @@ impl Vm {
         self.registers.truncate(256);
         self.registers.shrink_to_fit();
 
+        let res_reg = prog.get_result_reg() as usize + self.window_start;
+
         //convert result
-        value_to_sexpr(&self.registers[prog.get_result_reg() as usize + self.window_start])
+        value_to_sexpr(&self.registers[res_reg])
     }
 
 }

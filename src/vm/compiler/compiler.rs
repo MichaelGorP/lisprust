@@ -87,6 +87,8 @@ impl<'a> Compiler<'a> {
             self.compile_expr(root, &[], false)?
         };
 
+        self.bytecode.store_opcode(Instr::Ret, reg, 0, 0);
+
         let mut new_builder = BytecodeBuilder::new(self.generate_asm);
         std::mem::swap(&mut self.bytecode, &mut new_builder);
         

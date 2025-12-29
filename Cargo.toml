@@ -18,3 +18,7 @@ derive_more = { version = "1", features = ["from"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.148"
 anyhow = "1.0.100"
+cranelift = "0.120.2"
+cranelift-jit = "0.120.2"
+cranelift-module = "0.120.2"
+cranelift-native = "0.120.2"

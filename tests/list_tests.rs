@@ -12,7 +12,7 @@ fn compile_and_run(prog: &str) -> Option<SExpression> {
     let parser = Parser::new();
     let (expr, map, _) = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), SourceMap::Leaf(0..0), 0));
     let mut prog = compiler.compile(&expr, &map).unwrap();
-    let mut vm = Vm::new();
+    let mut vm = Vm::new(false);
     vm.run(&mut prog)
 }
 

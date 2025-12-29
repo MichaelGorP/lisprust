@@ -23,7 +23,7 @@ fn parse_and_exec(prog: &str) -> SExpression {
     let mut compiler = Compiler::new(false);
     math_functions::register_functions(&mut compiler);
     let mut prog = compiler.compile(&expr, &map).unwrap();
-    let mut vm = Vm::new();
+    let mut vm = Vm::new(false);
     let res2 = match vm.run(&mut prog) {
         Some(r) => r,
         None => panic!("VM failed to execute")
@@ -48,7 +48,7 @@ fn compile_and_run(prog: &str) -> Option<SExpression> {
     let parser = Parser::new();
     let (expr, map, _) = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), SourceMap::Leaf(0..0), 0));
     let mut prog = compiler.compile(&expr, &map).unwrap();
-    let mut vm = Vm::new();
+    let mut vm = Vm::new(false);
     vm.run(&mut prog)
 }
 
@@ -204,7 +204,7 @@ fn debug_compiled_letrec_simple() {
     math_functions::register_functions(&mut compiler);
     let mut prog = compiler.compile(&expr, &map).unwrap();
     println!("ASM:\n{}", prog.get_listing());
-    let mut vm = Vm::new();
+    let mut vm = Vm::new(false);
     let res = vm.run(&mut prog);
     println!("VM result: {:?}", res);
     let interp = Interpreter::new();

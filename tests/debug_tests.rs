@@ -26,7 +26,7 @@ fn test_debugger_steps() {
     math_functions::register_functions(&mut compiler);
     let mut prog = compiler.compile(&expr, &map).unwrap();
     
-    let mut vm = Vm::new();
+    let mut vm = Vm::new(false);
     let mut debugger = StepCounter { steps: 0 };
     
     vm.run_debug(&mut prog, Some(&mut debugger));
@@ -67,7 +67,7 @@ fn test_debugger_source_mapping() {
         }
     }
     
-    let mut vm = Vm::new();
+    let mut vm = Vm::new(false);
     let mut debugger = SourceChecker { found_spans: Vec::new() };
     
     vm.run_debug(&mut prog, Some(&mut debugger));
