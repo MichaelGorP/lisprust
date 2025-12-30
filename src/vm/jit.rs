@@ -1,11 +1,20 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::cell::Cell;
 use cranelift::prelude::*;
+use cranelift::codegen::ir::BlockArg;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, Linkage, Module};
-use super::vp::{Value, Instr, JumpCondition, VirtualProgram, FunctionHeader, FunctionData};
+use super::vp::{Value as LispValue, Instr, JumpCondition, VirtualProgram, FunctionHeader, FunctionData, HeapValue};
 use super::vm::Vm;
+
+// Constants for Value layout
+// Assumes #[repr(C, u8)] for Value enum
+const TAG_OFFSET: i32 = 0;
+// Data offset depends on alignment. For 64-bit types (i64, f64, ptr), alignment is 8.
+// So tag (1 byte) + padding (7 bytes) = 8 bytes offset.
+const DATA_OFFSET: i32 = 8;
 
 pub struct Jit {
     builder_context: FunctionBuilderContext,
@@ -42,6 +51,7 @@ impl Jit {
         builder.symbol("helper_make_ref", helper_make_ref as *const u8);
         builder.symbol("helper_set_ref", helper_set_ref as *const u8);
         builder.symbol("helper_deref", helper_deref as *const u8);
+        builder.symbol("helper_get_registers_ptr", helper_get_registers_ptr as *const u8);
 
         let module = JITModule::new(builder);
         
@@ -55,12 +65,12 @@ impl Jit {
         }
     }
 
-    pub fn compile(&mut self, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Result<fn(*mut Vm, *mut VirtualProgram, *mut Value), String> {
+    pub fn compile(&mut self, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Result<fn(*mut Vm, *mut VirtualProgram, *mut LispValue), String> {
         if let Some(&code) = self.cache.get(&start_addr) {
             return Ok(unsafe { std::mem::transmute(code) });
         }
 
-        // Define signature: fn(*mut Vm, *mut VirtualProgram, *mut Value) -> ()
+        // Define signature: fn(*mut Vm, *mut VirtualProgram, *mut LispValue) -> ()
         let ptr_type = self.module.target_config().pointer_type();
         self.ctx.func.signature.params.push(AbiParam::new(ptr_type)); // vm
         self.ctx.func.signature.params.push(AbiParam::new(ptr_type)); // prog
@@ -179,7 +189,7 @@ impl Jit {
         let registers_ptr = builder.block_params(entry_block)[2];
 
         // Jump to loop header
-        builder.ins().jump(loop_header, &[]);
+        builder.ins().jump(loop_header, &[BlockArg::from(registers_ptr)]);
         builder.seal_block(entry_block);
         
         // We must switch to loop_header before declaring helpers? No, helpers are declared in the function.
@@ -289,10 +299,23 @@ impl Jit {
         let callee_helper_deref = self.module.declare_function("helper_deref", Linkage::Import, &sig_helper_deref).map_err(|e| e.to_string())?;
         let local_helper_deref = self.module.declare_func_in_func(callee_helper_deref, &mut builder.func);
 
+        let mut sig_helper_get_registers_ptr = self.module.make_signature();
+        sig_helper_get_registers_ptr.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_get_registers_ptr.returns.push(AbiParam::new(ptr_type)); // registers
+        let callee_helper_get_registers_ptr = self.module.declare_function("helper_get_registers_ptr", Linkage::Import, &sig_helper_get_registers_ptr).map_err(|e| e.to_string())?;
+        let local_helper_get_registers_ptr = self.module.declare_func_in_func(callee_helper_get_registers_ptr, &mut builder.func);
+
         // --- PASS 2: Generate Code ---
         prog.jump_to(start_addr);
         
         let mut is_terminated = false;
+        
+        // Add registers_ptr param to all blocks
+        for block in blocks.values() {
+             builder.append_block_param(*block, ptr_type);
+        }
+
+        let mut registers_ptr = builder.block_params(entry_block)[2];
 
         while prog.current_address() < end_addr {
             let current_addr = prog.current_address();
@@ -301,9 +324,10 @@ impl Jit {
             if let Some(&block) = blocks.get(&current_addr) {
                 if current_addr != start_addr {
                     if !is_terminated {
-                        builder.ins().jump(block, &[]);
+                        builder.ins().jump(block, &[BlockArg::from(registers_ptr)]);
                     }
                     builder.switch_to_block(block);
+                    registers_ptr = builder.block_params(block)[0];
                     is_terminated = false;
                 }
             } else if is_terminated {
@@ -353,15 +377,15 @@ impl Jit {
 
 
                     if cond_byte == JumpCondition::Jump as u8 {
-                        builder.ins().jump(target_block, &[]);
+                        builder.ins().jump(target_block, &[BlockArg::from(registers_ptr)]);
                     } else {
                         // Conditional Jump
                         let reg_idx = opcode[1] as i64;
-                        let val_size = std::mem::size_of::<Value>() as i64;
+                        let val_size = std::mem::size_of::<LispValue>() as i64;
                         let reg_ptr = builder.ins().iadd_imm(registers_ptr, reg_idx * val_size);
                         
-                        let tag = builder.ins().load(types::I8, MemFlags::trusted(), reg_ptr, 0);
-                        let val = builder.ins().load(types::I8, MemFlags::trusted(), reg_ptr, 8);
+                        let tag = builder.ins().load(types::I8, MemFlags::trusted(), reg_ptr, TAG_OFFSET);
+                        let val = builder.ins().load(types::I8, MemFlags::trusted(), reg_ptr, DATA_OFFSET);
                         
                         // is_false = (tag == 1) && (val == 0)
                         // Tag 1 is Boolean. Val 0 is false.
@@ -379,11 +403,11 @@ impl Jit {
                             // If is_false (it is false), we want to jump (it is true).
                             // So if is_false is 0, we jump.
                             // brif(is_false, fallthrough, target)
-                            builder.ins().brif(is_false, fallthrough_block, &[], target_block, &[]);
+                            builder.ins().brif(is_false, fallthrough_block, &[BlockArg::from(registers_ptr)], target_block, &[BlockArg::from(registers_ptr)]);
                         } else {
                             // JumpFalse
                             // Jump if is_false
-                            builder.ins().brif(is_false, target_block, &[], fallthrough_block, &[]);
+                            builder.ins().brif(is_false, target_block, &[BlockArg::from(registers_ptr)], fallthrough_block, &[BlockArg::from(registers_ptr)]);
                         }
                     }
                     is_terminated = true;
@@ -392,14 +416,14 @@ impl Jit {
                     let dest_reg = opcode[1] as i64;
                     let val = prog.read_int().unwrap();
                     
-                    let val_size = std::mem::size_of::<Value>() as i64;
+                    let val_size = std::mem::size_of::<LispValue>() as i64;
                     let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
                     
                     let const_tag = builder.ins().iconst(types::I8, 2); // Value::Integer
                     let val_const = builder.ins().iconst(types::I64, val);
                     
-                    builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, 0);
-                    builder.ins().store(MemFlags::trusted(), val_const, dest_ptr, 8);
+                    builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                    builder.ins().store(MemFlags::trusted(), val_const, dest_ptr, DATA_OFFSET);
                     
                     is_terminated = false;
                 },
@@ -408,14 +432,14 @@ impl Jit {
                     let val_bits = prog.read_int().unwrap();
                     let val = f64::from_bits(val_bits as u64);
                     
-                    let val_size = std::mem::size_of::<Value>() as i64;
+                    let val_size = std::mem::size_of::<LispValue>() as i64;
                     let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
                     
                     let const_tag = builder.ins().iconst(types::I8, 3); // Value::Float
                     let val_const = builder.ins().f64const(val);
                     
-                    builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, 0);
-                    builder.ins().store(MemFlags::trusted(), val_const, dest_ptr, 8);
+                    builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                    builder.ins().store(MemFlags::trusted(), val_const, dest_ptr, DATA_OFFSET);
                     
                     is_terminated = false;
                 },
@@ -423,57 +447,11 @@ impl Jit {
                     let dest_reg = opcode[1] as i64;
                     let sym_id = prog.read_int().unwrap();
                     
-                    let val_size = 32;
-                    let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
-                    
-                    let globals_vec_offset = 32;
-                    let globals_ptr = builder.ins().load(types::I64, MemFlags::trusted(), vm_ptr, globals_vec_offset);
-                    
-                    let sym_offset = sym_id * val_size;
-                    let global_val_ptr = builder.ins().iadd_imm(globals_ptr, sym_offset);
-                    
-                    let tag = builder.ins().load(types::I8, MemFlags::trusted(), global_val_ptr, 0);
-                    
-                    let block_check_jit = builder.create_block();
-                    let block_copy = builder.create_block();
-                    let block_call_helper = builder.create_block();
-                    let block_done = builder.create_block();
-                    
-                    // Check if FuncRef (6)
-                    let is_func = builder.ins().icmp_imm(IntCC::Equal, tag, 6);
-                    builder.ins().brif(is_func, block_check_jit, &[], block_copy, &[]);
-                    
-                    builder.switch_to_block(block_check_jit);
-                    // Check jit_code at offset 24
-                    let jit_code = builder.ins().load(types::I64, MemFlags::trusted(), global_val_ptr, 24);
-                    let is_zero = builder.ins().icmp_imm(IntCC::Equal, jit_code, 0);
-                    builder.ins().brif(is_zero, block_call_helper, &[], block_copy, &[]);
-                    
-                    builder.switch_to_block(block_call_helper);
                     let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
                     let sym_id_const = builder.ins().iconst(types::I64, sym_id);
+                    
                     builder.ins().call(local_helper_load_global, &[vm_ptr, registers_ptr, dest_reg_const, sym_id_const]);
-                    builder.ins().jump(block_done, &[]);
                     
-                    builder.switch_to_block(block_copy);
-                    // Copy 32 bytes
-                    let v0 = builder.ins().load(types::I64, MemFlags::trusted(), global_val_ptr, 0);
-                    let v1 = builder.ins().load(types::I64, MemFlags::trusted(), global_val_ptr, 8);
-                    let v2 = builder.ins().load(types::I64, MemFlags::trusted(), global_val_ptr, 16);
-                    let v3 = builder.ins().load(types::I64, MemFlags::trusted(), global_val_ptr, 24);
-                    
-                    builder.ins().store(MemFlags::trusted(), v0, dest_ptr, 0);
-                    builder.ins().store(MemFlags::trusted(), v1, dest_ptr, 8);
-                    builder.ins().store(MemFlags::trusted(), v2, dest_ptr, 16);
-                    builder.ins().store(MemFlags::trusted(), v3, dest_ptr, 24);
-                    builder.ins().jump(block_done, &[]);
-                    
-                    // builder.seal_block(block_check_jit);
-                    // builder.seal_block(block_call_helper);
-                    // builder.seal_block(block_copy);
-                    
-                    builder.switch_to_block(block_done);
-                    // builder.seal_block(block_done); // Removed this line
                     is_terminated = false;
                 },
                 Instr::Define => {
@@ -506,6 +484,11 @@ impl Jit {
                     let target_reg_const = builder.ins().iconst(types::I64, target_reg);
                     
                     builder.ins().call(local_helper_call_symbol, &[vm_ptr, prog_ptr, registers_ptr, func_reg_const, param_start_const, target_reg_const]);
+                    
+                    // Reload registers_ptr as it might have changed due to resize
+                    let call_inst = builder.ins().call(local_helper_get_registers_ptr, &[vm_ptr]);
+                    registers_ptr = builder.inst_results(call_inst)[0];
+                    
                     is_terminated = false;
                 },
                 Instr::TailCallSymbol => {
@@ -515,63 +498,6 @@ impl Jit {
                     let func_reg_const = builder.ins().iconst(types::I64, func_reg);
                     let param_start_const = builder.ins().iconst(types::I64, param_start);
                     
-                    // Check self recursion inline
-                    // Load func from registers
-                    let val_size = std::mem::size_of::<Value>() as i64;
-                    let func_ptr = builder.ins().iadd_imm(registers_ptr, func_reg * val_size);
-                    
-                    let tag = builder.ins().load(types::I8, MemFlags::trusted(), func_ptr, 0);
-                    
-                    let block_check_addr = builder.create_block();
-                    let block_loop = builder.create_block();
-                    let block_fallback = builder.create_block();
-                    
-                    // Check if tag is FuncRef (6)
-                    let is_func_ref = builder.ins().icmp_imm(IntCC::Equal, tag, 6);
-                    builder.ins().brif(is_func_ref, block_check_addr, &[], block_fallback, &[]);
-                    
-                    builder.switch_to_block(block_check_addr);
-                    // FunctionData is inline at offset 8.
-                    // address is at FunctionData offset 8.
-                    // So address is at Value offset 8 + 8 = 16.
-                    let func_addr = builder.ins().load(types::I64, MemFlags::trusted(), func_ptr, 16);
-                    let is_self = builder.ins().icmp_imm(IntCC::Equal, func_addr, start_addr as i64);
-                    builder.ins().brif(is_self, block_loop, &[], block_fallback, &[]);
-
-                    builder.switch_to_block(block_loop);
-                    // Self recursion loop
-                    // Copy params from param_start to 0
-                    // We need param_count.
-                    // Read header
-                    let header_addr = start_addr - 4;
-                    let header = prog.read_function_header(header_addr).unwrap();
-                    let param_count = header.param_count as i64;
-                    
-                    let u64_count = val_size / 8;
-                    
-                    for i in 0..param_count {
-                        let src_idx = param_start + i;
-                        let dest_idx = i;
-                        
-                        let src_offset = builder.ins().iconst(types::I64, src_idx * val_size);
-                        let dest_offset = builder.ins().iconst(types::I64, dest_idx * val_size);
-                        
-                        let src_ptr = builder.ins().iadd(registers_ptr, src_offset);
-                        let dest_ptr = builder.ins().iadd(registers_ptr, dest_offset);
-                        
-                        // Copy value_size bytes
-                        for j in 0..u64_count {
-                            let off = (j * 8) as i32;
-                            let val = builder.ins().load(types::I64, MemFlags::trusted(), src_ptr, off);
-                            builder.ins().store(MemFlags::trusted(), val, dest_ptr, off);
-                        }
-                    }
-                    
-                    // Jump to loop header
-                    let loop_header = *blocks.get(&start_addr).unwrap();
-                    builder.ins().jump(loop_header, &[]);
-
-                    builder.switch_to_block(block_fallback);
                     builder.ins().call(local_helper_tail_call_symbol, &[vm_ptr, prog_ptr, registers_ptr, func_reg_const, param_start_const]);
                     builder.ins().return_(&[]);
                     is_terminated = true;
@@ -582,21 +508,20 @@ impl Jit {
                     let src1_reg = opcode[2] as i64;
                     let src2_reg = opcode[3] as i64;
                     
-                    let val_size = std::mem::size_of::<Value>() as i64;
-                    let tag_offset = 0;
-                    let data_offset = 8;
+                    let val_size = std::mem::size_of::<LispValue>() as i64;
                     
                     let src1_ptr = builder.ins().iadd_imm(registers_ptr, src1_reg * val_size);
                     let src2_ptr = builder.ins().iadd_imm(registers_ptr, src2_reg * val_size);
                     let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
                     
-                    let tag1 = builder.ins().load(types::I8, MemFlags::trusted(), src1_ptr, tag_offset);
-                    let tag2 = builder.ins().load(types::I8, MemFlags::trusted(), src2_ptr, tag_offset);
+                    let tag1 = builder.ins().load(types::I8, MemFlags::trusted(), src1_ptr, TAG_OFFSET);
+                    let tag2 = builder.ins().load(types::I8, MemFlags::trusted(), src2_ptr, TAG_OFFSET);
                     
                     let block_int = builder.create_block();
                     let block_float_exec = builder.create_block();
                     let block_slow = builder.create_block();
                     let block_done = builder.create_block();
+                    builder.append_block_param(block_done, ptr_type);
                     let block_dispatch = builder.create_block();
 
                     // Fast path for integers
@@ -629,210 +554,203 @@ impl Jit {
                     
                     // --- Integer Path ---
                     builder.switch_to_block(block_int);
-                    let val1 = builder.ins().load(types::I64, MemFlags::trusted(), src1_ptr, data_offset);
-                    let val2 = builder.ins().load(types::I64, MemFlags::trusted(), src2_ptr, data_offset);
+                    let val1 = builder.ins().load(types::I64, MemFlags::trusted(), src1_ptr, DATA_OFFSET);
+                    let val2 = builder.ins().load(types::I64, MemFlags::trusted(), src2_ptr, DATA_OFFSET);
                     
                     match instr {
                         Instr::Add => {
                             let res = builder.ins().iadd(val1, val2);
                             let const_tag = builder.ins().iconst(types::I8, 2);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Sub => {
                             let res = builder.ins().isub(val1, val2);
                             let const_tag = builder.ins().iconst(types::I8, 2);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Mul => {
                             let res = builder.ins().imul(val1, val2);
                             let const_tag = builder.ins().iconst(types::I8, 2);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Div => {
                             // Integer division in Lisp might need to handle 0 or return float? 
                             // For now assuming standard integer div
                             let res = builder.ins().sdiv(val1, val2);
                             let const_tag = builder.ins().iconst(types::I8, 2);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Eq => {
                             let res = builder.ins().icmp(IntCC::Equal, val1, val2);
+                            let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Neq => {
                             let res = builder.ins().icmp(IntCC::NotEqual, val1, val2);
+                            let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Lt => {
                             let res = builder.ins().icmp(IntCC::SignedLessThan, val1, val2);
+                            let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Gt => {
                             let res = builder.ins().icmp(IntCC::SignedGreaterThan, val1, val2);
+                            let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Leq => {
                             let res = builder.ins().icmp(IntCC::SignedLessThanOrEqual, val1, val2);
+                            let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Geq => {
                             let res = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, val1, val2);
+                            let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
                         },
                         _ => {}
                     }
-                    builder.ins().jump(block_done, &[]);
+                    builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
 
                     // --- Float Path ---
                     builder.switch_to_block(block_float_exec);
-                    let val1 = builder.ins().load(types::F64, MemFlags::trusted(), src1_ptr, data_offset);
-                    let val2 = builder.ins().load(types::F64, MemFlags::trusted(), src2_ptr, data_offset);
+                    let val1 = builder.ins().load(types::F64, MemFlags::trusted(), src1_ptr, DATA_OFFSET);
+                    let val2 = builder.ins().load(types::F64, MemFlags::trusted(), src2_ptr, DATA_OFFSET);
                     
                     match instr {
                         Instr::Add => {
                             let res = builder.ins().fadd(val1, val2);
                             let const_tag = builder.ins().iconst(types::I8, 3);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Sub => {
                             let res = builder.ins().fsub(val1, val2);
                             let const_tag = builder.ins().iconst(types::I8, 3);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Mul => {
                             let res = builder.ins().fmul(val1, val2);
                             let const_tag = builder.ins().iconst(types::I8, 3);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Div => {
                             let res = builder.ins().fdiv(val1, val2);
                             let const_tag = builder.ins().iconst(types::I8, 3);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Eq => {
                             let res = builder.ins().fcmp(FloatCC::Equal, val1, val2);
+                            let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Neq => {
                             let res = builder.ins().fcmp(FloatCC::NotEqual, val1, val2);
+                            let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Lt => {
                             let res = builder.ins().fcmp(FloatCC::LessThan, val1, val2);
+                            let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Gt => {
                             let res = builder.ins().fcmp(FloatCC::GreaterThan, val1, val2);
+                            let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Leq => {
                             let res = builder.ins().fcmp(FloatCC::LessThanOrEqual, val1, val2);
+                            let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
                         },
                         Instr::Geq => {
                             let res = builder.ins().fcmp(FloatCC::GreaterThanOrEqual, val1, val2);
+                            let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, tag_offset);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, data_offset);
+                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
                         },
                         _ => {}
                     }
-                    builder.ins().jump(block_done, &[]);
+                    builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
 
                     // --- Slow Path ---
                     builder.switch_to_block(block_slow);
                     let op_val = u32::from_le_bytes(opcode);
                     let op_const = builder.ins().iconst(types::I32, op_val as i64);
                     builder.ins().call(local_helper_op, &[vm_ptr, prog_ptr, registers_ptr, op_const]);
-                    builder.ins().jump(block_done, &[]);
+                    builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
                     
                     builder.switch_to_block(block_done);
+                    registers_ptr = builder.block_params(block_done)[0];
                 },
                 Instr::Not => {
                     let dest_reg = opcode[1] as i64;
                     let src_reg = opcode[2] as i64;
-                    let val_size = std::mem::size_of::<Value>() as i64;
+                    let val_size = std::mem::size_of::<LispValue>() as i64;
                     
                     let src_ptr = builder.ins().iadd_imm(registers_ptr, src_reg * val_size);
                     let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
                     
-                    let tag = builder.ins().load(types::I8, MemFlags::trusted(), src_ptr, 0);
+                    let tag = builder.ins().load(types::I8, MemFlags::trusted(), src_ptr, TAG_OFFSET);
+                    let val = builder.ins().load(types::I8, MemFlags::trusted(), src_ptr, DATA_OFFSET);
                     
-                    let block_bool = builder.create_block();
-                    let block_other = builder.create_block();
-                    let block_done = builder.create_block();
+                    let tag_is_bool = builder.ins().icmp_imm(IntCC::Equal, tag, 1);
+                    let not_val = builder.ins().bxor_imm(val, 1);
                     
-                    let is_bool = builder.ins().icmp_imm(IntCC::Equal, tag, 1);
-                    builder.ins().brif(is_bool, block_bool, &[], block_other, &[]);
+                    // If tag is bool, result is not_val. Else result is false (0).
+                    let zero = builder.ins().iconst(types::I8, 0);
+                    let res_val = builder.ins().select(tag_is_bool, not_val, zero);
                     
-                    builder.switch_to_block(block_bool);
-                    let val_bool = builder.ins().load(types::I8, MemFlags::trusted(), src_ptr, 8);
-                    let not_val = builder.ins().bxor_imm(val_bool, 1);
+                    let res_val_ext = builder.ins().uextend(types::I64, res_val);
                     let const_tag = builder.ins().iconst(types::I8, 1);
-                    builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, 0);
-                    builder.ins().store(MemFlags::trusted(), not_val, dest_ptr, 8);
-                    builder.ins().jump(block_done, &[]);
                     
-                    builder.switch_to_block(block_other);
-                    let is_ref = builder.ins().icmp_imm(IntCC::Equal, tag, 8);
-                    let block_slow = builder.create_block();
-                    let block_false = builder.create_block();
-                    builder.ins().brif(is_ref, block_slow, &[], block_false, &[]);
+                    builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                    builder.ins().store(MemFlags::trusted(), res_val_ext, dest_ptr, DATA_OFFSET);
                     
-                    builder.switch_to_block(block_false);
-                    let const_tag_bool = builder.ins().iconst(types::I8, 1);
-                    let const_false = builder.ins().iconst(types::I8, 0);
-                    builder.ins().store(MemFlags::trusted(), const_tag_bool, dest_ptr, 0);
-                    builder.ins().store(MemFlags::trusted(), const_false, dest_ptr, 8);
-                    builder.ins().jump(block_done, &[]);
-                    
-                    builder.switch_to_block(block_slow);
-                    let op_val = u32::from_le_bytes(opcode);
-                    let op_const = builder.ins().iconst(types::I32, op_val as i64);
-                    builder.ins().call(local_helper_op, &[vm_ptr, prog_ptr, registers_ptr, op_const]);
-                    builder.ins().jump(block_done, &[]);
-                    
-                    builder.switch_to_block(block_done);
+                    is_terminated = false;
                 },
                 Instr::CopyReg => {
                     let dest_reg = opcode[1] as i64;
                     let src_reg = opcode[2] as i64;
-                    let val_size = std::mem::size_of::<Value>() as i64;
+                    let val_size = std::mem::size_of::<LispValue>() as i64;
                     
                     let src_ptr = builder.ins().iadd_imm(registers_ptr, src_reg * val_size);
                     let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
                     
-                    let tag = builder.ins().load(types::I8, MemFlags::trusted(), src_ptr, 0);
+                    let tag = builder.ins().load(types::I8, MemFlags::trusted(), src_ptr, TAG_OFFSET);
                     
                     // Check if POD (tag <= 3 or tag == 6)
                     let is_pod_basic = builder.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, tag, 3);
@@ -842,28 +760,33 @@ impl Jit {
                     let block_copy = builder.create_block();
                     let block_slow = builder.create_block();
                     let block_done = builder.create_block();
+                    builder.append_block_param(block_done, ptr_type);
                     
                     builder.ins().brif(is_pod, block_copy, &[], block_slow, &[]);
                     
                     builder.switch_to_block(block_copy);
-                    // Copy 32 bytes. 4 x i64.
-                    for i in 0..4 {
-                        let offset = i * 8;
+                    // Copy full Value size. Assumes size is multiple of 8.
+                    let val_size_usize = std::mem::size_of::<LispValue>();
+                    assert!(val_size_usize % 8 == 0, "LispValue size must be multiple of 8");
+                    let num_words = val_size_usize / 8;
+                    
+                    for i in 0..num_words {
+                        let offset = (i * 8) as i32;
                         let val = builder.ins().load(types::I64, MemFlags::trusted(), src_ptr, offset);
                         builder.ins().store(MemFlags::trusted(), val, dest_ptr, offset);
                     }
-                    builder.ins().jump(block_done, &[]);
+                    builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
                     
                     builder.switch_to_block(block_slow);
                     let op_val = u32::from_le_bytes(opcode);
                     let op_const = builder.ins().iconst(types::I32, op_val as i64);
                     builder.ins().call(local_helper_op, &[vm_ptr, prog_ptr, registers_ptr, op_const]);
-                    builder.ins().jump(block_done, &[]);
+                    builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
                     
                     builder.switch_to_block(block_done);
+                    registers_ptr = builder.block_params(block_done)[0];
                 },
                 Instr::MakeClosure => {
-                    // println!("DEBUG: Generating MakeClosure at {}", current_addr);
                     let dest_reg = opcode[1] as i64;
                     let func_reg = opcode[2] as i64;
                     let count = opcode[3] as i64;
@@ -938,7 +861,7 @@ impl Jit {
                  }
             } else {
                 if !is_terminated {
-                    builder.ins().jump(end_block, &[]);
+                    builder.ins().jump(end_block, &[BlockArg::from(registers_ptr)]);
                 }
                 
                 builder.switch_to_block(end_block);
@@ -989,25 +912,29 @@ unsafe extern "C" fn helper_check_self_recursion(vm: *mut Vm, func_reg: usize, s
     let vm = &mut *vm;
     let func = &vm.registers[vm.window_start + func_reg];
     
-    let address = if let Value::Ref(r) = func {
+    let address = if let Some(r) = func.as_ref() {
         let inner = r.borrow();
-        match &*inner {
-            Value::FuncRef(f) => f.address,
-            Value::Closure(c) => c.function.address,
-            _ => return 0,
+        if let Some(f) = inner.as_func_ref() {
+            f.address
+        } else if let Some(c) = inner.as_closure() {
+            c.function.address
+        } else {
+            return 0;
         }
     } else {
-        match func {
-            Value::FuncRef(f) => f.address,
-            Value::Closure(c) => c.function.address,
-            _ => return 0,
+        if let Some(f) = func.as_func_ref() {
+            f.address
+        } else if let Some(c) = func.as_closure() {
+            c.function.address
+        } else {
+            return 0;
         }
     };
     
     if address == start_addr { 1 } else { 0 }
 }
 
-unsafe extern "C" fn helper_op(vm: *mut Vm, _prog: *mut VirtualProgram, registers: *mut Value, opcode_val: u32) {
+unsafe extern "C" fn helper_op(vm: *mut Vm, _prog: *mut VirtualProgram, registers: *mut LispValue, opcode_val: u32) {
     let opcode = opcode_val.to_le_bytes();
     let vm = &mut *vm;
 
@@ -1019,10 +946,10 @@ unsafe extern "C" fn helper_op(vm: *mut Vm, _prog: *mut VirtualProgram, register
                  let res_reg = opcode[1] as usize;
                  
                  match (v1, v2) {
-                    (Value::Integer(lhs), Value::Integer(rhs)) => *registers.add(res_reg) = Value::Integer(lhs $op rhs),
-                    (Value::Integer(lhs), Value::Float(rhs)) => *registers.add(res_reg) = Value::Float(lhs as f64 $op rhs),
-                    (Value::Float(lhs), Value::Float(rhs)) => *registers.add(res_reg) = Value::Float(lhs $op rhs),
-                    (Value::Float(lhs), Value::Integer(rhs)) => *registers.add(res_reg) = Value::Float(lhs $op rhs as f64),
+                    (LispValue::Integer(lhs), LispValue::Integer(rhs)) => *registers.add(res_reg) = LispValue::Integer(lhs $op rhs),
+                    (LispValue::Integer(lhs), LispValue::Float(rhs)) => *registers.add(res_reg) = LispValue::Float(lhs as f64 $op rhs),
+                    (LispValue::Float(lhs), LispValue::Float(rhs)) => *registers.add(res_reg) = LispValue::Float(lhs $op rhs),
+                    (LispValue::Float(lhs), LispValue::Integer(rhs)) => *registers.add(res_reg) = LispValue::Float(lhs $op rhs as f64),
                     (_v1, _v2) => {
                         // println!("DEBUG: Binary op failed: {:?} {:?} {:?}", opcode[0], v1, v2);
                     } 
@@ -1039,13 +966,13 @@ unsafe extern "C" fn helper_op(vm: *mut Vm, _prog: *mut VirtualProgram, register
                  let res_reg = opcode[1] as usize;
                  
                  let matches = match (v1, v2) {
-                    (Value::Integer(lhs), Value::Integer(rhs)) => lhs $op rhs,
-                    (Value::Integer(lhs), Value::Float(rhs)) => (lhs as f64) $op rhs,
-                    (Value::Float(lhs), Value::Float(rhs)) => lhs $op rhs,
-                    (Value::Float(lhs), Value::Integer(rhs)) => lhs $op rhs as f64,
+                    (LispValue::Integer(lhs), LispValue::Integer(rhs)) => lhs $op rhs,
+                    (LispValue::Integer(lhs), LispValue::Float(rhs)) => (lhs as f64) $op rhs,
+                    (LispValue::Float(lhs), LispValue::Float(rhs)) => lhs $op rhs,
+                    (LispValue::Float(lhs), LispValue::Integer(rhs)) => lhs $op rhs as f64,
                     _ => false,
                  };
-                 *registers.add(res_reg) = Value::Boolean(matches);
+                 *registers.add(res_reg) = LispValue::Boolean(matches);
             }
         }
     }
@@ -1065,8 +992,8 @@ unsafe extern "C" fn helper_op(vm: *mut Vm, _prog: *mut VirtualProgram, register
              let v = resolve_value(vm, registers, opcode[2]);
              let res_reg = opcode[1] as usize;
              match v {
-                 Value::Boolean(b) => *registers.add(res_reg) = Value::Boolean(!b),
-                 _ => *registers.add(res_reg) = Value::Boolean(false),
+                 LispValue::Boolean(b) => *registers.add(res_reg) = LispValue::Boolean(!b),
+                 _ => *registers.add(res_reg) = LispValue::Boolean(false),
              }
         },
         Ok(Instr::CopyReg) => {
@@ -1082,98 +1009,83 @@ unsafe extern "C" fn helper_op(vm: *mut Vm, _prog: *mut VirtualProgram, register
     }
 }
 
-unsafe extern "C" fn helper_check_condition(_vm: *mut Vm, registers: *mut Value, reg_idx: usize) -> i32 {
+unsafe extern "C" fn helper_check_condition(_vm: *mut Vm, registers: *mut LispValue, reg_idx: usize) -> i32 {
     let val = &*registers.add(reg_idx);
     if val.is_true() { 1 } else { 0 }
 }
 
-unsafe fn resolve_value(_vm: &Vm, registers: *mut Value, reg_idx: u8) -> Value {
+unsafe fn resolve_value(_vm: &Vm, registers: *mut LispValue, reg_idx: u8) -> LispValue {
     let val = &*registers.add(reg_idx as usize);
-    if let Value::Ref(r) = val {
+    if let Some(r) = val.as_ref() {
         r.borrow().clone()
     } else {
         val.clone()
     }
 }
 
-unsafe extern "C" fn helper_load_global(vm: *mut Vm, registers: *mut Value, dest_reg: usize, sym_id: i64) {
+unsafe extern "C" fn helper_load_global(vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, sym_id: i64) {
     let vm = &mut *vm;
     
     if (sym_id as usize) < vm.global_vars.len() {
         let v = &mut vm.global_vars[sym_id as usize];
-        match v {
-            Value::FuncRef(f) => {
-                if f.jit_code == 0 {
-                    if let Some(&ptr) = vm.jit.cache.get(&f.address) {
-                        f.jit_code = ptr as u64;
-                    }
-                }
-            },
-            Value::Closure(_c) => {
-                 // Closure holds Rc<ClosureData>
-                 // Cannot update jit_code inside Rc without interior mutability
-            },
-            _ => {}
-        }
         *registers.add(dest_reg) = v.clone();
     } else {
-        *registers.add(dest_reg) = Value::Empty;
+        *registers.add(dest_reg) = LispValue::Empty;
     }
 }
 
-unsafe extern "C" fn helper_define(vm: *mut Vm, registers: *mut Value, src_reg: usize, sym_id: i64) {
+unsafe extern "C" fn helper_define(vm: *mut Vm, registers: *mut LispValue, src_reg: usize, sym_id: i64) {
     let vm = &mut *vm;
     let val = (*registers.add(src_reg)).clone();
     // println!("DEBUG: Define sym {} = {:?}", sym_id, val);
     if sym_id as usize >= vm.global_vars.len() {
-        vm.global_vars.resize(sym_id as usize + 1, Value::Empty);
+        vm.global_vars.resize(sym_id as usize + 1, LispValue::Empty);
     }
     vm.global_vars[sym_id as usize] = val;
 }
 
-unsafe extern "C" fn helper_load_func_ref(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut Value, dest_reg: usize, header_addr: i64) {
+unsafe extern "C" fn helper_load_func_ref(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, header_addr: i64) {
     let vm = &mut *vm;
     let prog = &mut *prog;
     let header = prog.read_function_header(header_addr as u64).unwrap();
     let func_addr = header_addr as usize + std::mem::size_of::<FunctionHeader>();
     
     let jit_code = vm.jit.cache.get(&(func_addr as u64)).map(|&ptr| ptr as u64).unwrap_or(0);
-    *registers.add(dest_reg) = Value::FuncRef(FunctionData{header, address: func_addr as u64, jit_code});
+    *registers.add(dest_reg) = LispValue::Object(Rc::new(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(jit_code)})));
 }
 
-unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut Value, func_reg: usize, param_start: usize, target_reg: usize) {
+unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, func_reg: usize, param_start: usize, target_reg: usize) {
     let vm = &mut *vm;
     let prog = &mut *prog;
     
-    // println!("DEBUG: CallSymbol func_reg={}, param_start={}, target_reg={}", func_reg, param_start, target_reg);
-
     let func = &*registers.add(func_reg);
     
-    let (header, address, captures, jit_code) = if let Value::Ref(r) = func {
+    let (header, address, captures, jit_code_cell) = if let Some(r) = func.as_ref() {
+        // If it's in a RefCell, we can't safely get a reference to the Cell that outlives the borrow.
+        // So we just return None for the cell, meaning we won't update the cache.
         let inner = r.borrow();
-        match &*inner {
-            Value::FuncRef(f) => (f.header, f.address, None, f.jit_code),
-            Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code),
-            _ => {
-                // println!("DEBUG: CallSymbol failed: Not a function at reg {}: {:?}", func_reg, inner);
-                return
-            }
+        if let Some(f) = inner.as_func_ref() {
+            (f.header, f.address, None, None)
+        } else if let Some(c) = inner.as_closure() {
+            (c.function.header, c.function.address, Some(c.captures.clone()), None)
+        } else {
+            // println!("DEBUG: CallSymbol failed: Not a function at reg {}: {:?}", func_reg, inner);
+            return
         }
     } else {
-        match func {
-            Value::FuncRef(f) => (f.header, f.address, None, f.jit_code),
-            Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code),
-            _ => {
-                // println!("DEBUG: CallSymbol failed: Not a function at reg {}: {:?}", func_reg, func);
-                return
-            }
+        if let Some(f) = func.as_func_ref() {
+            (f.header, f.address, None, Some(&f.jit_code))
+        } else if let Some(c) = func.as_closure() {
+            (c.function.header, c.function.address, Some(c.captures.clone()), Some(&c.function.jit_code))
+        } else {
+            // println!("DEBUG: CallSymbol failed: Not a function at reg {}: {:?}", func_reg, func);
+            return
         }
     };
 
     let size = param_start + header.register_count as usize + vm.window_start;
     if size >= vm.registers.len() {
-        // println!("DEBUG: Resizing registers to {}", size);
-        vm.registers.resize(size, Value::Empty);
+        vm.registers.resize(size, LispValue::Empty);
     }
     let old_ws = vm.window_start;
     let ret_addr = 0; 
@@ -1190,12 +1102,20 @@ unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, 
         }
     }
     
+    let jit_code = jit_code_cell.map(|c| c.get()).unwrap_or(0);
     if jit_code != 0 {
-         let func: unsafe extern "C" fn(*mut Vm, *mut VirtualProgram, *mut Value) = std::mem::transmute(jit_code as *const u8);
+         let func: unsafe extern "C" fn(*mut Vm, *mut VirtualProgram, *mut LispValue) = std::mem::transmute(jit_code as *const u8);
          func(vm, prog, vm.registers.as_mut_ptr().add(vm.window_start));
     } else {
          let end_addr = vm.scan_function_end(prog, address);
          vm.run_jit_function(prog, address, end_addr);
+         
+         // Update cache in FunctionData
+         if let Some(cell) = jit_code_cell {
+             if let Some(&code) = vm.jit.cache.get(&address) {
+                 cell.set(code as u64);
+             }
+         }
     }
     
     let state = vm.call_states.pop().unwrap();
@@ -1206,31 +1126,34 @@ unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, 
     vm.window_start = old_ws;
 }
 
-unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut Value, func_reg: usize, param_start: usize) {
-
+unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, func_reg: usize, param_start: usize) {
     let vm = &mut *vm;
     let prog = &mut *prog;
 
     let func = &*registers.add(func_reg);
     
-    let (header, address, captures, jit_code) = if let Value::Ref(r) = func {
+    let (header, address, captures, jit_code_cell) = if let Some(r) = func.as_ref() {
         let inner = r.borrow();
-        match &*inner {
-            Value::FuncRef(f) => (f.header, f.address, None, f.jit_code),
-            Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code),
-            _ => return
+        if let Some(f) = inner.as_func_ref() {
+            (f.header, f.address, None, None)
+        } else if let Some(c) = inner.as_closure() {
+            (c.function.header, c.function.address, Some(c.captures.clone()), None)
+        } else {
+            return
         }
     } else {
-        match func {
-            Value::FuncRef(f) => (f.header, f.address, None, f.jit_code),
-            Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code),
-            _ => return
+        if let Some(f) = func.as_func_ref() {
+            (f.header, f.address, None, Some(&f.jit_code))
+        } else if let Some(c) = func.as_closure() {
+            (c.function.header, c.function.address, Some(c.captures.clone()), Some(&c.function.jit_code))
+        } else {
+            return
         }
     };
 
     let size = vm.window_start + header.register_count as usize;
     if size >= vm.registers.len() {
-        vm.registers.resize(size, Value::Empty);
+        vm.registers.resize(size, LispValue::Empty);
     }
 
     let param_count = header.param_count as usize;
@@ -1266,12 +1189,20 @@ unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut VirtualProg
         }
     }
 
+    let jit_code = jit_code_cell.map(|c| c.get()).unwrap_or(0);
     if jit_code != 0 {
-         let func: unsafe extern "C" fn(*mut Vm, *mut VirtualProgram, *mut Value) = std::mem::transmute(jit_code as *const u8);
+         let func: unsafe extern "C" fn(*mut Vm, *mut VirtualProgram, *mut LispValue) = std::mem::transmute(jit_code as *const u8);
          func(vm, prog, vm.registers.as_mut_ptr().add(vm.window_start));
     } else {
-        let end_addr = vm.scan_function_end(prog, address);
-        vm.run_jit_function(prog, address, end_addr);
+         let end_addr = vm.scan_function_end(prog, address);
+         vm.run_jit_function(prog, address, end_addr);
+         
+         // Update cache in FunctionData
+         if let Some(cell) = jit_code_cell {
+             if let Some(&code) = vm.jit.cache.get(&address) {
+                 cell.set(code as u64);
+             }
+         }
     }
 }
 
@@ -1279,7 +1210,7 @@ use super::vp::ClosureData;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-unsafe extern "C" fn helper_make_closure(_vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut Value, dest_reg: usize, func_reg: usize, count: usize, instr_addr: u64) {
+unsafe extern "C" fn helper_make_closure(_vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, func_reg: usize, count: usize, instr_addr: u64) {
     let prog = &mut *prog;
     
     let old_pos = prog.current_address();
@@ -1297,28 +1228,33 @@ unsafe extern "C" fn helper_make_closure(_vm: *mut Vm, prog: *mut VirtualProgram
     
     let func_val = &*registers.add(func_reg);
     
-    if let Value::FuncRef(fd) = func_val {
+    if let Some(fd) = func_val.as_func_ref() {
         // Avoid cloning FunctionData if possible, but it's small (copy)
         // The main cost is Rc allocation for ClosureData
-        *registers.add(dest_reg) = Value::Closure(Rc::new(ClosureData{function: fd.clone(), captures}));
+        *registers.add(dest_reg) = LispValue::Object(Rc::new(HeapValue::Closure(ClosureData{function: fd.clone(), captures})));
     } else {
-        *registers.add(dest_reg) = Value::Empty;
+        *registers.add(dest_reg) = LispValue::Empty;
     }
 }
 
-unsafe extern "C" fn helper_make_ref(_vm: *mut Vm, registers: *mut Value, dest_reg: usize) {
+unsafe extern "C" fn helper_make_ref(_vm: *mut Vm, registers: *mut LispValue, dest_reg: usize) {
     let val = (*registers.add(dest_reg)).clone();
-    *registers.add(dest_reg) = Value::Ref(Rc::new(RefCell::new(val)));
+    *registers.add(dest_reg) = LispValue::Object(Rc::new(HeapValue::Ref(RefCell::new(val))));
 }
 
-unsafe extern "C" fn helper_set_ref(_vm: *mut Vm, registers: *mut Value, dest_reg: usize, src_reg: usize) {
-    if let Value::Ref(r) = &*registers.add(dest_reg) {
+unsafe extern "C" fn helper_set_ref(_vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, src_reg: usize) {
+    if let Some(r) = (*registers.add(dest_reg)).as_ref() {
         *r.borrow_mut() = (*registers.add(src_reg)).clone();
     }
 }
 
-unsafe extern "C" fn helper_deref(_vm: *mut Vm, registers: *mut Value, dest_reg: usize, src_reg: usize) {
-    if let Value::Ref(r) = &*registers.add(src_reg) {
+unsafe extern "C" fn helper_deref(_vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, src_reg: usize) {
+    if let Some(r) = (*registers.add(src_reg)).as_ref() {
         *registers.add(dest_reg) = r.borrow().clone();
     }
+}
+
+unsafe extern "C" fn helper_get_registers_ptr(vm: *mut Vm) -> *mut LispValue {
+    let vm = &mut *vm;
+    vm.registers.as_mut_ptr().add(vm.window_start)
 }

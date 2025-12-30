@@ -1,4 +1,4 @@
-use std::{cell::{Ref, RefCell}, io::{Cursor, Read}, mem::size_of, rc::{Rc}, ops::Range, collections::HashMap};
+use std::{cell::{Cell, Ref, RefCell}, io::{Cursor, Read}, mem::size_of, rc::{Rc}, ops::Range, collections::HashMap};
 
 use enum_display::EnumDisplay;
 
@@ -133,7 +133,7 @@ impl FunctionHeader {
 pub struct FunctionData {
     pub header: FunctionHeader,
     pub address: u64,
-    pub jit_code: u64 // 0 if None
+    pub jit_code: Cell<u64> // 0 if None
 }
 
 impl PartialEq for FunctionData {
@@ -174,17 +174,22 @@ pub struct ClosureData {
 }
 
 #[derive(PartialEq, Clone, Debug)]
+pub enum HeapValue {
+    String(String),
+    List(ListSlice),
+    FuncRef(FunctionData),
+    Closure(ClosureData),
+    Ref(RefCell<Value>)
+}
+
+#[derive(PartialEq, Clone, Debug)]
 #[repr(C, u8)]
 pub enum Value {
     Empty,
     Boolean(bool),
     Integer(i64),
     Float(f64),
-    String(Rc<String>),
-    List(ListSlice),
-    FuncRef(FunctionData),
-    Closure(Rc<ClosureData>),
-    Ref(Rc<RefCell<Value>>)
+    Object(Rc<HeapValue>)
 }
 
 impl Value {
@@ -193,6 +198,33 @@ impl Value {
             Self::Boolean(b) if !b => false,
             _ => true
         }
+    }
+
+    pub fn as_func_ref(&self) -> Option<&FunctionData> {
+        if let Value::Object(o) = self {
+            if let HeapValue::FuncRef(f) = &**o {
+                return Some(f);
+            }
+        }
+        None
+    }
+
+    pub fn as_closure(&self) -> Option<&ClosureData> {
+        if let Value::Object(o) = self {
+            if let HeapValue::Closure(c) = &**o {
+                return Some(c);
+            }
+        }
+        None
+    }
+    
+    pub fn as_ref(&self) -> Option<&RefCell<Value>> {
+        if let Value::Object(o) = self {
+            if let HeapValue::Ref(r) = &**o {
+                return Some(r);
+            }
+        }
+        None
     }
 }
 

@@ -1,10 +1,10 @@
 use std::rc::Rc;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 
 use crate::parser::{SExpression, Atom};
 
-use super::vp::{ClosureData, FunctionData, FunctionHeader, Instr, JumpCondition, Value, VirtualProgram};
+use super::vp::{ClosureData, FunctionData, FunctionHeader, Instr, JumpCondition, Value, HeapValue, VirtualProgram};
 use super::jit::Jit;
 
 macro_rules! binary_op {
@@ -131,11 +131,12 @@ impl Vm {
     }
 
     fn resolve_value(&self, val: &Value) -> Value {
-        if let Value::Ref(r) = val {
-            r.borrow().clone()
-        } else {
-            val.clone()
+        if let Value::Object(o) = val {
+            if let HeapValue::Ref(r) = &**o {
+                return r.borrow().clone();
+            }
         }
+        val.clone()
     }
 
     pub(super) fn scan_function_end(&self, prog: &mut VirtualProgram, start_addr: u64) -> u64 {
@@ -234,7 +235,7 @@ impl Vm {
                     let Some(val) = prog.read_string() else {
                         return None;
                     };
-                    self.registers[opcode[1] as usize + self.window_start] = Value::String(Rc::new(val));
+                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(Rc::new(HeapValue::String(val)));
                 },
                 Ok(Instr::CopyReg) => {
                     self.registers[opcode[1] as usize + self.window_start] = self.registers[opcode[2] as usize + self.window_start].clone();
@@ -331,25 +332,18 @@ impl Vm {
                     };
                     let func_addr = header_addr as usize + std::mem::size_of::<FunctionHeader>();
                     // eprintln!("LoadFuncRef: header_addr={}, func_addr={}", header_addr, func_addr);
-                    self.registers[opcode[1] as usize + self.window_start] = Value::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: 0});
+                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(Rc::new(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(0)})));
                 },
                 Ok(Instr::CallSymbol) => {
                     let func_reg = opcode[1] as usize + self.window_start;
-                    let func = self.registers[func_reg].clone();
-                    
-                    // Handle Ref dereferencing
-                    let resolved_func = if let Value::Ref(r) = &func {
-                        r.borrow().clone()
-                    } else {
-                        func
-                    };
+                    let resolved_func = self.resolve_value(&self.registers[func_reg]);
 
-                    let (header, address, captures) = match resolved_func {
-                        Value::FuncRef(f) => (f.header, f.address, None),
-                        Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone())),
-                        _ => {
-                            break;
-                        }
+                    let (header, address, captures) = if let Some(f) = resolved_func.as_func_ref() {
+                        (f.header, f.address, None)
+                    } else if let Some(c) = resolved_func.as_closure() {
+                        (c.function.header, c.function.address, Some(c.captures.clone()))
+                    } else {
+                        break;
                     };
 
                     let param_start = opcode[2];
@@ -387,18 +381,14 @@ impl Vm {
                 },
                 Ok(Instr::TailCallSymbol) => {
                     // For tail-calls, clone the function value instead of swapping it out.
-                    let func_val = self.registers[opcode[1] as usize + self.window_start].clone();
-                    
-                    let resolved_func = if let Value::Ref(r) = &func_val {
-                        r.borrow().clone()
-                    } else {
-                        func_val
-                    };
+                    let resolved_func = self.resolve_value(&self.registers[opcode[1] as usize + self.window_start]);
 
-                    let (header, address, captures) = match resolved_func {
-                        Value::FuncRef(f) => (f.header, f.address, None),
-                        Value::Closure(c) => (c.function.header, c.function.address, Some(c.captures.clone())),
-                        _ => break
+                    let (header, address, captures) = if let Some(f) = resolved_func.as_func_ref() {
+                        (f.header, f.address, None)
+                    } else if let Some(c) = resolved_func.as_closure() {
+                        (c.function.header, c.function.address, Some(c.captures.clone()))
+                    } else {
+                        break;
                     };
 
                     // eprintln!("TailCallSymbol: jumping to {}, param_count={}", address, header.param_count);
@@ -478,8 +468,8 @@ impl Vm {
                     
                     let func_val = &self.registers[func_reg];
 
-                    if let Value::FuncRef(fd) = func_val {
-                        self.registers[dest_reg] = Value::Closure(Rc::new(ClosureData{function: fd.clone(), captures}));
+                    if let Some(fd) = func_val.as_func_ref() {
+                        self.registers[dest_reg] = Value::Object(Rc::new(HeapValue::Closure(ClosureData{function: fd.clone(), captures})));
                     } else {
                         self.registers[dest_reg] = Value::Empty; 
                     }
@@ -487,19 +477,19 @@ impl Vm {
                 Ok(Instr::MakeRef) => {
                     let reg = opcode[1] as usize + self.window_start;
                     let val = self.registers[reg].clone();
-                    self.registers[reg] = Value::Ref(Rc::new(RefCell::new(val)));
+                    self.registers[reg] = Value::Object(Rc::new(HeapValue::Ref(RefCell::new(val))));
                 },
                 Ok(Instr::SetRef) => {
                     let dest_reg = opcode[1] as usize + self.window_start;
                     let src_reg = opcode[2] as usize + self.window_start;
-                    if let Value::Ref(r) = &self.registers[dest_reg] {
+                    if let Some(r) = self.registers[dest_reg].as_ref() {
                         *r.borrow_mut() = self.registers[src_reg].clone();
                     }
                 },
                 Ok(Instr::Deref) => {
                     let dest_reg = opcode[1] as usize + self.window_start;
                     let src_reg = opcode[2] as usize + self.window_start;
-                    let val = if let Value::Ref(r) = &self.registers[src_reg] {
+                    let val = if let Some(r) = self.registers[src_reg].as_ref() {
                         Some(r.borrow().clone())
                     } else {
                         None
@@ -546,18 +536,20 @@ fn value_to_sexpr(value: &Value) -> Option<SExpression> {
         Value::Boolean(b) => Some(SExpression::Atom(Atom::Boolean(*b))),
         Value::Integer(i) => Some(SExpression::Atom(Atom::Integer(*i))),
         Value::Float(f) => Some(SExpression::Atom(Atom::Float(*f))),
-        Value::String(s) => Some(SExpression::Atom(Atom::String(s.as_ref().clone()))),
-        Value::List(l) => {
-            let mut expressions = Vec::with_capacity(l.len());
-            let data_ref = l.values();
-            for value in &data_ref[l.offset() .. l.offset() + l.len()] {
-                let sexpr = value_to_sexpr(value);
-                expressions.push(sexpr.unwrap_or(SExpression::Atom(Atom::Integer(0))));
-            }
-            Some(SExpression::List(expressions))
+        Value::Object(o) => match &**o {
+            HeapValue::String(s) => Some(SExpression::Atom(Atom::String(s.clone()))),
+            HeapValue::List(l) => {
+                let mut expressions = Vec::with_capacity(l.len());
+                let data_ref = l.values();
+                for value in &data_ref[l.offset() .. l.offset() + l.len()] {
+                    let sexpr = value_to_sexpr(value);
+                    expressions.push(sexpr.unwrap_or(SExpression::Atom(Atom::Integer(0))));
+                }
+                Some(SExpression::List(expressions))
+            },
+            HeapValue::FuncRef(_) => None,
+            HeapValue::Closure(_) => None,
+            HeapValue::Ref(r) => value_to_sexpr(&r.borrow())
         }
-        Value::FuncRef(_) => None,
-        Value::Closure(_) => None,
-        Value::Ref(r) => value_to_sexpr(&r.borrow())
     }
 }

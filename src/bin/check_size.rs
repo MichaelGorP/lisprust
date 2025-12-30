@@ -1,7 +1,6 @@
 use std::mem::size_of;
 use std::rc::Rc;
 use std::cell::RefCell;
-use std::sync::atomic::AtomicU64;
 
 #[derive(PartialEq, Clone, Debug)]
 #[repr(C)]
@@ -39,38 +38,29 @@ pub struct ClosureData {
 }
 
 #[derive(PartialEq, Clone, Debug)]
+pub enum HeapValue {
+    String(String),
+    List(ListSlice),
+    FuncRef(FunctionData),
+    Closure(ClosureData),
+    Ref(RefCell<Value>)
+}
+
+#[derive(PartialEq, Clone, Debug)]
 #[repr(C, u8)]
 pub enum Value {
     Empty,
     Boolean(bool),
     Integer(i64),
     Float(f64),
-    String(Rc<String>),
-    List(ListSlice),
-    FuncRef(FunctionData),
-    Closure(ClosureData),
-    Ref(Rc<RefCell<Value>>)
+    Object(Rc<HeapValue>)
 }
 
 fn main() {
     println!("Size of Value: {}", size_of::<Value>());
+    println!("Size of HeapValue: {}", size_of::<HeapValue>());
     println!("Size of ListSlice: {}", size_of::<ListSlice>());
     println!("Size of FunctionData: {}", size_of::<FunctionData>());
-    println!("Offset of Integer: {}", 0); // It's a union, so data starts at offset 1 (tag is u8) + padding
     
-    // Let's check alignment
     println!("Align of Value: {}", std::mem::align_of::<Value>());
-
-    // Check offsets
-    let val = Value::FuncRef(FunctionData {
-        header: FunctionHeader { param_count: 0, register_count: 0, result_reg: 0 },
-        address: 0,
-        jit_code: 0xDEADBEEF
-    });
-    
-    let base_ptr = &val as *const Value as usize;
-    if let Value::FuncRef(fd) = &val {
-        let jit_ptr = &fd.jit_code as *const u64 as usize;
-        println!("Offset of jit_code in Value: {}", jit_ptr - base_ptr);
-    }
 }
