@@ -85,6 +85,15 @@ pub fn compile_comparison(compiler: &mut Compiler, instr: &Instruction, args: &[
 
     if reg_args.len() < 2 {
             compiler.bytecode.load_atom(&Atom::Boolean(true), dest_reg);
+    } else if reg_args.len() == 2 {
+        match instr {
+            Instruction::Eq => compiler.bytecode.store_opcode(Instr::Eq, dest_reg, reg_args[0], reg_args[1]),
+            Instruction::Lt => compiler.bytecode.store_opcode(Instr::Lt, dest_reg, reg_args[0], reg_args[1]),
+            Instruction::Gt => compiler.bytecode.store_opcode(Instr::Gt, dest_reg, reg_args[0], reg_args[1]),
+            Instruction::Leq => compiler.bytecode.store_opcode(Instr::Leq, dest_reg, reg_args[0], reg_args[1]),
+            Instruction::Geq => compiler.bytecode.store_opcode(Instr::Geq, dest_reg, reg_args[0], reg_args[1]),
+            _ => unreachable!()
+        }
     } else {
         compiler.bytecode.load_atom(&Atom::Boolean(true), dest_reg);
         
