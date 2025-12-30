@@ -1,5 +1,6 @@
 use std::rc::Rc;
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 use crate::parser::{SExpression, Atom};
 
@@ -18,7 +19,10 @@ macro_rules! binary_op {
                 (Value::Integer(lhs), Value::Float(rhs)) => $self.registers[res_reg] = Value::Float(lhs as f64 $op rhs),
                 (Value::Float(lhs), Value::Float(rhs)) => $self.registers[res_reg] = Value::Float(lhs $op rhs),
                 (Value::Float(lhs), Value::Integer(rhs)) => $self.registers[res_reg] = Value::Float(lhs $op rhs as f64),
-                _ => break,
+                (v1, v2) => {
+                    eprintln!("Binary op failed: {:?} {:?}", v1, v2);
+                    break;
+                }
             }
         }
     };
@@ -136,35 +140,61 @@ impl Vm {
 
     pub(super) fn scan_function_end(&self, prog: &mut VirtualProgram, start_addr: u64) -> u64 {
         let old_pos = prog.current_address();
-        prog.jump_to(start_addr);
-        let mut end_pos = start_addr;
         
-        loop {
-            let Some(opcode) = prog.read_opcode() else { break; };
-            let instr: Result<Instr, _> = opcode[0].try_into();
+        let mut visited = HashSet::new();
+        let mut queue = vec![start_addr];
+        let mut max_addr = start_addr;
+        
+        while let Some(addr) = queue.pop() {
+            if visited.contains(&addr) { continue; }
+            visited.insert(addr);
             
-            match instr {
-                Ok(Instr::Jump) => {
-                     let _ = prog.read_int();
-                },
-                Ok(Instr::LoadInt) | Ok(Instr::LoadFloat) => { let _ = prog.read_int(); },
-                Ok(Instr::LoadString) => { let _ = prog.read_string(); },
-                Ok(Instr::Define) | Ok(Instr::LoadGlobal) | Ok(Instr::LoadFuncRef) => { let _ = prog.read_int(); },
-                Ok(Instr::MakeClosure) => {
-                    let count = prog.read_byte().unwrap();
-                    for _ in 0..count {
-                        prog.read_byte().unwrap();
-                    }
-                },
-                Ok(Instr::Ret) => {
-                    end_pos = prog.current_address();
-                    break;
-                },
-                _ => {}
+            prog.jump_to(addr);
+            
+            loop {
+                let Some(opcode) = prog.read_opcode() else { break; };
+                let instr: Result<Instr, _> = opcode[0].try_into();
+                // eprintln!("Exec: {:?} {:?}", instr, opcode);
+                
+                match instr {
+                    Ok(Instr::Jump) => {
+                        let cond = opcode[2];
+                        let dist = prog.read_int().unwrap_or(0);
+                        let after_read = prog.current_address();
+                        let target = (after_read as i64 + dist) as u64;
+                        
+                        if !visited.contains(&target) {
+                            queue.push(target);
+                        }
+                        
+                        if cond != JumpCondition::Jump as u8 {
+                            // Fallthrough
+                        } else {
+                            if after_read > max_addr { max_addr = after_read; }
+                            break; // Unconditional jump ends block
+                        }
+                    },
+                    Ok(Instr::Ret) | Ok(Instr::TailCallSymbol) => {
+                        if prog.current_address() > max_addr { max_addr = prog.current_address(); }
+                        break;
+                    },
+                    Ok(Instr::LoadInt) | Ok(Instr::LoadFloat) | Ok(Instr::Define) | Ok(Instr::LoadGlobal) | Ok(Instr::LoadFuncRef) => { let _ = prog.read_int(); },
+                    Ok(Instr::LoadString) => { let _ = prog.read_string(); },
+                    Ok(Instr::MakeClosure) => {
+                        let count = opcode[3];
+                        for _ in 0..count {
+                            let _ = prog.read_byte();
+                        }
+                    },
+                    _ => {}
+                }
+                
+                if prog.current_address() > max_addr { max_addr = prog.current_address(); }
             }
         }
+        
         prog.jump_to(old_pos);
-        end_pos
+        max_addr
     }
 
     pub fn run(&mut self, prog: &mut VirtualProgram) -> Option<SExpression> {
@@ -180,6 +210,10 @@ impl Vm {
             let Some(opcode) = prog.read_opcode() else {
                 break;
             };
+            // let pc = prog.current_address() - 4;
+            // let instr: Result<Instr, _> = opcode[0].try_into();
+            // eprintln!("PC: {}, Instr: {:?}", pc, instr);
+
             match opcode[0].try_into() {
                 Ok(Instr::LoadInt) => {
                     let Some(val) = prog.read_int() else {
@@ -296,10 +330,12 @@ impl Vm {
                         break;
                     };
                     let func_addr = header_addr as usize + std::mem::size_of::<FunctionHeader>();
+                    // eprintln!("LoadFuncRef: header_addr={}, func_addr={}", header_addr, func_addr);
                     self.registers[opcode[1] as usize + self.window_start] = Value::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: 0});
                 },
                 Ok(Instr::CallSymbol) => {
-                    let func = self.registers[opcode[1] as usize + self.window_start].clone();
+                    let func_reg = opcode[1] as usize + self.window_start;
+                    let func = self.registers[func_reg].clone();
                     
                     // Handle Ref dereferencing
                     let resolved_func = if let Value::Ref(r) = &func {
@@ -365,6 +401,8 @@ impl Vm {
                         _ => break
                     };
 
+                    // eprintln!("TailCallSymbol: jumping to {}, param_count={}", address, header.param_count);
+
                     let size = self.window_start + header.register_count as usize;
                     if size >= self.registers.len() {
                         self.registers.resize(size, empty_value());
@@ -397,6 +435,7 @@ impl Vm {
 
                     if self.jit_enabled {
                         let end_addr = self.scan_function_end(prog, address);
+                        // println!("Scanned end for {}: {}", address, end_addr);
                         self.run_jit_function(prog as *mut VirtualProgram, address, end_addr);
                         
                         // Simulate Ret

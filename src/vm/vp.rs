@@ -127,12 +127,19 @@ impl FunctionHeader {
     }
 }
 
-#[derive(PartialEq, Clone, Debug)]
+
+#[derive(Debug, Clone)]
 #[repr(C)]
 pub struct FunctionData {
     pub header: FunctionHeader,
     pub address: u64,
     pub jit_code: u64 // 0 if None
+}
+
+impl PartialEq for FunctionData {
+    fn eq(&self, other: &Self) -> bool {
+        self.header == other.header && self.address == other.address
+    }
 }
 
 #[derive(PartialEq, Clone, Debug)]

@@ -72,156 +72,101 @@ impl Jit {
         // Save cursor to restore later (though we only compile once usually)
         let original_pos = prog.current_address();
 
-        // --- PASS 1: Scan for Basic Blocks ---
+        // --- PASS 1: Traversal to find Basic Blocks ---
         let mut block_starts = HashSet::new();
         block_starts.insert(start_addr);
         
-        prog.jump_to(start_addr);
-        while prog.current_address() < end_addr {
-            let _current_addr = prog.current_address();
-            let opcode = prog.read_opcode().ok_or("Unexpected EOF reading opcode")?;
-            let instr: Instr = opcode[0].try_into().map_err(|_| "Invalid opcode")?;
-            
-            match instr {
-                Instr::Jump => {
-                    let distance = prog.read_int().ok_or("Unexpected EOF reading jump distance")?;
-                    // Target is relative to position AFTER reading int
-                    let after_read_pos = prog.current_address();
-                    let target = (after_read_pos as i64 + distance) as u64;
-                    
-                    block_starts.insert(target);
-                    block_starts.insert(after_read_pos); // Fallthrough
-                },
-                Instr::Ret => {
-                    // Ret terminates a block, next instruction (if any) starts a new one
-                    block_starts.insert(prog.current_address());
-                },
-                // Instructions with arguments - must advance cursor
-                Instr::LoadInt | Instr::LoadFloat | Instr::Define | Instr::LoadGlobal | Instr::LoadFuncRef => {
-                    prog.read_int();
-                },
-                Instr::LoadString => {
-                    prog.read_string();
-                },
-                Instr::MakeClosure => {
-                    let count = opcode[3];
-                    for _ in 0..count {
-                        prog.read_byte().unwrap();
-                    }
-                },
-                // Others have no arguments (handled by read_opcode)
-                _ => {}
+        let mut queue = Vec::new();
+        queue.push(start_addr);
+        
+        let mut visited_starts = HashSet::new();
+
+        while let Some(current_start) = queue.pop() {
+            if visited_starts.contains(&current_start) {
+                continue;
             }
-        }
-
-        // --- PASS 1.5: Reachability Analysis ---
-        let mut sorted_starts: Vec<u64> = block_starts.iter().cloned().collect();
-        sorted_starts.sort();
-        
-        // println!("DEBUG: Block starts: {:?}", sorted_starts);
-
-        let mut successors: HashMap<u64, Vec<u64>> = HashMap::new();
-        
-        for i in 0..sorted_starts.len() {
-            let start = sorted_starts[i];
-            if start >= end_addr { continue; }
+            visited_starts.insert(current_start);
             
-            let next_start = if i + 1 < sorted_starts.len() {
-                sorted_starts[i+1]
-            } else {
-                end_addr
-            };
+            prog.jump_to(current_start);
             
-            // println!("DEBUG: Scanning block {} to {}", start, next_start);
-
-            prog.jump_to(start);
-            while prog.current_address() < next_start {
-                let opcode = prog.read_opcode().unwrap();
-                let instr: Instr = opcode[0].try_into().unwrap();
+            loop {
+                if prog.current_address() >= end_addr {
+                    break;
+                }
                 
-                // Advance cursor
-                 match instr {
+                // Check if we ran into another block start (that is not the current one)
+                if prog.current_address() != current_start && block_starts.contains(&prog.current_address()) {
+                    break;
+                }
+
+                let opcode = match prog.read_opcode() {
+                    Some(op) => op,
+                    None => break
+                };
+                let instr: Instr = match opcode[0].try_into() {
+                    Ok(i) => i,
+                    Err(_) => break // Stop scanning if invalid opcode (likely data)
+                };
+                
+                match instr {
                     Instr::Jump => {
                         let cond_byte = opcode[2];
-                        let distance = prog.read_int().unwrap();
+                        let distance = match prog.read_int() {
+                            Some(d) => d,
+                            None => break
+                        };
                         let after_read_pos = prog.current_address();
                         let target = (after_read_pos as i64 + distance) as u64;
                         
-                        if prog.current_address() == next_start {
-                            // Last instruction of the block
-                            let mut succs = Vec::new();
-                            succs.push(target);
-                            if cond_byte != JumpCondition::Jump as u8 {
-                                succs.push(after_read_pos); // Fallthrough
+                        if !block_starts.contains(&target) {
+                            block_starts.insert(target);
+                            queue.push(target);
+                        }
+                        
+                        if cond_byte != JumpCondition::Jump as u8 {
+                            // Conditional jump, fallthrough is a block start
+                            if !block_starts.contains(&after_read_pos) {
+                                block_starts.insert(after_read_pos);
+                                queue.push(after_read_pos);
                             }
-                            successors.insert(start, succs);
-                            // println!("DEBUG: Jump at {} to {}", start, target);
                         }
+                        break; // End of block
                     },
-                    Instr::Ret => {
-                        if prog.current_address() == next_start {
-                            successors.insert(start, Vec::new());
-                        }
+                    Instr::Ret | Instr::TailCallSymbol => {
+                        break; // End of block
                     },
-                    Instr::TailCallSymbol => {
-                         // TailCallSymbol terminates the block (returns)
-                         // Arguments are in opcode
-                         if prog.current_address() == next_start {
-                             successors.insert(start, Vec::new());
-                         }
-                    },
+                    // Instructions with arguments
                     Instr::LoadInt | Instr::LoadFloat | Instr::Define | Instr::LoadGlobal | Instr::LoadFuncRef => {
-                        prog.read_int();
+                        let _ = prog.read_int();
                     },
                     Instr::LoadString => {
-                        prog.read_string();
+                        let _ = prog.read_string();
                     },
                     Instr::MakeClosure => {
                         let count = opcode[3];
                         for _ in 0..count {
-                            prog.read_byte().unwrap();
+                            let _ = prog.read_byte();
                         }
                     },
                     _ => {}
-                 }
-                 
-                 if prog.current_address() == next_start {
-                     // If not handled above (fallthrough)
-                     if !successors.contains_key(&start) {
-                         successors.insert(start, vec![next_start]);
-                     }
-                 }
-            }
-        }
-        
-        let mut reachable = HashSet::new();
-        let mut queue = Vec::new();
-        queue.push(start_addr);
-        reachable.insert(start_addr);
-        
-        while let Some(addr) = queue.pop() {
-            if let Some(succs) = successors.get(&addr) {
-                for &succ in succs {
-                    if succ <= end_addr && !reachable.contains(&succ) {
-                        reachable.insert(succ);
-                        queue.push(succ);
-                    }
                 }
             }
         }
+
+        // Sort block starts
+        let mut sorted_starts: Vec<u64> = block_starts.iter().cloned().collect();
+        sorted_starts.sort();
         
-        // println!("DEBUG: Reachable blocks: {:?}", reachable);
+        // Filter out blocks that are outside the range
+        sorted_starts.retain(|&x| x < end_addr);
 
         let mut blocks = HashMap::new();
         let loop_header = builder.create_block();
         blocks.insert(start_addr, loop_header);
         
-        for &start in &block_starts {
-            // Only create blocks for addresses within our function range AND reachable
-            if start != start_addr && start >= start_addr && start <= end_addr {
-                if reachable.contains(&start) {
-                    blocks.insert(start, builder.create_block());
-                }
+        for &start in &sorted_starts {
+            if start != start_addr {
+                 blocks.insert(start, builder.create_block());
             }
         }
         
@@ -296,6 +241,7 @@ impl Jit {
         let mut sig_helper_tail_call_symbol = self.module.make_signature();
         sig_helper_tail_call_symbol.params.push(AbiParam::new(ptr_type)); // vm
         sig_helper_tail_call_symbol.params.push(AbiParam::new(ptr_type)); // prog
+        sig_helper_tail_call_symbol.params.push(AbiParam::new(ptr_type)); // registers
         sig_helper_tail_call_symbol.params.push(AbiParam::new(types::I64)); // func_reg
         sig_helper_tail_call_symbol.params.push(AbiParam::new(types::I64)); // param_start
         let callee_helper_tail_call_symbol = self.module.declare_function("helper_tail_call_symbol", Linkage::Import, &sig_helper_tail_call_symbol).map_err(|e| e.to_string())?;
@@ -477,10 +423,57 @@ impl Jit {
                     let dest_reg = opcode[1] as i64;
                     let sym_id = prog.read_int().unwrap();
                     
+                    let val_size = 32;
+                    let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
+                    
+                    let globals_vec_offset = 32;
+                    let globals_ptr = builder.ins().load(types::I64, MemFlags::trusted(), vm_ptr, globals_vec_offset);
+                    
+                    let sym_offset = sym_id * val_size;
+                    let global_val_ptr = builder.ins().iadd_imm(globals_ptr, sym_offset);
+                    
+                    let tag = builder.ins().load(types::I8, MemFlags::trusted(), global_val_ptr, 0);
+                    
+                    let block_check_jit = builder.create_block();
+                    let block_copy = builder.create_block();
+                    let block_call_helper = builder.create_block();
+                    let block_done = builder.create_block();
+                    
+                    // Check if FuncRef (6)
+                    let is_func = builder.ins().icmp_imm(IntCC::Equal, tag, 6);
+                    builder.ins().brif(is_func, block_check_jit, &[], block_copy, &[]);
+                    
+                    builder.switch_to_block(block_check_jit);
+                    // Check jit_code at offset 24
+                    let jit_code = builder.ins().load(types::I64, MemFlags::trusted(), global_val_ptr, 24);
+                    let is_zero = builder.ins().icmp_imm(IntCC::Equal, jit_code, 0);
+                    builder.ins().brif(is_zero, block_call_helper, &[], block_copy, &[]);
+                    
+                    builder.switch_to_block(block_call_helper);
                     let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
                     let sym_id_const = builder.ins().iconst(types::I64, sym_id);
-                    
                     builder.ins().call(local_helper_load_global, &[vm_ptr, registers_ptr, dest_reg_const, sym_id_const]);
+                    builder.ins().jump(block_done, &[]);
+                    
+                    builder.switch_to_block(block_copy);
+                    // Copy 32 bytes
+                    let v0 = builder.ins().load(types::I64, MemFlags::trusted(), global_val_ptr, 0);
+                    let v1 = builder.ins().load(types::I64, MemFlags::trusted(), global_val_ptr, 8);
+                    let v2 = builder.ins().load(types::I64, MemFlags::trusted(), global_val_ptr, 16);
+                    let v3 = builder.ins().load(types::I64, MemFlags::trusted(), global_val_ptr, 24);
+                    
+                    builder.ins().store(MemFlags::trusted(), v0, dest_ptr, 0);
+                    builder.ins().store(MemFlags::trusted(), v1, dest_ptr, 8);
+                    builder.ins().store(MemFlags::trusted(), v2, dest_ptr, 16);
+                    builder.ins().store(MemFlags::trusted(), v3, dest_ptr, 24);
+                    builder.ins().jump(block_done, &[]);
+                    
+                    // builder.seal_block(block_check_jit);
+                    // builder.seal_block(block_call_helper);
+                    // builder.seal_block(block_copy);
+                    
+                    builder.switch_to_block(block_done);
+                    // builder.seal_block(block_done); // Removed this line
                     is_terminated = false;
                 },
                 Instr::Define => {
@@ -538,9 +531,9 @@ impl Jit {
                     builder.ins().brif(is_func_ref, block_check_addr, &[], block_fallback, &[]);
                     
                     builder.switch_to_block(block_check_addr);
-                    // Load address from offset 16 (8 + 8)
-                    // Value(8) -> FunctionData(0) -> address(8)
-                    // So offset is 8 + 8 = 16
+                    // FunctionData is inline at offset 8.
+                    // address is at FunctionData offset 8.
+                    // So address is at Value offset 8 + 8 = 16.
                     let func_addr = builder.ins().load(types::I64, MemFlags::trusted(), func_ptr, 16);
                     let is_self = builder.ins().icmp_imm(IntCC::Equal, func_addr, start_addr as i64);
                     builder.ins().brif(is_self, block_loop, &[], block_fallback, &[]);
@@ -579,7 +572,7 @@ impl Jit {
                     builder.ins().jump(loop_header, &[]);
 
                     builder.switch_to_block(block_fallback);
-                    builder.ins().call(local_helper_tail_call_symbol, &[vm_ptr, prog_ptr, func_reg_const, param_start_const]);
+                    builder.ins().call(local_helper_tail_call_symbol, &[vm_ptr, prog_ptr, registers_ptr, func_reg_const, param_start_const]);
                     builder.ins().return_(&[]);
                     is_terminated = true;
                 },
@@ -938,30 +931,19 @@ impl Jit {
 
         // Handle implicit return at end of function if a block exists there
         if let Some(&end_block) = blocks.get(&end_addr) {
-            // Only switch if the block was actually created and might be used
-            // If we are currently in a terminated state, we don't need to jump to it from here
-            // But we need to ensure the block itself is terminated if it's reachable
-            
-            // Check if the block is currently empty (meaning we didn't generate code for it)
-            // We can't easily check if it's empty, but we know we didn't visit it in the loop
-            // because the loop condition is `current_address < end_addr`.
-            
-            // If the previous block fell through to here, we need to connect them?
-            // The loop handles fallthrough:
-            // if !is_terminated { builder.ins().jump(block, &[]); }
-            // But that's inside the loop.
-            
-            // If the last instruction of the function was NOT a terminator, we need to jump to end_block?
-            // But wait, if the last instruction was not a terminator, `is_terminated` is false.
-            // And we are at `end_addr`.
-            // So we should fall through to `end_block`.
-            
-            if !is_terminated {
-                builder.ins().jump(end_block, &[]);
+            let current_block = builder.current_block();
+            if current_block == Some(end_block) {
+                 if !is_terminated {
+                     builder.ins().return_(&[]);
+                 }
+            } else {
+                if !is_terminated {
+                    builder.ins().jump(end_block, &[]);
+                }
+                
+                builder.switch_to_block(end_block);
+                builder.ins().return_(&[]);
             }
-            
-            builder.switch_to_block(end_block);
-            builder.ins().return_(&[]);
         } else if !is_terminated {
              // If we reached the end without a terminator and no end block (unlikely if we scanned correctly),
              // we should return.
@@ -1041,8 +1023,8 @@ unsafe extern "C" fn helper_op(vm: *mut Vm, _prog: *mut VirtualProgram, register
                     (Value::Integer(lhs), Value::Float(rhs)) => *registers.add(res_reg) = Value::Float(lhs as f64 $op rhs),
                     (Value::Float(lhs), Value::Float(rhs)) => *registers.add(res_reg) = Value::Float(lhs $op rhs),
                     (Value::Float(lhs), Value::Integer(rhs)) => *registers.add(res_reg) = Value::Float(lhs $op rhs as f64),
-                    (v1, v2) => {
-                        println!("DEBUG: Binary op failed: {:?} {:?} {:?}", opcode[0], v1, v2);
+                    (_v1, _v2) => {
+                        // println!("DEBUG: Binary op failed: {:?} {:?} {:?}", opcode[0], v1, v2);
                     } 
                  }
             }
@@ -1127,22 +1109,9 @@ unsafe extern "C" fn helper_load_global(vm: *mut Vm, registers: *mut Value, dest
                     }
                 }
             },
-            Value::Closure(c) => {
-                 if let Some(c_data) = std::rc::Rc::get_mut(c) {
-                     if c_data.function.jit_code == 0 {
-                         if let Some(&ptr) = vm.jit.cache.get(&c_data.function.address) {
-                             c_data.function.jit_code = ptr as u64;
-                         }
-                     }
-                 } else {
-                     let mut c_data = (**c).clone();
-                     if c_data.function.jit_code == 0 {
-                         if let Some(&ptr) = vm.jit.cache.get(&c_data.function.address) {
-                             c_data.function.jit_code = ptr as u64;
-                         }
-                     }
-                     *c = std::rc::Rc::new(c_data);
-                 }
+            Value::Closure(_c) => {
+                 // Closure holds Rc<ClosureData>
+                 // Cannot update jit_code inside Rc without interior mutability
             },
             _ => {}
         }
@@ -1172,13 +1141,13 @@ unsafe extern "C" fn helper_load_func_ref(vm: *mut Vm, prog: *mut VirtualProgram
     *registers.add(dest_reg) = Value::FuncRef(FunctionData{header, address: func_addr as u64, jit_code});
 }
 
-unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, _registers: *mut Value, func_reg: usize, param_start: usize, target_reg: usize) {
+unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut Value, func_reg: usize, param_start: usize, target_reg: usize) {
     let vm = &mut *vm;
     let prog = &mut *prog;
     
     // println!("DEBUG: CallSymbol func_reg={}, param_start={}, target_reg={}", func_reg, param_start, target_reg);
 
-    let func = &vm.registers[func_reg + vm.window_start];
+    let func = &*registers.add(func_reg);
     
     let (header, address, captures, jit_code) = if let Value::Ref(r) = func {
         let inner = r.borrow();
@@ -1237,12 +1206,12 @@ unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, 
     vm.window_start = old_ws;
 }
 
-unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, func_reg: usize, param_start: usize) {
+unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut Value, func_reg: usize, param_start: usize) {
 
     let vm = &mut *vm;
     let prog = &mut *prog;
 
-    let func = &vm.registers[func_reg + vm.window_start];
+    let func = &*registers.add(func_reg);
     
     let (header, address, captures, jit_code) = if let Value::Ref(r) = func {
         let inner = r.borrow();

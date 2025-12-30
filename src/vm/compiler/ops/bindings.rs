@@ -48,7 +48,8 @@ pub fn compile_let(compiler: &mut Compiler, args: &[SExpression], is_tail: bool)
             for (i, binding) in bindings_list.iter().enumerate() {
                 if let SExpression::List(ref pair) = binding {
                     if let SExpression::Symbol(ref sym) = &pair[0] {
-                        let var_reg = compiler.scopes.find_or_alloc(sym)?;
+                        let var_reg = compiler.scopes.allocate_reg()?;
+                        compiler.scopes.symbols.insert(sym.clone(), var_reg);
                         compiler.bytecode.store_opcode(Instr::CopyReg, var_reg, init_regs[i], 0);
                     }
                     else {
@@ -64,7 +65,9 @@ pub fn compile_let(compiler: &mut Compiler, args: &[SExpression], is_tail: bool)
                 last_reg = compiler.compile_expr(expr, &[], is_tail && index == body.len() - 1)?;
                 compiler.pop_map();
             }
+            let inner_max = compiler.scopes.max_used_registers;
             compiler.scopes.end_scope();
+            compiler.scopes.max_used_registers = std::cmp::max(compiler.scopes.max_used_registers, inner_max);
             Ok(last_reg)
         }
         else {
@@ -107,7 +110,8 @@ pub fn compile_let_star(compiler: &mut Compiler, args: &[SExpression], is_tail: 
                     compiler.pop_map();
 
                     if let SExpression::Symbol(ref sym) = &pair[0] {
-                        let var_reg = compiler.scopes.find_or_alloc(sym)?;
+                        let var_reg = compiler.scopes.allocate_reg()?;
+                        compiler.scopes.symbols.insert(sym.clone(), var_reg);
                         compiler.bytecode.store_opcode(Instr::CopyReg, var_reg, init_reg, 0);
                     }
                     else {
@@ -151,6 +155,12 @@ pub fn compile_letrec(compiler: &mut Compiler, args: &[SExpression], is_tail: bo
             let bindings_map_list = if let SourceMap::List(_, l) = bindings_map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
 
             compiler.scopes.begin_scope();
+            // preserve outer register allocation so nested lexical scopes don't reuse registers
+            if let Some(prev) = compiler.scopes.scope_stack.last() {
+                compiler.scopes.last_used_reg = prev.last_used_reg;
+                compiler.scopes.max_used_registers = prev.max_used_registers;
+            }
+
             //allocate all vars first
             let mut var_regs = Vec::new();
             let mut letrec_vars = HashSet::new();
@@ -160,7 +170,8 @@ pub fn compile_letrec(compiler: &mut Compiler, args: &[SExpression], is_tail: bo
                         return Err(CompilationError::from("Binding must be (var init)"));
                     }
                     if let SExpression::Symbol(ref sym) = &pair[0] {
-                        let var_reg = compiler.scopes.find_or_alloc(sym)?;
+                        let var_reg = compiler.scopes.allocate_reg()?;
+                        compiler.scopes.symbols.insert(sym.clone(), var_reg);
                         var_regs.push(var_reg);
                         letrec_vars.insert(sym.clone());
                     }
@@ -205,7 +216,9 @@ pub fn compile_letrec(compiler: &mut Compiler, args: &[SExpression], is_tail: bo
                 last_reg = compiler.compile_expr(expr, &[], is_tail && index == body.len() - 1)?;
                 compiler.pop_map();
             }
+            let inner_max = compiler.scopes.max_used_registers;
             compiler.scopes.end_scope();
+            compiler.scopes.max_used_registers = std::cmp::max(compiler.scopes.max_used_registers, inner_max);
             Ok(last_reg)
         }
         else {

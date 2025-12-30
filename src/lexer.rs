@@ -41,7 +41,12 @@ pub enum Token {
     RParen,
     #[regex(r"[+-]?(0|[1-9][_0-9]*)", |lex| { lex.slice().parse() }, priority = 3)]
     Integer(i64),
-    #[regex("(true|false)", |lex| { lex.slice().parse()})]
+    #[regex(r"(true|false|#t|#f)", |lex| {
+        let s = lex.slice();
+        if s == "#t" { Ok(true) }
+        else if s == "#f" { Ok(false) }
+        else { s.parse() }
+    })]
     Boolean(bool),
     #[regex(r"[+-]?((\d+\.?\d*)|(\.\d+))(([eE][+-]?)?\d+)?", |lex| { lex.slice().parse() }, priority = 2)]
     Float(f64),

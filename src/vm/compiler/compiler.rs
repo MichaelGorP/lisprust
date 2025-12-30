@@ -47,7 +47,8 @@ pub struct Compiler<'a> {
     pub(super) scopes: ScopeManager,
     pub(super) functions: FunctionRegistry,
     source_map_stack: Vec<&'a SourceMap>,
-    debug_symbols: HashMap<usize, HashMap<u8, String>>
+    debug_symbols: HashMap<usize, HashMap<u8, String>>,
+    current_function: Option<(String, usize, u8, Option<u8>)>,
 }
 
 impl<'a> Compiler<'a> {
@@ -58,7 +59,8 @@ impl<'a> Compiler<'a> {
             scopes: ScopeManager::new(),
             functions: FunctionRegistry::new(),
             source_map_stack: Vec::new(),
-            debug_symbols: HashMap::new()
+            debug_symbols: HashMap::new(),
+            current_function: None,
         }
     }
 
@@ -194,78 +196,135 @@ impl<'a> Compiler<'a> {
                         self.bytecode.store_value(&id.to_le_bytes());
                     }
                     else {
-                        let sym_reg; //register for symbol
-                        if let Some(reg) = self.scopes.find_symbol(s.as_str()) {
-                            sym_reg = reg;
-                        }
-                        else {
-                            sym_reg = self.scopes.allocate_reg()?;
-                            let symbol_id = self.scopes.get_or_intern_symbol(s);
-                            self.bytecode.store_opcode(Instr::LoadGlobal, sym_reg, 0, 0);
-                            self.bytecode.store_value(&symbol_id.to_le_bytes());
-                        }
-
-                        self.pop_map();
-
-                        // Resolve sym_reg through aliases to find the definition register
-                        // With runtime closures, we don't need to manually copy captures here.
-                        // The VM handles unpacking captures from the closure object.
+                        // Check for self-recursion optimization
+                        let mut is_recursive = false;
+                        let mut target_addr = 0;
+                        let mut target_param_count = 0;
                         
-                        let mut arg_regs = Vec::new();
-                        for (expr, sub_map) in list.iter().skip(1).zip(map_list.iter().skip(1)) {
-                            self.push_map(sub_map);
-                            let reg = self.compile_expr(expr, &[], false)?;
+                        if let Some((name, addr, p_count, self_reg)) = &self.current_function {
+                            if name == s && is_tail {
+                                // Only optimize if the symbol is NOT shadowed by a local variable
+                                // OR if the shadowing variable IS the function itself
+                                let is_shadowed = if let Some(reg) = self.scopes.find_symbol(s) {
+                                    if let Some(sr) = self_reg {
+                                        reg != *sr
+                                    } else {
+                                        true
+                                    }
+                                } else {
+                                    false
+                                };
+                                
+                                // println!("DEBUG: Recursion check for {}: is_tail={}, self_reg={:?}, found_sym={:?}, is_shadowed={}", s, is_tail, self_reg, self.scopes.find_symbol(s), is_shadowed);
+
+                                if !is_shadowed {
+                                    is_recursive = true;
+                                    target_addr = *addr;
+                                    target_param_count = *p_count;
+                                } else {
+                                    // Shadowed, not recursive
+                                }
+                            }
+                        }
+
+                        if is_recursive {
                             self.pop_map();
-                            arg_regs.push(reg);
-                        }
-
-                        // Copy arguments to a contiguous block
-                        let start_reg = self.scopes.allocate_reg()?;
-                        // Allocate remaining registers
-                        for _ in 1..arg_regs.len() {
-                            self.scopes.allocate_reg()?;
-                        }
-                        
-                        for (i, reg) in arg_regs.iter().enumerate() {
-                            self.bytecode.store_opcode(Instr::CopyReg, start_reg + i as u8, *reg, 0);
-                        }
-                        let reg_count = arg_regs.len() as u8;
-
-                        if is_tail {
-                            // If the function register is within the parameter area we're about to overwrite,
-                            // move it to a safe temporary register first.
-                            let mut final_sym_reg = sym_reg;
-                            // Check if sym_reg is in the target area (0..reg_count)
-                            // Note: For tail calls, we copy to 0..reg_count.
-                            if sym_reg < reg_count {
-                                let temp_reg = self.scopes.allocate_reg()?;
-                                self.bytecode.store_opcode(Instr::CopyReg, temp_reg, sym_reg, 0);
-                                final_sym_reg = temp_reg;
+                            
+                            let mut arg_regs = Vec::new();
+                            for (expr, sub_map) in list.iter().skip(1).zip(map_list.iter().skip(1)) {
+                                self.push_map(sub_map);
+                                let reg = self.compile_expr(expr, &[], false)?;
+                                self.pop_map();
+                                arg_regs.push(reg);
+                            }
+                            
+                            if arg_regs.len() != target_param_count as usize {
+                                return Err(CompilationError::from(format!("Argument count mismatch for recursive call: expected {}, got {}", target_param_count, arg_regs.len()).as_str()));
                             }
 
-                            // For tail-calls the VM expects parameters to live in the
-                            // low parameter area (registers starting at 0 relative to
-                            // the current window). Move the evaluated argument
-                            // registers into that area. Use temporaries to avoid
-                            // clobbering when source/dest overlap.
-                            if reg_count > 0 {
-                                let mut temps: Vec<u8> = Vec::new();
-                                for i in 0..(reg_count as usize) {
-                                    let src = (start_reg as usize + i) as u8;
-                                    let temp = self.scopes.allocate_reg()?;
-                                    self.bytecode.store_opcode(Instr::CopyReg, temp, src, 0);
-                                    temps.push(temp);
-                                }
-                                for i in 0..(reg_count as usize) {
-                                    let dest = i as u8; // param slots start at register 0
-                                    let temp = temps[i];
-                                    self.bytecode.store_opcode(Instr::CopyReg, dest, temp, 0);
-                                }
+                            for (i, reg) in arg_regs.iter().enumerate() {
+                                self.bytecode.store_opcode(Instr::CopyReg, i as u8, *reg, 0);
                             }
-                            self.bytecode.store_opcode(Instr::TailCallSymbol, final_sym_reg, 0, result_reg);
+                            
+                            self.bytecode.store_opcode(Instr::Jump, 0, JumpCondition::Jump as u8, 0);
+                            let jump_pos = self.bytecode.position();
+                            let dist = (target_addr as i64) - (jump_pos as i64 + 8);
+                            self.bytecode.store_value(&dist.to_le_bytes());
                         }
                         else {
-                            self.bytecode.store_opcode(Instr::CallSymbol, sym_reg, start_reg, result_reg);
+                            let sym_reg; //register for symbol
+                            if let Some(reg) = self.scopes.find_symbol(s.as_str()) {
+                                sym_reg = reg;
+                            }
+                            else {
+                                sym_reg = self.scopes.allocate_reg()?;
+                                let symbol_id = self.scopes.get_or_intern_symbol(s);
+                                self.bytecode.store_opcode(Instr::LoadGlobal, sym_reg, 0, 0);
+                                self.bytecode.store_value(&symbol_id.to_le_bytes());
+                            }
+
+                            self.pop_map();
+
+                            // Resolve sym_reg through aliases to find the definition register
+                            // With runtime closures, we don't need to manually copy captures here.
+                            // The VM handles unpacking captures from the closure object.
+                            
+                            let mut arg_regs = Vec::new();
+                            for (expr, sub_map) in list.iter().skip(1).zip(map_list.iter().skip(1)) {
+                                self.push_map(sub_map);
+                                let reg = self.compile_expr(expr, &[], false)?;
+                                self.pop_map();
+                                arg_regs.push(reg);
+                            }
+
+                            // Copy arguments to a contiguous block
+                            let start_reg = self.scopes.allocate_reg()?;
+                            // Allocate remaining registers
+                            for _ in 1..arg_regs.len() {
+                                self.scopes.allocate_reg()?;
+                            }
+                            
+                            for (i, reg) in arg_regs.iter().enumerate() {
+                                self.bytecode.store_opcode(Instr::CopyReg, start_reg + i as u8, *reg, 0);
+                            }
+                            let reg_count = arg_regs.len() as u8;
+
+                            if is_tail {
+                                // If the function register is within the parameter area we're about to overwrite,
+                                // move it to a safe temporary register first.
+                                let mut final_sym_reg = sym_reg;
+                                // Check if sym_reg is in the target area (0..reg_count)
+                                // Note: For tail calls, we copy to 0..reg_count.
+                                if sym_reg < reg_count {
+                                    let temp_reg = self.scopes.allocate_reg()?;
+                                    self.bytecode.store_opcode(Instr::CopyReg, temp_reg, sym_reg, 0);
+                                    final_sym_reg = temp_reg;
+                                }
+
+                                // For tail-calls the VM expects parameters to live in the
+                                // low parameter area (registers starting at 0 relative to
+                                // the current window). Move the evaluated argument
+                                // registers into that area. Use temporaries to avoid
+                                // clobbering when source/dest overlap.
+                                if reg_count > 0 {
+                                    let mut temps: Vec<u8> = Vec::new();
+                                    for i in 0..(reg_count as usize) {
+                                        let src = (start_reg as usize + i) as u8;
+                                        let temp = self.scopes.allocate_reg()?;
+                                        self.bytecode.store_opcode(Instr::CopyReg, temp, src, 0);
+                                        temps.push(temp);
+                                    }
+                                    for i in 0..(reg_count as usize) {
+                                        let dest = i as u8; // param slots start at register 0
+                                        let temp = temps[i];
+                                        self.bytecode.store_opcode(Instr::CopyReg, dest, temp, 0);
+                                    }
+                                }
+                                self.bytecode.store_opcode(Instr::TailCallSymbol, final_sym_reg, 0, result_reg);
+                            }
+                            else {
+                                self.bytecode.store_opcode(Instr::CallSymbol, sym_reg, start_reg, result_reg);
+                            }
                         }
                     }
                     self.scopes.reset_reg(result_reg + 1);
@@ -328,25 +387,35 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    pub(super) fn compile_lambda_into(&mut self, args: &[SExpression], func_value_reg: u8, forced_captures: &[String]) -> Result<u8, CompilationError> {
-        //jump past the lambda body
-        self.bytecode.store_opcode(Instr::Jump, 0, JumpCondition::Jump as u8, 0);
+    pub(super) fn compile_lambda_into(&mut self, args: &[SExpression], func_value_reg: u8, forced_captures: &[String], name: Option<&str>, self_binding: Option<u8>) -> Result<u8, CompilationError> {
+        // Jump past the lambda body (unconditional jump)
         let jump_addr = self.bytecode.position();
-        self.bytecode.store_value(&[0; std::mem::size_of::<i64>()]);
+        self.bytecode.store_opcode(Instr::Jump, 0, JumpCondition::Jump as u8, 0);
+        self.bytecode.store_value(&0i64.to_le_bytes());
 
         self.scopes.begin_scope();
         let header_addr = self.bytecode.position();
+        // Placeholder for header
         self.bytecode.store_value(&[0; std::mem::size_of::<FunctionHeader>()]);
+
         //register parameters
         let mut param_count: u8 = 0;
         if let SExpression::List(arg_list) = &args[0] {
             for param in arg_list {
                 if let SExpression::Symbol(sym) = param {
-                    self.scopes.find_or_alloc(sym.as_str())?;
+                    let reg = self.scopes.allocate_reg()?;
+                    self.scopes.symbols.insert(sym.clone(), reg);
                     param_count = param_count.saturating_add(1);
                 }
             }
         }
+
+        // Set current function for recursion optimization
+        let prev_func = self.current_function.clone();
+        if let Some(n) = name {
+            self.current_function = Some((n.to_string(), self.bytecode.position() as usize, param_count, self_binding));
+        }
+
         self.scopes.fixed_registers = param_count;
         self.scopes.last_used_reg = self.scopes.fixed_registers;
 
@@ -398,12 +467,77 @@ impl<'a> Compiler<'a> {
         let map = self.current_map();
         let map_list = if let SourceMap::List(_, l) = map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
 
+        // Scan for internal definitions (letrec semantics)
+        let mut internal_defines: Vec<(usize, String, u8)> = Vec::new();
+        for (i, expr) in args.iter().skip(1).enumerate() {
+            if let SExpression::List(l) = expr {
+                if let Some(SExpression::BuiltIn(Instruction::Define)) = l.first() {
+                    if l.len() == 3 {
+                        if let SExpression::Symbol(name) = &l[1] {
+                            let reg = self.scopes.allocate_reg()?;
+                            self.scopes.symbols.insert(name.clone(), reg);
+                            internal_defines.push((i, name.clone(), reg));
+                            
+                            // Initialize with Ref(Empty)
+                            // We load 0 (Integer) as a placeholder
+                            self.bytecode.store_opcode(Instr::LoadInt, reg, 0, 0);
+                            self.bytecode.store_value(&0i64.to_le_bytes());
+                            self.bytecode.store_opcode(Instr::MakeRef, reg, 0, 0);
+                            
+                            continue;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+
+        let base_reg = self.scopes.last_used_reg;
         let mut last_reg = 0;
         for (index, (expr, sub_map)) in args.iter().skip(1).zip(map_list.iter().skip(2)).enumerate() {
             self.push_map(sub_map);
-            last_reg = self.compile_expr(expr, &[], index == args.len() - 2)?;
+            
+            let define_info = internal_defines.iter().find(|(i, _, _)| *i == index);
+            
+            if let Some((_, name, reg)) = define_info {
+                if let SExpression::List(l) = expr {
+                    let value_expr = &l[2];
+                    let value_map = if let SourceMap::List(_, maps) = sub_map {
+                        if maps.len() > 2 { &maps[2] } else { sub_map }
+                    } else { sub_map };
+                    
+                    self.push_map(value_map);
+                    
+                    let is_lambda = if let SExpression::List(vl) = value_expr {
+                         if let Some(SExpression::BuiltIn(Instruction::Lambda)) = vl.first() {
+                             true
+                         } else { false }
+                    } else { false };
+
+                    // Compile to a temporary register to avoid overwriting the Ref
+                    let temp_reg = self.scopes.allocate_reg()?;
+
+                    let val_reg = if is_lambda {
+                         if let SExpression::List(vl) = value_expr {
+                             self.compile_lambda_into(&vl[1..], temp_reg, &[], Some(name), Some(*reg))?
+                         } else { unreachable!() }
+                    } else {
+                        self.compile_expr(value_expr, &[], false)?
+                    };
+                    
+                    self.pop_map();
+                    
+                    // Update the Ref with the compiled value
+                    self.bytecode.store_opcode(Instr::SetRef, *reg, val_reg, 0);
+                    
+                    last_reg = *reg;
+                }
+            } else {
+                last_reg = self.compile_expr(expr, &[], index == args.len() - 2)?;
+            }
+
             self.pop_map();
-            self.scopes.reset_reg(last_reg);
+            self.scopes.reset_reg(base_reg);
         }
         self.scopes.reset_reg(last_reg + 1); //keep the result reg of the last expression
         self.bytecode.store_opcode(Instr::Ret, 0, 0, 0);
@@ -418,12 +552,19 @@ impl<'a> Compiler<'a> {
         }
         self.debug_symbols.insert(header_addr as usize, symbols);
 
+        self.current_function = prev_func;
+
         self.scopes.end_scope();
 
         let pos = self.bytecode.position();
-        let dist = pos - jump_addr - std::mem::size_of::<i64>() as u64;
+        // Jump instruction is 4 bytes (OpCode) + 8 bytes (i64).
+        // We want to jump from (jump_addr + 12) to pos.
+        // dist = pos - (jump_addr + 12)
+        let dist = pos - jump_addr - 12;
+        // println!("Compiling lambda: jump_addr={}, pos={}, dist={}", jump_addr, pos, dist);
         
-        self.bytecode.store_and_reset_pos(jump_addr, &dist.to_le_bytes());
+        // Store distance at jump_addr + 4 (skipping OpCode)
+        self.bytecode.store_and_reset_pos(jump_addr + 4, &dist.to_le_bytes());
         //the return of a compiled lambda is a function reference
         let reg = func_value_reg;
         self.bytecode.store_opcode(Instr::LoadFuncRef, reg, 0, 0);

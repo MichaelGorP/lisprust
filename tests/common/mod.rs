@@ -2,6 +2,7 @@ use lisp::parser::{SExpression, Atom, Parser, SourceMap};
 use lisp::lexer;
 use lisp::vm::compiler::Compiler;
 use lisp::vm::math_functions;
+use lisp::vm::list_functions;
 use lisp::vm::vm::Vm;
 
 pub fn parse_and_exec(prog: &str) -> SExpression {
@@ -15,6 +16,7 @@ pub fn parse_compile_and_exec(prog: &str, use_jit: bool) -> SExpression {
 
     let mut compiler = Compiler::new(false);
     math_functions::register_functions(&mut compiler);
+    list_functions::register_functions(&mut compiler);
     let mut prog = compiler.compile(&expr, &map).unwrap();
     let mut prog_copy = prog.clone();
     let mut vm = Vm::new(false);
