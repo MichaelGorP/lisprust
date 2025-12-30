@@ -507,6 +507,55 @@ impl Jit {
                     let dest_reg = opcode[1] as i64;
                     let src1_reg = opcode[2] as i64;
                     let src2_reg = opcode[3] as i64;
+
+                    let block_int = builder.create_block();
+                    let block_float_exec = builder.create_block();
+                    let block_slow = builder.create_block();
+                    let block_done = builder.create_block();
+                    builder.append_block_param(block_done, ptr_type);
+                    let block_dispatch = builder.create_block();
+
+                    // Optimization: Peek ahead for conditional jump
+                    let mut fused_jump = false;
+                    let mut jump_target_block = block_done; // Default, will be overwritten
+                    let mut jump_fallthrough_block = block_done; // Default
+                    let mut jump_condition = JumpCondition::Jump;
+
+                    let is_comparison = matches!(instr, Instr::Eq | Instr::Neq | Instr::Lt | Instr::Gt | Instr::Leq | Instr::Geq);
+                    if is_comparison {
+                        let peek_pos = prog.current_address();
+                        // If the next instruction is a jump target, we cannot fuse it safely
+                        // because we would skip generating the block for it.
+                        if !blocks.contains_key(&peek_pos) {
+                            let bytecode = prog.get_bytecode();
+                            if (peek_pos as usize) + 12 <= bytecode.len() {
+                                let next_op = bytecode[peek_pos as usize];
+                                if next_op == Instr::Jump as u8 {
+                                let next_reg = bytecode[peek_pos as usize + 1];
+                                let next_cond = bytecode[peek_pos as usize + 2];
+                                
+                                if next_reg == dest_reg as u8 && (next_cond == JumpCondition::JumpTrue as u8 || next_cond == JumpCondition::JumpFalse as u8) {
+                                    let dist_bytes = &bytecode[peek_pos as usize + 4 .. peek_pos as usize + 12];
+                                    let dist = i64::from_le_bytes(dist_bytes.try_into().unwrap());
+                                    
+                                    let after_jump_pos = peek_pos + 12;
+                                    let target_addr = (after_jump_pos as i64 + dist) as u64;
+                                    
+                                    if let Some(tb) = blocks.get(&target_addr) {
+                                        if let Some(fb) = blocks.get(&after_jump_pos) {
+                                            fused_jump = true;
+                                            jump_target_block = *tb;
+                                            jump_fallthrough_block = *fb;
+                                            jump_condition = unsafe { std::mem::transmute(next_cond) };
+                                            
+                                            prog.jump(12);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    }
                     
                     let val_size = std::mem::size_of::<LispValue>() as i64;
                     
@@ -516,13 +565,6 @@ impl Jit {
                     
                     let tag1 = builder.ins().load(types::I8, MemFlags::trusted(), src1_ptr, TAG_OFFSET);
                     let tag2 = builder.ins().load(types::I8, MemFlags::trusted(), src2_ptr, TAG_OFFSET);
-                    
-                    let block_int = builder.create_block();
-                    let block_float_exec = builder.create_block();
-                    let block_slow = builder.create_block();
-                    let block_done = builder.create_block();
-                    builder.append_block_param(block_done, ptr_type);
-                    let block_dispatch = builder.create_block();
 
                     // Fast path for integers
                     let t1_x = builder.ins().bxor_imm(tag1, 2);
@@ -557,6 +599,8 @@ impl Jit {
                     let val1 = builder.ins().load(types::I64, MemFlags::trusted(), src1_ptr, DATA_OFFSET);
                     let val2 = builder.ins().load(types::I64, MemFlags::trusted(), src2_ptr, DATA_OFFSET);
                     
+                    let mut comparison_result = None;
+
                     match instr {
                         Instr::Add => {
                             let res = builder.ins().iadd(val1, val2);
@@ -586,6 +630,7 @@ impl Jit {
                         },
                         Instr::Eq => {
                             let res = builder.ins().icmp(IntCC::Equal, val1, val2);
+                            comparison_result = Some(res);
                             let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
                             builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
@@ -593,6 +638,7 @@ impl Jit {
                         },
                         Instr::Neq => {
                             let res = builder.ins().icmp(IntCC::NotEqual, val1, val2);
+                            comparison_result = Some(res);
                             let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
                             builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
@@ -600,6 +646,7 @@ impl Jit {
                         },
                         Instr::Lt => {
                             let res = builder.ins().icmp(IntCC::SignedLessThan, val1, val2);
+                            comparison_result = Some(res);
                             let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
                             builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
@@ -607,6 +654,7 @@ impl Jit {
                         },
                         Instr::Gt => {
                             let res = builder.ins().icmp(IntCC::SignedGreaterThan, val1, val2);
+                            comparison_result = Some(res);
                             let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
                             builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
@@ -614,6 +662,7 @@ impl Jit {
                         },
                         Instr::Leq => {
                             let res = builder.ins().icmp(IntCC::SignedLessThanOrEqual, val1, val2);
+                            comparison_result = Some(res);
                             let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
                             builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
@@ -621,6 +670,7 @@ impl Jit {
                         },
                         Instr::Geq => {
                             let res = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, val1, val2);
+                            comparison_result = Some(res);
                             let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
                             builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
@@ -628,13 +678,28 @@ impl Jit {
                         },
                         _ => {}
                     }
-                    builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
+                    
+                    if fused_jump {
+                        if let Some(res) = comparison_result {
+                             match jump_condition {
+                                 JumpCondition::JumpTrue => builder.ins().brif(res, jump_target_block, &[BlockArg::from(registers_ptr)], jump_fallthrough_block, &[BlockArg::from(registers_ptr)]),
+                                 JumpCondition::JumpFalse => builder.ins().brif(res, jump_fallthrough_block, &[BlockArg::from(registers_ptr)], jump_target_block, &[BlockArg::from(registers_ptr)]),
+                                 _ => builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)])
+                             };
+                        } else {
+                             builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
+                        }
+                    } else {
+                        builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
+                    }
 
                     // --- Float Path ---
                     builder.switch_to_block(block_float_exec);
                     let val1 = builder.ins().load(types::F64, MemFlags::trusted(), src1_ptr, DATA_OFFSET);
                     let val2 = builder.ins().load(types::F64, MemFlags::trusted(), src2_ptr, DATA_OFFSET);
                     
+                    comparison_result = None;
+
                     match instr {
                         Instr::Add => {
                             let res = builder.ins().fadd(val1, val2);
@@ -662,6 +727,7 @@ impl Jit {
                         },
                         Instr::Eq => {
                             let res = builder.ins().fcmp(FloatCC::Equal, val1, val2);
+                            comparison_result = Some(res);
                             let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
                             builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
@@ -669,6 +735,7 @@ impl Jit {
                         },
                         Instr::Neq => {
                             let res = builder.ins().fcmp(FloatCC::NotEqual, val1, val2);
+                            comparison_result = Some(res);
                             let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
                             builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
@@ -676,6 +743,7 @@ impl Jit {
                         },
                         Instr::Lt => {
                             let res = builder.ins().fcmp(FloatCC::LessThan, val1, val2);
+                            comparison_result = Some(res);
                             let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
                             builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
@@ -683,6 +751,7 @@ impl Jit {
                         },
                         Instr::Gt => {
                             let res = builder.ins().fcmp(FloatCC::GreaterThan, val1, val2);
+                            comparison_result = Some(res);
                             let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
                             builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
@@ -690,6 +759,7 @@ impl Jit {
                         },
                         Instr::Leq => {
                             let res = builder.ins().fcmp(FloatCC::LessThanOrEqual, val1, val2);
+                            comparison_result = Some(res);
                             let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
                             builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
@@ -697,6 +767,7 @@ impl Jit {
                         },
                         Instr::Geq => {
                             let res = builder.ins().fcmp(FloatCC::GreaterThanOrEqual, val1, val2);
+                            comparison_result = Some(res);
                             let res_ext = builder.ins().uextend(types::I64, res);
                             let const_tag = builder.ins().iconst(types::I8, 1);
                             builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
@@ -704,14 +775,49 @@ impl Jit {
                         },
                         _ => {}
                     }
-                    builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
+                    
+                    if fused_jump {
+                        if let Some(res) = comparison_result {
+                             match jump_condition {
+                                 JumpCondition::JumpTrue => builder.ins().brif(res, jump_target_block, &[BlockArg::from(registers_ptr)], jump_fallthrough_block, &[BlockArg::from(registers_ptr)]),
+                                 JumpCondition::JumpFalse => builder.ins().brif(res, jump_fallthrough_block, &[BlockArg::from(registers_ptr)], jump_target_block, &[BlockArg::from(registers_ptr)]),
+                                 _ => builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)])
+                             };
+                        } else {
+                             builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
+                        }
+                    } else {
+                        builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
+                    }
 
                     // --- Slow Path ---
                     builder.switch_to_block(block_slow);
                     let op_val = u32::from_le_bytes(opcode);
                     let op_const = builder.ins().iconst(types::I32, op_val as i64);
                     builder.ins().call(local_helper_op, &[vm_ptr, prog_ptr, registers_ptr, op_const]);
-                    builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
+                    
+                    if fused_jump {
+                         let tag = builder.ins().load(types::I8, MemFlags::trusted(), dest_ptr, TAG_OFFSET);
+                         let val = builder.ins().load(types::I8, MemFlags::trusted(), dest_ptr, DATA_OFFSET);
+                         
+                         let tag_is_bool = builder.ins().icmp_imm(IntCC::Equal, tag, 1);
+                         let val_is_false = builder.ins().icmp_imm(IntCC::Equal, val, 0);
+                         let is_false = builder.ins().band(tag_is_bool, val_is_false);
+                         
+                         match jump_condition {
+                             JumpCondition::JumpTrue => {
+                                 builder.ins().brif(is_false, jump_fallthrough_block, &[BlockArg::from(registers_ptr)], jump_target_block, &[BlockArg::from(registers_ptr)]);
+                             },
+                             JumpCondition::JumpFalse => {
+                                 builder.ins().brif(is_false, jump_target_block, &[BlockArg::from(registers_ptr)], jump_fallthrough_block, &[BlockArg::from(registers_ptr)]);
+                             },
+                             _ => {
+                                 builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
+                             }
+                         }
+                    } else {
+                        builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
+                    }
                     
                     builder.switch_to_block(block_done);
                     registers_ptr = builder.block_params(block_done)[0];
@@ -719,6 +825,47 @@ impl Jit {
                 Instr::Not => {
                     let dest_reg = opcode[1] as i64;
                     let src_reg = opcode[2] as i64;
+                    
+                    let block_done = builder.create_block();
+                    builder.append_block_param(block_done, ptr_type);
+
+                    // Optimization: Peek ahead for conditional jump
+                    let mut fused_jump = false;
+                    let mut jump_target_block = block_done;
+                    let mut jump_fallthrough_block = block_done;
+                    let mut jump_condition = JumpCondition::Jump;
+
+                    let peek_pos = prog.current_address();
+                    if !blocks.contains_key(&peek_pos) {
+                        let bytecode = prog.get_bytecode();
+                        if (peek_pos as usize) + 12 <= bytecode.len() {
+                            let next_op = bytecode[peek_pos as usize];
+                            if next_op == Instr::Jump as u8 {
+                                let next_reg = bytecode[peek_pos as usize + 1];
+                                let next_cond = bytecode[peek_pos as usize + 2];
+                                
+                                if next_reg == dest_reg as u8 && (next_cond == JumpCondition::JumpTrue as u8 || next_cond == JumpCondition::JumpFalse as u8) {
+                                    let dist_bytes = &bytecode[peek_pos as usize + 4 .. peek_pos as usize + 12];
+                                    let dist = i64::from_le_bytes(dist_bytes.try_into().unwrap());
+                                    
+                                    let after_jump_pos = peek_pos + 12;
+                                    let target_addr = (after_jump_pos as i64 + dist) as u64;
+                                    
+                                    if let Some(tb) = blocks.get(&target_addr) {
+                                        if let Some(fb) = blocks.get(&after_jump_pos) {
+                                            fused_jump = true;
+                                            jump_target_block = *tb;
+                                            jump_fallthrough_block = *fb;
+                                            jump_condition = unsafe { std::mem::transmute(next_cond) };
+                                            
+                                            prog.jump(12);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let val_size = std::mem::size_of::<LispValue>() as i64;
                     
                     let src_ptr = builder.ins().iadd_imm(registers_ptr, src_reg * val_size);
@@ -739,6 +886,28 @@ impl Jit {
                     
                     builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
                     builder.ins().store(MemFlags::trusted(), res_val_ext, dest_ptr, DATA_OFFSET);
+                    
+                    if fused_jump {
+                        // res_val is the boolean result of Not.
+                        // If JumpTrue, we jump if res_val != 0.
+                        // If JumpFalse, we jump if res_val == 0.
+                        match jump_condition {
+                             JumpCondition::JumpTrue => {
+                                 builder.ins().brif(res_val, jump_target_block, &[BlockArg::from(registers_ptr)], jump_fallthrough_block, &[BlockArg::from(registers_ptr)]);
+                             },
+                             JumpCondition::JumpFalse => {
+                                 builder.ins().brif(res_val, jump_fallthrough_block, &[BlockArg::from(registers_ptr)], jump_target_block, &[BlockArg::from(registers_ptr)]);
+                             },
+                             _ => {
+                                 builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
+                             }
+                         }
+                    } else {
+                        builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
+                    }
+                    
+                    builder.switch_to_block(block_done);
+                    registers_ptr = builder.block_params(block_done)[0];
                     
                     is_terminated = false;
                 },
