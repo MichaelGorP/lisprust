@@ -1,26 +1,20 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::cell::Cell;
 use cranelift::prelude::*;
 use cranelift::codegen::ir::BlockArg;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, Linkage, Module};
-use super::vp::{Value as LispValue, Instr, JumpCondition, VirtualProgram, FunctionHeader, FunctionData, HeapValue};
-use super::vm::Vm;
+use crate::vm::vp::{Value as LispValue, Instr, JumpCondition, VirtualProgram, FunctionHeader};
+use crate::vm::vm::Vm;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum JitType {
-    Int,
-    Float,
-}
+pub mod jit_types;
+pub mod analysis;
+pub mod vm_helpers;
 
-// Constants for Value layout
-// Assumes #[repr(C, u8)] for Value enum
-const TAG_OFFSET: i32 = 0;
-// Data offset depends on alignment. For 64-bit types (i64, f64, ptr), alignment is 8.
-// So tag (1 byte) + padding (7 bytes) = 8 bytes offset.
-const DATA_OFFSET: i32 = 8;
+use self::jit_types::{JitType, TAG_OFFSET, DATA_OFFSET};
+use self::analysis::{analyze_function, scan_function_end};
+use self::vm_helpers::*;
 
 pub struct Jit {
     builder_context: FunctionBuilderContext,
@@ -77,202 +71,6 @@ impl Jit {
             pending_funcs: HashMap::new(),
             function_map: Arc::new(Mutex::new(Vec::new())),
         }
-    }
-
-    fn analyze_function(prog: &mut VirtualProgram, start_addr: u64, end_addr: u64, param_count: u8) -> Option<(Vec<JitType>, JitType, HashMap<usize, JitType>)> {
-        let original_pos = prog.cursor.position();
-        let mut has_float = false;
-        let mut defined_regs = HashSet::new();
-        let mut used_regs = HashSet::new();
-        
-        for i in 0..param_count {
-            defined_regs.insert(i as usize);
-        }
-        
-        let mut worklist = vec![start_addr];
-        let mut visited = HashSet::new();
-        
-        while let Some(addr) = worklist.pop() {
-            if visited.contains(&addr) { continue; }
-            visited.insert(addr);
-            
-            prog.cursor.set_position(addr);
-            
-            loop {
-                if prog.cursor.position() >= end_addr { break; }
-                let opcode = match prog.read_opcode() {
-                    Some(o) => o,
-                    None => break,
-                };
-                let instr: Instr = match opcode[0].try_into() {
-                    Ok(i) => i,
-                    Err(_) => break,
-                };
-                
-                match instr {
-                    Instr::LoadFloat => {
-                        has_float = true;
-                        prog.read_int();
-                        defined_regs.insert(opcode[1] as usize);
-                    },
-                    Instr::LoadInt | Instr::LoadString | Instr::LoadGlobal | Instr::Define => { 
-                        prog.read_int(); 
-                        defined_regs.insert(opcode[1] as usize);
-                    },
-                    Instr::LoadBool => {
-                        defined_regs.insert(opcode[1] as usize);
-                    },
-                    Instr::CopyReg => {
-                        used_regs.insert(opcode[2] as usize);
-                        defined_regs.insert(opcode[1] as usize);
-                    },
-                    Instr::Add | Instr::Sub | Instr::Mul | Instr::Div | Instr::Eq | Instr::Neq | Instr::Lt | Instr::Gt | Instr::Leq | Instr::Geq => {
-                        used_regs.insert(opcode[2] as usize);
-                        used_regs.insert(opcode[3] as usize);
-                        defined_regs.insert(opcode[1] as usize);
-                    },
-                    Instr::Not => {
-                        used_regs.insert(opcode[2] as usize);
-                        defined_regs.insert(opcode[1] as usize);
-                         // Check for fused jump
-                         let pos = prog.cursor.position();
-                         if let Some(next_op) = prog.read_opcode() {
-                             if let Ok(Instr::Jump) = next_op[0].try_into() {
-                                 let dist = prog.read_int().unwrap_or(0);
-                                 let target = (prog.cursor.position() as i64 + dist) as u64;
-                                 worklist.push(target);
-                                 // Jump is conditional (fused with Not), so we also fall through
-                             } else {
-                                 prog.cursor.set_position(pos);
-                             }
-                         }
-                    },
-                    Instr::Jump => { 
-                        let dist = prog.read_int().unwrap_or(0);
-                        let target = (prog.cursor.position() as i64 + dist) as u64;
-                        worklist.push(target);
-                        
-                        if opcode[2] == JumpCondition::Jump as u8 { // Unconditional
-                            break; // Stop scanning this block
-                        } else {
-                            // Conditional
-                            used_regs.insert(opcode[1] as usize);
-                        }
-                    },
-                    Instr::LoadFuncRef => { return None; },
-                    Instr::MakeClosure => { return None; },
-                    Instr::TailCallSymbol => {
-                        used_regs.insert(opcode[1] as usize);
-                        break; // Tail call ends block
-                    },
-                    Instr::CallSymbol => {
-                        used_regs.insert(opcode[1] as usize);
-                        defined_regs.insert(opcode[3] as usize);
-                    },
-                    Instr::CallFunction => {
-                        return None;
-                    },
-                    Instr::Ret => {
-                        // Ret uses result_reg from header, but we don't have header here.
-                        // Assuming result_reg is defined.
-                        break;
-                    },
-                    _ => {}
-                }
-            }
-        }
-        
-        prog.cursor.set_position(original_pos);
-        
-        // Check for captures
-        for reg in used_regs {
-            if !defined_regs.contains(&reg) {
-                println!("Capture check failed for reg {}", reg);
-                return None;
-            }
-        }
-        
-        let main_type = if has_float { JitType::Float } else { JitType::Int };
-        let reg_types = HashMap::new();
-        let mut params = Vec::new();
-        
-        for _ in 0..param_count {
-            params.push(main_type);
-        }
-        
-        Some((params, main_type, reg_types))
-    }
-
-    fn scan_function_end(prog: &mut VirtualProgram, start_addr: u64) -> u64 {
-        let original = prog.cursor.position();
-        prog.cursor.set_position(start_addr);
-        loop {
-            let opcode = match prog.read_opcode() {
-                Some(o) => o,
-                None => break,
-            };
-            let instr: Result<Instr, _> = opcode[0].try_into();
-            if let Ok(Instr::Ret) = instr {
-                // Ret marks the end of the function in this simple JIT.
-            }
-        }
-        
-        // Perform a basic block traversal to find the maximum reachable address.
-        let mut max_addr = start_addr;
-        let mut worklist = vec![start_addr];
-        let mut visited = HashSet::new();
-        
-        while let Some(addr) = worklist.pop() {
-            if visited.contains(&addr) { continue; }
-            visited.insert(addr);
-            if addr > max_addr { max_addr = addr; }
-            
-            prog.cursor.set_position(addr);
-            loop {
-                let pos = prog.cursor.position();
-                if pos > max_addr { max_addr = pos; }
-                
-                let opcode = match prog.read_opcode() {
-                    Some(o) => o,
-                    None => break,
-                };
-                let instr: Instr = match opcode[0].try_into() {
-                    Ok(i) => i,
-                    Err(_) => break,
-                };
-                
-                match instr {
-                    Instr::Jump => {
-                        let dist = prog.read_int().unwrap_or(0);
-                        let target = (prog.cursor.position() as i64 + dist) as u64;
-                        worklist.push(target);
-                        if opcode[2] == JumpCondition::Jump as u8 { break; }
-                    },
-                    Instr::Not => {
-                         if let Some(next) = prog.read_opcode() {
-                             if let Ok(Instr::Jump) = next[0].try_into() {
-                                 let dist = prog.read_int().unwrap_or(0);
-                                 let target = (prog.cursor.position() as i64 + dist) as u64;
-                                 worklist.push(target);
-                             } else {
-                                 prog.cursor.set_position(pos + 1 + 8); // Skip Not opcode + args
-                             }
-                         }
-                    },
-                    Instr::Ret => break,
-                    _ => {
-                        // Advance cursor
-                        match instr {
-                            Instr::LoadInt | Instr::LoadFloat | Instr::LoadGlobal | Instr::Define | Instr::LoadFuncRef => { prog.read_int(); },
-                            Instr::LoadString => { prog.read_string(); },
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-        prog.cursor.set_position(original);
-        max_addr + 1 // Approximate
     }
 
     fn generate_wrapper(&mut self, prog: &mut VirtualProgram, start_addr: u64, fast_ptr: *const u8) -> Option<*const u8> {
@@ -410,7 +208,7 @@ impl Jit {
             return None;
         }
 
-        let (param_types, main_type, _) = match Self::analyze_function(prog, start_addr, end_addr, header.param_count) {
+        let (param_types, main_type, _) = match analyze_function(prog, start_addr, end_addr, header.param_count) {
             Some(res) => res,
             None => {
                 prog.cursor.set_position(original_pos);
@@ -547,6 +345,41 @@ impl Jit {
 
         let mut const_funcs: HashMap<usize, u64> = HashMap::new();
 
+        // Macros for compact instruction generation
+        macro_rules! emit_arithmetic {
+            ($builder:expr, $vars:expr, $opcode:expr, $main_type:expr, $const_funcs:expr, $int_func:ident, $float_func:ident) => {{
+                let v1 = $builder.use_var($vars[$opcode[2] as usize]);
+                let v2 = $builder.use_var($vars[$opcode[3] as usize]);
+                let res = if $main_type == JitType::Float {
+                    $builder.ins().$float_func(v1, v2)
+                } else {
+                    $builder.ins().$int_func(v1, v2)
+                };
+                $builder.def_var($vars[$opcode[1] as usize], res);
+                $const_funcs.remove(&($opcode[1] as usize));
+            }};
+        }
+
+        macro_rules! emit_cmp {
+            ($builder:expr, $vars:expr, $opcode:expr, $main_type:expr, $const_funcs:expr, $int_cc:expr, $float_cc:expr) => {{
+                let v1 = $builder.use_var($vars[$opcode[2] as usize]);
+                let v2 = $builder.use_var($vars[$opcode[3] as usize]);
+                let res = if $main_type == JitType::Float {
+                    $builder.ins().fcmp($float_cc, v1, v2)
+                } else {
+                    $builder.ins().icmp($int_cc, v1, v2)
+                };
+                let val = if $main_type == JitType::Float {
+                    let b_int = $builder.ins().uextend(types::I64, res);
+                    $builder.ins().fcvt_from_uint(types::F64, b_int)
+                } else {
+                    $builder.ins().uextend(types::I64, res)
+                };
+                $builder.def_var($vars[$opcode[1] as usize], val);
+                $const_funcs.remove(&($opcode[1] as usize));
+            }};
+        }
+
         for addr in sorted_blocks {
             let block = blocks[&addr];
             builder.switch_to_block(block);
@@ -575,14 +408,14 @@ impl Jit {
                             return None;
                         };
 
-                        let target_end = Self::scan_function_end(prog, target_addr);
+                        let target_end = scan_function_end(prog, target_addr);
                         let h_addr = target_addr - std::mem::size_of::<FunctionHeader>() as u64;
                         let pos = prog.cursor.position();
                         prog.cursor.set_position(h_addr);
                         let h = FunctionHeader::read(&mut prog.cursor);
                         prog.cursor.set_position(pos);
                         
-                        let (_, tgt_ret, _) = Self::analyze_function(prog, target_addr, target_end, h.param_count)?;
+                        let (_, tgt_ret, _) = analyze_function(prog, target_addr, target_end, h.param_count)?;
                         
                         if tgt_ret != main_type {
                             prog.cursor.set_position(original_pos);
@@ -663,101 +496,13 @@ impl Jit {
                             const_funcs.remove(&(opcode[1] as usize));
                         }
                     },
-                    Instr::Add => {
-                        let v1 = builder.use_var(vars[opcode[2] as usize]);
-                        let v2 = builder.use_var(vars[opcode[3] as usize]);
-                        let res = if main_type == JitType::Float {
-                            builder.ins().fadd(v1, v2)
-                        } else {
-                            builder.ins().iadd(v1, v2)
-                        };
-                        builder.def_var(vars[opcode[1] as usize], res);
-                        const_funcs.remove(&(opcode[1] as usize));
-                    },
-                    Instr::Sub => {
-                        let v1 = builder.use_var(vars[opcode[2] as usize]);
-                        let v2 = builder.use_var(vars[opcode[3] as usize]);
-                        let res = if main_type == JitType::Float {
-                            builder.ins().fsub(v1, v2)
-                        } else {
-                            builder.ins().isub(v1, v2)
-                        };
-                        builder.def_var(vars[opcode[1] as usize], res);
-                        const_funcs.remove(&(opcode[1] as usize));
-                    },
-                    Instr::Mul => {
-                        let v1 = builder.use_var(vars[opcode[2] as usize]);
-                        let v2 = builder.use_var(vars[opcode[3] as usize]);
-                        let res = if main_type == JitType::Float {
-                            builder.ins().fmul(v1, v2)
-                        } else {
-                            builder.ins().imul(v1, v2)
-                        };
-                        builder.def_var(vars[opcode[1] as usize], res);
-                        const_funcs.remove(&(opcode[1] as usize));
-                    },
-                    Instr::Div => {
-                        let v1 = builder.use_var(vars[opcode[2] as usize]);
-                        let v2 = builder.use_var(vars[opcode[3] as usize]);
-                        let res = if main_type == JitType::Float {
-                            builder.ins().fdiv(v1, v2)
-                        } else {
-                            builder.ins().sdiv(v1, v2)
-                        };
-                        builder.def_var(vars[opcode[1] as usize], res);
-                        const_funcs.remove(&(opcode[1] as usize));
-                    },
-                    Instr::Lt => {
-                        let v1 = builder.use_var(vars[opcode[2] as usize]);
-                        let v2 = builder.use_var(vars[opcode[3] as usize]);
-                        let res = if main_type == JitType::Float {
-                            builder.ins().fcmp(FloatCC::LessThan, v1, v2)
-                        } else {
-                            builder.ins().icmp(IntCC::SignedLessThan, v1, v2)
-                        };
-                        let val = if main_type == JitType::Float {
-                            let b_int = builder.ins().uextend(types::I64, res);
-                            builder.ins().fcvt_from_uint(types::F64, b_int)
-                        } else {
-                            builder.ins().uextend(types::I64, res)
-                        };
-                        builder.def_var(vars[opcode[1] as usize], val);
-                        const_funcs.remove(&(opcode[1] as usize));
-                    },
-                    Instr::Gt => {
-                        let v1 = builder.use_var(vars[opcode[2] as usize]);
-                        let v2 = builder.use_var(vars[opcode[3] as usize]);
-                        let res = if main_type == JitType::Float {
-                            builder.ins().fcmp(FloatCC::GreaterThan, v1, v2)
-                        } else {
-                            builder.ins().icmp(IntCC::SignedGreaterThan, v1, v2)
-                        };
-                        let val = if main_type == JitType::Float {
-                            let b_int = builder.ins().uextend(types::I64, res);
-                            builder.ins().fcvt_from_uint(types::F64, b_int)
-                        } else {
-                            builder.ins().uextend(types::I64, res)
-                        };
-                        builder.def_var(vars[opcode[1] as usize], val);
-                        const_funcs.remove(&(opcode[1] as usize));
-                    },
-                    Instr::Eq => {
-                        let v1 = builder.use_var(vars[opcode[2] as usize]);
-                        let v2 = builder.use_var(vars[opcode[3] as usize]);
-                        let res = if main_type == JitType::Float {
-                            builder.ins().fcmp(FloatCC::Equal, v1, v2)
-                        } else {
-                            builder.ins().icmp(IntCC::Equal, v1, v2)
-                        };
-                        let val = if main_type == JitType::Float {
-                            let b_int = builder.ins().uextend(types::I64, res);
-                            builder.ins().fcvt_from_uint(types::F64, b_int)
-                        } else {
-                            builder.ins().uextend(types::I64, res)
-                        };
-                        builder.def_var(vars[opcode[1] as usize], val);
-                        const_funcs.remove(&(opcode[1] as usize));
-                    },
+                    Instr::Add => emit_arithmetic!(builder, vars, opcode, main_type, const_funcs, iadd, fadd),
+                    Instr::Sub => emit_arithmetic!(builder, vars, opcode, main_type, const_funcs, isub, fsub),
+                    Instr::Mul => emit_arithmetic!(builder, vars, opcode, main_type, const_funcs, imul, fmul),
+                    Instr::Div => emit_arithmetic!(builder, vars, opcode, main_type, const_funcs, sdiv, fdiv),
+                    Instr::Lt => emit_cmp!(builder, vars, opcode, main_type, const_funcs, IntCC::SignedLessThan, FloatCC::LessThan),
+                    Instr::Gt => emit_cmp!(builder, vars, opcode, main_type, const_funcs, IntCC::SignedGreaterThan, FloatCC::GreaterThan),
+                    Instr::Eq => emit_cmp!(builder, vars, opcode, main_type, const_funcs, IntCC::Equal, FloatCC::Equal),
                     Instr::LoadGlobal => {
                         let sym_id = prog.read_int().unwrap();
                         if let Some(val) = global_vars.get(sym_id as usize) {
@@ -777,14 +522,14 @@ impl Jit {
                             return None;
                         };
 
-                        let target_end = Self::scan_function_end(prog, target_addr);
+                        let target_end = scan_function_end(prog, target_addr);
                         let h_addr = target_addr - std::mem::size_of::<FunctionHeader>() as u64;
                         let pos = prog.cursor.position();
                         prog.cursor.set_position(h_addr);
                         let h = FunctionHeader::read(&mut prog.cursor);
                         prog.cursor.set_position(pos);
                         
-                        let (_, tgt_ret, _) = Self::analyze_function(prog, target_addr, target_end, h.param_count)?;
+                        let (_, tgt_ret, _) = analyze_function(prog, target_addr, target_end, h.param_count)?;
                         
                         if tgt_ret != main_type {
                             prog.cursor.set_position(original_pos);
@@ -1969,374 +1714,4 @@ impl Jit {
         self.cache.insert(start_addr, code);
         Ok(unsafe { std::mem::transmute(code) })
     }
-}
-
-unsafe extern "C" fn helper_check_self_recursion(vm: *mut Vm, func_reg: usize, start_addr: u64) -> i32 {
-    let vm = &mut *vm;
-    let func = &vm.registers[vm.window_start + func_reg];
-    
-    let address = if let Some(r) = func.as_ref() {
-        let inner = r.borrow();
-        if let Some(f) = inner.as_func_ref() {
-            f.address
-        } else if let Some(c) = inner.as_closure() {
-            c.function.address
-        } else {
-            return 0;
-        }
-    } else {
-        if let Some(f) = func.as_func_ref() {
-            f.address
-        } else if let Some(c) = func.as_closure() {
-            c.function.address
-        } else {
-            return 0;
-        }
-    };
-    
-    if address == start_addr { 1 } else { 0 }
-}
-
-unsafe extern "C" fn helper_op(vm: *mut Vm, _prog: *mut VirtualProgram, registers: *mut LispValue, opcode_val: u32) {
-    let opcode = opcode_val.to_le_bytes();
-    let vm = &mut *vm;
-
-    macro_rules! jit_binary_op {
-        ($op:tt) => {
-            {
-                 let v1 = resolve_value(vm, registers, opcode[2]);
-                 let v2 = resolve_value(vm, registers, opcode[3]);
-                 let res_reg = opcode[1] as usize;
-                 
-                 match (v1, v2) {
-                    (LispValue::Integer(lhs), LispValue::Integer(rhs)) => *registers.add(res_reg) = LispValue::Integer(lhs $op rhs),
-                    (LispValue::Integer(lhs), LispValue::Float(rhs)) => *registers.add(res_reg) = LispValue::Float(lhs as f64 $op rhs),
-                    (LispValue::Float(lhs), LispValue::Float(rhs)) => *registers.add(res_reg) = LispValue::Float(lhs $op rhs),
-                    (LispValue::Float(lhs), LispValue::Integer(rhs)) => *registers.add(res_reg) = LispValue::Float(lhs $op rhs as f64),
-                    (_v1, _v2) => {
-                    } 
-                 }
-            }
-        }
-    }
-
-    macro_rules! jit_comparison_op {
-        ($op:tt) => {
-            {
-                 let v1 = resolve_value(vm, registers, opcode[2]);
-                 let v2 = resolve_value(vm, registers, opcode[3]);
-                 let res_reg = opcode[1] as usize;
-                 
-                 let matches = match (v1, v2) {
-                    (LispValue::Integer(lhs), LispValue::Integer(rhs)) => lhs $op rhs,
-                    (LispValue::Integer(lhs), LispValue::Float(rhs)) => (lhs as f64) $op rhs,
-                    (LispValue::Float(lhs), LispValue::Float(rhs)) => lhs $op rhs,
-                    (LispValue::Float(lhs), LispValue::Integer(rhs)) => lhs $op rhs as f64,
-                    _ => false,
-                 };
-                 *registers.add(res_reg) = LispValue::Boolean(matches);
-            }
-        }
-    }
-    
-    match opcode[0].try_into() {
-        Ok(Instr::Add) => jit_binary_op!(+),
-        Ok(Instr::Sub) => jit_binary_op!(-),
-        Ok(Instr::Mul) => jit_binary_op!(*),
-        Ok(Instr::Div) => jit_binary_op!(/),
-        Ok(Instr::Eq) => jit_comparison_op!(==),
-        Ok(Instr::Neq) => jit_comparison_op!(!=),
-        Ok(Instr::Lt) => jit_comparison_op!(<),
-        Ok(Instr::Gt) => jit_comparison_op!(>),
-        Ok(Instr::Leq) => jit_comparison_op!(<=),
-        Ok(Instr::Geq) => jit_comparison_op!(>=),
-        Ok(Instr::Not) => {
-             let v = resolve_value(vm, registers, opcode[2]);
-             let res_reg = opcode[1] as usize;
-             match v {
-                 LispValue::Boolean(b) => *registers.add(res_reg) = LispValue::Boolean(!b),
-                 _ => *registers.add(res_reg) = LispValue::Boolean(false),
-             }
-        },
-        Ok(Instr::CopyReg) => {
-             let dest_reg = opcode[1] as usize;
-             let src_reg = opcode[2] as usize;
-             let val = (*registers.add(src_reg)).clone();
-
-             *registers.add(dest_reg) = val;
-        },
-        _ => {
-        }
-    }
-}
-
-unsafe extern "C" fn helper_check_condition(_vm: *mut Vm, registers: *mut LispValue, reg_idx: usize) -> i32 {
-    let val = &*registers.add(reg_idx);
-    if val.is_true() { 1 } else { 0 }
-}
-
-unsafe fn resolve_value(_vm: &Vm, registers: *mut LispValue, reg_idx: u8) -> LispValue {
-    let val = &*registers.add(reg_idx as usize);
-    if let Some(r) = val.as_ref() {
-        r.borrow().clone()
-    } else {
-        val.clone()
-    }
-}
-
-unsafe extern "C" fn helper_load_global(vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, sym_id: i64) {
-    let vm = &mut *vm;
-    
-    if (sym_id as usize) < vm.global_vars.len() {
-        let v = &mut vm.global_vars[sym_id as usize];
-        *registers.add(dest_reg) = v.clone();
-    } else {
-        *registers.add(dest_reg) = LispValue::Empty;
-    }
-}
-
-unsafe extern "C" fn helper_define(vm: *mut Vm, registers: *mut LispValue, src_reg: usize, sym_id: i64) {
-    let vm = &mut *vm;
-    let val = (*registers.add(src_reg)).clone();
-    if sym_id as usize >= vm.global_vars.len() {
-        vm.global_vars.resize(sym_id as usize + 1, LispValue::Empty);
-    }
-    vm.global_vars[sym_id as usize] = val;
-}
-
-unsafe extern "C" fn helper_load_func_ref(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, header_addr: i64) {
-    let vm = &mut *vm;
-    let prog = &mut *prog;
-    let header = prog.read_function_header(header_addr as u64).unwrap();
-    let func_addr = header_addr as usize + std::mem::size_of::<FunctionHeader>();
-    
-    let jit_code = vm.jit.cache.get(&(func_addr as u64)).map(|&ptr| ptr as u64).unwrap_or(0);
-    *registers.add(dest_reg) = LispValue::Object(Rc::new(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(jit_code), fast_jit_code: Cell::new(0)})));
-}
-
-unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, func_reg: usize, param_start: usize, target_reg: usize) {
-    let vm = &mut *vm;
-    let prog = &mut *prog;
-    
-    let func = &*registers.add(func_reg);
-    
-    let (header, address, captures, jit_code_cell, fast_jit_code_cell) = if let Some(r) = func.as_ref() {
-        // If it's in a RefCell, we can't safely get a reference to the Cell that outlives the borrow.
-        // So we just return None for the cell, meaning we won't update the cache.
-        let inner = r.borrow();
-        if let Some(f) = inner.as_func_ref() {
-            (f.header, f.address, None, None, None)
-        } else if let Some(c) = inner.as_closure() {
-            (c.function.header, c.function.address, Some(c.captures.clone()), None, None)
-        } else {
-            return
-        }
-    } else {
-        if let Some(f) = func.as_func_ref() {
-            (f.header, f.address, None, Some(&f.jit_code), Some(&f.fast_jit_code))
-        } else if let Some(c) = func.as_closure() {
-            (c.function.header, c.function.address, Some(c.captures.clone()), Some(&c.function.jit_code), Some(&c.function.fast_jit_code))
-        } else {
-            return
-        }
-    };
-
-    let size = param_start + header.register_count as usize + vm.window_start;
-    if size >= vm.registers.len() {
-        vm.registers.resize(size, LispValue::Empty);
-    }
-    let old_ws = vm.window_start;
-    let ret_addr = 0; 
-    
-    let state = crate::vm::vm::CallState{window_start: old_ws, result_reg: header.result_reg, target_reg: target_reg as u8, return_addr: ret_addr};
-    vm.call_states.push(state);
-    
-    vm.window_start += param_start;
-    
-    if let Some(caps) = captures {
-        let start_reg = header.param_count as usize;
-        for (i, val) in caps.into_iter().enumerate() {
-            vm.registers[vm.window_start + start_reg + i] = val;
-        }
-    }
-    
-    let jit_code = jit_code_cell.map(|c| c.get()).unwrap_or(0);
-    if jit_code != 0 {
-         vm.tail_call_pending = true;
-         vm.next_jit_code = jit_code;
-    } else {
-         let end_addr = vm.scan_function_end(prog, address);
-         if let Ok(func) = vm.jit.compile(&vm.global_vars, prog, address, end_addr) {
-             if let Some(cell) = jit_code_cell {
-                 if let Some(&code) = vm.jit.cache.get(&address) {
-                     cell.set(code as u64);
-                 }
-             }
-             if let Some(cell) = fast_jit_code_cell {
-                 if let Some(&code) = vm.jit.fast_cache.get(&address) {
-                     cell.set(code as u64);
-                 }
-             }
-             
-             vm.tail_call_pending = true;
-             vm.next_jit_code = func as usize as u64;
-         } else {
-             println!("JIT compilation failed in call");
-         }
-    }
-
-    while vm.tail_call_pending {
-        vm.tail_call_pending = false;
-        let code = vm.next_jit_code;
-        if code != 0 {
-             let func: unsafe extern "C" fn(*mut Vm, *mut VirtualProgram, *mut LispValue) = std::mem::transmute(code as *const u8);
-             func(vm, prog, vm.registers.as_mut_ptr().add(vm.window_start));
-        }
-    }
-    
-    let state = vm.call_states.pop().unwrap();
-    let source_reg = vm.window_start + state.result_reg as usize;
-    let target_reg = state.window_start + state.target_reg as usize;
-    vm.registers.swap(source_reg, target_reg);
-    
-    vm.window_start = old_ws;
-}
-
-
-unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, func_reg: usize, param_start: usize) {
-    let vm = &mut *vm;
-    let prog = &mut *prog;
-    let prog = &mut *prog;
-
-    let func = &*registers.add(func_reg);
-    
-    let (header, address, captures, jit_code_cell) = if let Some(r) = func.as_ref() {
-        let inner = r.borrow();
-        if let Some(f) = inner.as_func_ref() {
-            (f.header, f.address, None, None)
-        } else if let Some(c) = inner.as_closure() {
-            (c.function.header, c.function.address, Some(c.captures.clone()), None)
-        } else {
-            return
-        }
-    } else {
-        if let Some(f) = func.as_func_ref() {
-            (f.header, f.address, None, Some(&f.jit_code))
-        } else if let Some(c) = func.as_closure() {
-            (c.function.header, c.function.address, Some(c.captures.clone()), Some(&c.function.jit_code))
-        } else {
-            return
-        }
-    };
-
-    let size = vm.window_start + header.register_count as usize;
-    if size >= vm.registers.len() {
-        vm.registers.resize(size, LispValue::Empty);
-    }
-
-    let param_count = header.param_count as usize;
-    
-    if param_start >= param_count {
-        // Safe to copy directly
-        for i in 0..param_count {
-            let src_idx = vm.window_start + param_start + i;
-            let dest_idx = vm.window_start + i;
-            vm.registers[dest_idx] = vm.registers[src_idx].clone();
-        }
-    } else {
-        vm.scratch_buffer.clear();
-        for i in 0..param_count {
-            let idx = vm.window_start + param_start + i;
-            vm.scratch_buffer.push(vm.registers[idx].clone());
-        }
-        for (i, param) in vm.scratch_buffer.drain(..).enumerate() {
-            let target_reg = vm.window_start + i;
-            vm.registers[target_reg] = param;
-        }
-    }
-
-    if let Some(last_frame) = vm.call_states.last_mut() {
-        last_frame.result_reg = header.result_reg;
-    }
-    
-    if let Some(caps) = captures {
-        let start_reg = header.param_count as usize;
-        for (i, val) in caps.into_iter().enumerate() {
-            let target = vm.window_start + start_reg + i;
-            vm.registers[target] = val;
-        }
-    }
-
-    let jit_code = jit_code_cell.map(|c| c.get()).unwrap_or(0);
-    if jit_code != 0 {
-         vm.tail_call_pending = true;
-         vm.next_jit_code = jit_code;
-    } else {
-         let end_addr = vm.scan_function_end(prog, address);
-         if let Ok(func) = vm.jit.compile(&vm.global_vars, prog, address, end_addr) {
-             if let Some(cell) = jit_code_cell {
-                 if let Some(&code) = vm.jit.cache.get(&address) {
-                     cell.set(code as u64);
-                 }
-             }
-             
-             vm.tail_call_pending = true;
-             vm.next_jit_code = func as usize as u64;
-         } else {
-             println!("JIT compilation failed in tail call");
-         }
-    }
-}
-
-use super::vp::ClosureData;
-use std::cell::RefCell;
-use std::rc::Rc;
-
-unsafe extern "C" fn helper_make_closure(_vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, func_reg: usize, count: usize, instr_addr: u64) {
-    let prog = &mut *prog;
-    
-    let old_pos = prog.current_address();
-    prog.jump_to(instr_addr + 4); // Skip opcode (4)
-    
-    let mut captures = Vec::with_capacity(count);
-    for _ in 0..count {
-        let reg_idx = prog.read_byte().unwrap();
-        // Cloning values for capture is necessary as they escape the current scope
-        let val = (*registers.add(reg_idx as usize)).clone();
-        captures.push(val);
-    }
-    
-    prog.jump_to(old_pos);
-    
-    let func_val = &*registers.add(func_reg);
-    
-    if let Some(fd) = func_val.as_func_ref() {
-        // Avoid cloning FunctionData if possible, but it's small (copy)
-        // The main cost is Rc allocation for ClosureData
-        *registers.add(dest_reg) = LispValue::Object(Rc::new(HeapValue::Closure(ClosureData{function: fd.clone(), captures})));
-    } else {
-        *registers.add(dest_reg) = LispValue::Empty;
-    }
-}
-
-unsafe extern "C" fn helper_make_ref(_vm: *mut Vm, registers: *mut LispValue, dest_reg: usize) {
-    let val = (*registers.add(dest_reg)).clone();
-    *registers.add(dest_reg) = LispValue::Object(Rc::new(HeapValue::Ref(RefCell::new(val))));
-}
-
-unsafe extern "C" fn helper_set_ref(_vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, src_reg: usize) {
-    if let Some(r) = (*registers.add(dest_reg)).as_ref() {
-        *r.borrow_mut() = (*registers.add(src_reg)).clone();
-    }
-}
-
-unsafe extern "C" fn helper_deref(_vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, src_reg: usize) {
-    if let Some(r) = (*registers.add(src_reg)).as_ref() {
-        *registers.add(dest_reg) = r.borrow().clone();
-    }
-}
-
-unsafe extern "C" fn helper_get_registers_ptr(vm: *mut Vm) -> *mut LispValue {
-    let vm = &mut *vm;
-    vm.registers.as_mut_ptr().add(vm.window_start)
 }
