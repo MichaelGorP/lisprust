@@ -3,7 +3,7 @@ use std::{cell::{Cell, Ref, RefCell}, io::{Cursor, Read}, mem::size_of, rc::{Rc}
 use enum_display::EnumDisplay;
 
 #[repr(u8)]
-#[derive(Clone, Copy, EnumDisplay, Debug)]
+#[derive(Clone, Copy, EnumDisplay, Debug, PartialEq, Eq)]
 pub(super) enum Instr {
     //register handling
     LoadInt,

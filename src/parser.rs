@@ -106,6 +106,7 @@ impl Parser {
         parser.instructions.insert("*", instructions::Instruction::Multiply);
         parser.instructions.insert("/", instructions::Instruction::Divide);
         parser.instructions.insert("=", instructions::Instruction::Eq);
+        parser.instructions.insert("eq?", instructions::Instruction::Eq);
         parser.instructions.insert("<", instructions::Instruction::Lt);
         parser.instructions.insert(">", instructions::Instruction::Gt);
         parser.instructions.insert("<=", instructions::Instruction::Leq);

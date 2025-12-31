@@ -30,6 +30,7 @@ pub struct Jit {
     cache: HashMap<u64, *const u8>,
     fast_cache: HashMap<u64, *const u8>,
     signatures: HashMap<u64, (Vec<JitType>, JitType)>,
+    pending_funcs: HashMap<u64, cranelift_module::FuncId>,
     pub function_map: Arc<Mutex<Vec<(usize, usize, String)>>>,
 }
 
@@ -38,6 +39,7 @@ impl Jit {
         let mut flag_builder = settings::builder();
         flag_builder.set("use_colocated_libcalls", "false").unwrap();
         flag_builder.set("is_pic", "false").unwrap();
+        flag_builder.set("preserve_frame_pointers", "true").unwrap();
         flag_builder.set("opt_level", "speed").unwrap();
         let isa_builder = cranelift_native::builder().unwrap_or_else(|msg| {
             panic!("host machine is not supported: {}", msg);
@@ -72,6 +74,7 @@ impl Jit {
             cache: HashMap::new(),
             fast_cache: HashMap::new(),
             signatures: HashMap::new(),
+            pending_funcs: HashMap::new(),
             function_map: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -162,9 +165,12 @@ impl Jit {
                         used_regs.insert(opcode[1] as usize);
                         break; // Tail call ends block
                     },
-                    Instr::CallSymbol | Instr::CallFunction => {
+                    Instr::CallSymbol => {
                         used_regs.insert(opcode[1] as usize);
                         defined_regs.insert(opcode[3] as usize);
+                    },
+                    Instr::CallFunction => {
+                        return None;
                     },
                     Instr::Ret => {
                         // Ret uses result_reg from header, but we don't have header here.
@@ -181,7 +187,7 @@ impl Jit {
         // Check for captures
         for reg in used_regs {
             if !defined_regs.contains(&reg) {
-                // println!("Analysis failed: Reg {} used but not defined (capture)", reg);
+                println!("Capture check failed for reg {}", reg);
                 return None;
             }
         }
@@ -269,12 +275,132 @@ impl Jit {
         max_addr + 1 // Approximate
     }
 
+    fn generate_wrapper(&mut self, prog: &mut VirtualProgram, start_addr: u64, fast_ptr: *const u8) -> Option<*const u8> {
+        let (param_types, main_type) = self.signatures.get(&start_addr)?;
+        let param_count = param_types.len();
+        let cranelift_type = match main_type {
+            JitType::Int => types::I64,
+            JitType::Float => types::F64,
+        };
+        
+        let original_pos = prog.cursor.position();
+        let header_addr = start_addr - std::mem::size_of::<FunctionHeader>() as u64;
+        prog.cursor.set_position(header_addr);
+        let header = FunctionHeader::read(&mut prog.cursor);
+        prog.cursor.set_position(original_pos);
+
+        let mut wrapper_ctx = codegen::Context::new();
+        wrapper_ctx.func.signature.clear(self.module.isa().default_call_conv());
+        let ptr_type = self.module.target_config().pointer_type();
+        wrapper_ctx.func.signature.params.push(AbiParam::new(ptr_type)); // vm
+        wrapper_ctx.func.signature.params.push(AbiParam::new(ptr_type)); // prog
+        wrapper_ctx.func.signature.params.push(AbiParam::new(ptr_type)); // registers
+        
+        let mut builder_context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut wrapper_ctx.func, &mut builder_context);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        
+        let regs_ptr = builder.block_params(entry)[2];
+        
+        let mut args = Vec::new();
+        for i in 0..param_count {
+             let offset = (i as i32) * 16 + 8;
+             let val = builder.ins().load(types::I64, MemFlags::trusted(), regs_ptr, offset);
+             let arg = if *main_type == JitType::Float {
+                 builder.ins().bitcast(types::F64, MemFlags::new(), val)
+             } else {
+                 val
+             };
+             args.push(arg);
+        }
+        
+        let fast_ptr_val = fast_ptr as usize as i64;
+        let callee = builder.ins().iconst(types::I64, fast_ptr_val);
+        
+        let mut sig = self.module.make_signature();
+        sig.call_conv = isa::CallConv::Tail;
+        for _ in 0..param_count {
+            sig.params.push(AbiParam::new(cranelift_type));
+        }
+        sig.returns.push(AbiParam::new(cranelift_type));
+        
+        let sig_ref = builder.import_signature(sig);
+        
+        let call = builder.ins().call_indirect(sig_ref, callee, &args);
+        let res = builder.inst_results(call)[0];
+        
+        let res_reg = header.result_reg as i32;
+        let offset_tag = res_reg * 16;
+        let offset_data = res_reg * 16 + 8;
+        
+        let tag = if *main_type == JitType::Float {
+            builder.ins().iconst(types::I8, 3) // Float tag
+        } else {
+            builder.ins().iconst(types::I8, 2) // Integer tag
+        };
+        
+        let res_store = if *main_type == JitType::Float {
+            builder.ins().bitcast(types::I64, MemFlags::new(), res)
+        } else {
+            res
+        };
+        
+        builder.ins().store(MemFlags::trusted(), tag, regs_ptr, offset_tag);
+        builder.ins().store(MemFlags::trusted(), res_store, regs_ptr, offset_data);
+        
+        builder.ins().return_(&[]);
+        builder.seal_all_blocks();
+        builder.finalize();
+        
+        let wrapper_name = format!("wrapper_{}", start_addr);
+        let wrapper_id = match self.module.declare_function(&wrapper_name, Linkage::Local, &wrapper_ctx.func.signature) {
+            Ok(id) => id,
+            Err(e) => { println!("Declare wrapper failed: {}", e); return None; }
+        };
+        if let Err(e) = self.module.define_function(wrapper_id, &mut wrapper_ctx) {
+            println!("Define wrapper failed: {:?}", e);
+            return None;
+        }
+        if let Err(e) = self.module.finalize_definitions() {
+             println!("Finalize wrapper failed: {}", e);
+             return None;
+        }
+        Some(self.module.get_finalized_function(wrapper_id))
+    }
+
     fn try_compile_fast(&mut self, global_vars: &Vec<LispValue>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Option<*const u8> {
         if let Some(&code) = self.fast_cache.get(&start_addr) {
-            return Some(code);
+            return self.generate_wrapper(prog, start_addr, code);
         }
 
-        let original_pos = prog.current_address();
+        self.pending_funcs.clear();
+        
+        let _ = self.compile_fast_internal(global_vars, prog, start_addr, end_addr)?;
+        
+        if let Err(e) = self.module.finalize_definitions() {
+             println!("Finalize definitions failed: {}", e);
+             return None;
+        }
+        
+        for (addr, id) in &self.pending_funcs {
+            let ptr = self.module.get_finalized_function(*id);
+            self.fast_cache.insert(*addr, ptr);
+        }
+        
+        self.pending_funcs.clear();
+        
+        let fast_ptr = self.fast_cache.get(&start_addr)?;
+        self.generate_wrapper(prog, start_addr, *fast_ptr)
+    }
+
+    fn compile_fast_internal(&mut self, global_vars: &Vec<LispValue>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Option<cranelift_module::FuncId> {
+        if let Some(&id) = self.pending_funcs.get(&start_addr) {
+            return Some(id);
+        }
+        
+        let original_pos = prog.cursor.position();
         let header_addr = start_addr - std::mem::size_of::<FunctionHeader>() as u64;
         prog.cursor.set_position(header_addr);
         let header = FunctionHeader::read(&mut prog.cursor);
@@ -284,11 +410,9 @@ impl Jit {
             return None;
         }
 
-        // Analyze
         let (param_types, main_type, _) = match Self::analyze_function(prog, start_addr, end_addr, header.param_count) {
             Some(res) => res,
             None => {
-                println!("Analysis failed for fast JIT");
                 prog.cursor.set_position(original_pos);
                 return None;
             }
@@ -300,19 +424,27 @@ impl Jit {
             JitType::Float => types::F64,
         };
 
-        self.module.clear_context(&mut self.ctx);
-        self.ctx.func.signature.clear(self.module.isa().default_call_conv());
+        let mut ctx = codegen::Context::new();
+        ctx.func.signature.clear(isa::CallConv::Tail);
         
         for _ in 0..header.param_count {
-            self.ctx.func.signature.params.push(AbiParam::new(cranelift_type));
+            ctx.func.signature.params.push(AbiParam::new(cranelift_type));
         }
-        self.ctx.func.signature.returns.push(AbiParam::new(cranelift_type));
+        ctx.func.signature.returns.push(AbiParam::new(cranelift_type));
         
-        let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
+        let fast_name = format!("fast_{}", start_addr);
+        let fast_func_id = match self.module.declare_function(&fast_name, Linkage::Local, &ctx.func.signature) {
+            Ok(id) => id,
+            Err(e) => { println!("Declare func failed: {}", e); prog.cursor.set_position(original_pos); return None; }
+        };
+        
+        self.pending_funcs.insert(start_addr, fast_func_id);
+        
+        let mut builder_context = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_context);
         
         let entry_block = builder.create_block();
         builder.append_block_params_for_function_params(entry_block);
-        
         builder.switch_to_block(entry_block);
         
         let mut vars = Vec::new();
@@ -329,22 +461,7 @@ impl Jit {
         
         let body_block = builder.create_block();
         builder.ins().jump(body_block, &[]);
-
-        let mut sig = self.module.make_signature();
-        for _ in 0..header.param_count {
-            sig.params.push(AbiParam::new(cranelift_type));
-        }
-        sig.returns.push(AbiParam::new(cranelift_type));
         
-        let fast_name = format!("fast_{}", start_addr);
-        let fast_func_id = match self.module.declare_function(&fast_name, Linkage::Local, &sig) {
-            Ok(id) => {
-                id
-            },
-            Err(e) => { println!("Declare func failed: {}", e); return None; }
-        };
-        let _local_fast_func = self.module.declare_func_in_func(fast_func_id, &mut builder.func);
-
         let mut blocks = HashMap::new();
         blocks.insert(start_addr, body_block);
         
@@ -360,16 +477,16 @@ impl Jit {
                 if prog.cursor.position() >= end_addr { break; }
                 let opcode = match prog.read_opcode() {
                     Some(o) => o,
-                    None => { println!("Read opcode failed"); return None; }
+                    None => { prog.cursor.set_position(original_pos); return None; }
                 };
                 let instr: Instr = match opcode[0].try_into() {
                     Ok(i) => i,
-                    Err(_) => { println!("Invalid opcode {}", opcode[0]); return None; }
+                    Err(_) => { prog.cursor.set_position(original_pos); return None; }
                 };
                 
                 match instr {
                     Instr::Jump => {
-                        let dist = prog.read_int()?;
+                        let dist = prog.read_int().unwrap_or(0);
                         let target = (prog.cursor.position() as i64 + dist) as u64;
                         if !blocks.contains_key(&target) {
                             blocks.insert(target, builder.create_block());
@@ -390,7 +507,7 @@ impl Jit {
                         let pos = prog.cursor.position();
                         if let Some(next_op) = prog.read_opcode() {
                             if let Ok(Instr::Jump) = next_op[0].try_into() {
-                                let dist = prog.read_int()?;
+                                let dist = prog.read_int().unwrap_or(0);
                                 let target = (prog.cursor.position() as i64 + dist) as u64;
                                 let fallthrough = prog.cursor.position();
                                 
@@ -408,7 +525,17 @@ impl Jit {
                         prog.cursor.set_position(pos);
                     },
                     Instr::Ret => break,
-                    _ => {}
+                    _ => {
+                        match instr {
+                            Instr::LoadInt | Instr::LoadFloat | Instr::LoadGlobal | Instr::Define | Instr::LoadFuncRef => { prog.read_int(); },
+                            Instr::LoadString => { prog.read_string(); },
+                            Instr::TailCallSymbol => {
+                                prog.read_int(); // param_start
+                                prog.read_int(); // target_reg
+                            },
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
@@ -435,12 +562,69 @@ impl Jit {
                 }
 
                 if prog.cursor.position() >= end_addr { break; }
-                let opcode = prog.read_opcode()?;
-                let instr: Instr = opcode[0].try_into().ok()?;
+                let opcode = prog.read_opcode().unwrap();
+                let instr: Instr = opcode[0].try_into().unwrap();
                 
                 match instr {
+                    Instr::TailCallSymbol => {
+                        let func_reg = opcode[1] as usize;
+                        let target_addr = if let Some(&addr) = const_funcs.get(&func_reg) {
+                            addr
+                        } else {
+                            prog.cursor.set_position(original_pos);
+                            return None;
+                        };
+
+                        let target_end = Self::scan_function_end(prog, target_addr);
+                        let h_addr = target_addr - std::mem::size_of::<FunctionHeader>() as u64;
+                        let pos = prog.cursor.position();
+                        prog.cursor.set_position(h_addr);
+                        let h = FunctionHeader::read(&mut prog.cursor);
+                        prog.cursor.set_position(pos);
+                        
+                        let (_, tgt_ret, _) = Self::analyze_function(prog, target_addr, target_end, h.param_count)?;
+                        
+                        if tgt_ret != main_type {
+                            prog.cursor.set_position(original_pos);
+                            return None;
+                        }
+                        
+                        let param_start = opcode[2];
+                        let _target_reg = opcode[3];
+                        
+                        let mut args = Vec::new();
+                        for i in 0..h.param_count {
+                            let arg_reg = param_start + i;
+                            args.push(builder.use_var(vars[arg_reg as usize]));
+                        }
+                        
+                        if let Some(&tgt_id) = self.pending_funcs.get(&target_addr) {
+                             let local_tgt = self.module.declare_func_in_func(tgt_id, &mut builder.func);
+                             builder.ins().return_call(local_tgt, &args);
+                             break;
+                        } else if let Some(&tgt_ptr) = self.fast_cache.get(&target_addr) {
+                             let tgt_ptr_val = tgt_ptr as usize as i64;
+                             let callee = builder.ins().iconst(types::I64, tgt_ptr_val);
+                             let mut sig = self.module.make_signature();
+                             sig.call_conv = isa::CallConv::Tail;
+                             for _ in 0..h.param_count { sig.params.push(AbiParam::new(cranelift_type)); }
+                             sig.returns.push(AbiParam::new(cranelift_type));
+                             let sig_ref = builder.import_signature(sig);
+                             builder.ins().return_call_indirect(sig_ref, callee, &args);
+                             break;
+                        } else {
+                             if let Some(tgt_id) = self.compile_fast_internal(global_vars, prog, target_addr, target_end) {
+                                 let local_tgt = self.module.declare_func_in_func(tgt_id, &mut builder.func);
+                                 builder.ins().return_call(local_tgt, &args);
+                                 break;
+                             } else {
+                                 prog.cursor.set_position(original_pos);
+                                 return None;
+                             }
+                        }
+                    },
                     Instr::LoadInt => {
-                        let val = match prog.read_int() { Some(v) => v, None => { println!("Read int failed"); return None; } };
+                        let val = prog.read_int().unwrap();
                         let v = if main_type == JitType::Float {
                             builder.ins().f64const(val as f64)
                         } else {
@@ -450,7 +634,7 @@ impl Jit {
                         const_funcs.remove(&(opcode[1] as usize));
                     },
                     Instr::LoadFloat => {
-                        let val = match prog.read_float() { Some(v) => v, None => { println!("Read float failed"); return None; } };
+                        let val = prog.read_float().unwrap();
                         let v = if main_type == JitType::Float {
                             builder.ins().f64const(val)
                         } else {
@@ -575,7 +759,7 @@ impl Jit {
                         const_funcs.remove(&(opcode[1] as usize));
                     },
                     Instr::LoadGlobal => {
-                        let sym_id = prog.read_int()?;
+                        let sym_id = prog.read_int().unwrap();
                         if let Some(val) = global_vars.get(sym_id as usize) {
                             if let Some(f) = val.as_func_ref() {
                                 const_funcs.insert(opcode[1] as usize, f.address);
@@ -593,7 +777,6 @@ impl Jit {
                             return None;
                         };
 
-                        // Analyze target
                         let target_end = Self::scan_function_end(prog, target_addr);
                         let h_addr = target_addr - std::mem::size_of::<FunctionHeader>() as u64;
                         let pos = prog.cursor.position();
@@ -617,19 +800,33 @@ impl Jit {
                             args.push(builder.use_var(vars[arg_reg as usize]));
                         }
                         
-                        let tgt_name = format!("fast_{}", target_addr);
-                        let mut tgt_sig = self.module.make_signature();
-                        for _ in 0..h.param_count {
-                            tgt_sig.params.push(AbiParam::new(cranelift_type));
+                        if let Some(&tgt_id) = self.pending_funcs.get(&target_addr) {
+                             let local_tgt = self.module.declare_func_in_func(tgt_id, &mut builder.func);
+                             let call = builder.ins().call(local_tgt, &args);
+                             let res = builder.inst_results(call)[0];
+                             builder.def_var(vars[target_reg as usize], res);
+                        } else if let Some(&tgt_ptr) = self.fast_cache.get(&target_addr) {
+                             let tgt_ptr_val = tgt_ptr as usize as i64;
+                             let callee = builder.ins().iconst(types::I64, tgt_ptr_val);
+                             let mut sig = self.module.make_signature();
+                             sig.call_conv = isa::CallConv::Tail;
+                             for _ in 0..h.param_count { sig.params.push(AbiParam::new(cranelift_type)); }
+                             sig.returns.push(AbiParam::new(cranelift_type));
+                             let sig_ref = builder.import_signature(sig);
+                             let call = builder.ins().call_indirect(sig_ref, callee, &args);
+                             let res = builder.inst_results(call)[0];
+                             builder.def_var(vars[target_reg as usize], res);
+                        } else {
+                             if let Some(tgt_id) = self.compile_fast_internal(global_vars, prog, target_addr, target_end) {
+                                 let local_tgt = self.module.declare_func_in_func(tgt_id, &mut builder.func);
+                                 let call = builder.ins().call(local_tgt, &args);
+                                 let res = builder.inst_results(call)[0];
+                                 builder.def_var(vars[target_reg as usize], res);
+                             } else {
+                                 prog.cursor.set_position(original_pos);
+                                 return None;
+                             }
                         }
-                        tgt_sig.returns.push(AbiParam::new(cranelift_type));
-                        
-                        let tgt_id = self.module.declare_function(&tgt_name, Linkage::Local, &tgt_sig).ok()?;
-                        let local_tgt = self.module.declare_func_in_func(tgt_id, &mut builder.func);
-                        
-                        let call = builder.ins().call(local_tgt, &args);
-                        let res = builder.inst_results(call)[0];
-                        builder.def_var(vars[target_reg as usize], res);
                         const_funcs.remove(&(target_reg as usize));
                     },
                     Instr::Not => {
@@ -637,7 +834,7 @@ impl Jit {
                         let fused = false;
                         if let Some(next_op) = prog.read_opcode() {
                             if let Ok(Instr::Jump) = next_op[0].try_into() {
-                                let dist = match prog.read_int() { Some(v) => v, None => { println!("Read int failed (Not Jump)"); return None; } };
+                                let dist = prog.read_int().unwrap();
                                 let target = (prog.cursor.position() as i64 + dist) as u64;
                                 let fallthrough = prog.cursor.position();
                                 
@@ -682,7 +879,7 @@ impl Jit {
                         }
                     },
                     Instr::Jump => {
-                        let dist = match prog.read_int() { Some(v) => v, None => { println!("Read int failed (Jump)"); return None; } };
+                        let dist = prog.read_int().unwrap();
                         let target = (prog.cursor.position() as i64 + dist) as u64;
                         let target_block = blocks[&target];
                         
@@ -713,7 +910,7 @@ impl Jit {
                         break;
                     },
                     _ => {
-                        println!("Fast JIT: Unsupported instr {:?}", instr);
+                        println!("Fast JIT: Unsupported instr {:?} (in default arm)", instr);
                         prog.cursor.set_position(original_pos);
                         return None;
                     }
@@ -724,111 +921,14 @@ impl Jit {
         builder.seal_all_blocks();
         builder.finalize();
         
-        let id = match self.module.declare_function(&fast_name, Linkage::Local, &self.ctx.func.signature) {
-            Ok(id) => id,
-            Err(e) => { println!("Declare fast func failed: {}", e); return None; }
-        };
-        if let Err(e) = self.module.define_function(id, &mut self.ctx) {
-            println!("Define fast func failed: {}", e);
-            println!("{}", self.ctx.func.display());
+        if let Err(e) = self.module.define_function(fast_func_id, &mut ctx) {
+            println!("Define fast func failed: {:?}", e);
+            prog.cursor.set_position(original_pos);
             return None;
         }
-        self.module.clear_context(&mut self.ctx);
-        self.ctx.func.clear(); // Explicit clear
         
-        if let Err(e) = self.module.finalize_definitions() {
-             println!("Finalize definitions failed: {}", e);
-             return None;
-        }
-        let code_ptr = self.module.get_finalized_function(id);
-        
-        self.fast_cache.insert(start_addr, code_ptr);
-        
-        // Generate Wrapper
-        let mut wrapper_ctx = codegen::Context::new();
-        wrapper_ctx.func.signature.clear(self.module.isa().default_call_conv());
-        let ptr_type = self.module.target_config().pointer_type();
-        wrapper_ctx.func.signature.params.push(AbiParam::new(ptr_type)); // vm
-        wrapper_ctx.func.signature.params.push(AbiParam::new(ptr_type)); // prog
-        wrapper_ctx.func.signature.params.push(AbiParam::new(ptr_type)); // registers
-        
-        let mut builder = FunctionBuilder::new(&mut wrapper_ctx.func, &mut self.builder_context);
-        let entry = builder.create_block();
-        builder.append_block_params_for_function_params(entry);
-        builder.switch_to_block(entry);
-        
-        let regs_ptr = builder.block_params(entry)[2];
-        
-        let mut args = Vec::new();
-        for i in 0..header.param_count {
-             let offset = (i as i32) * 16 + 8;
-             let val = builder.ins().load(types::I64, MemFlags::trusted(), regs_ptr, offset);
-             let arg = if main_type == JitType::Float {
-                 builder.ins().bitcast(types::F64, MemFlags::new(), val)
-             } else {
-                 val
-             };
-             args.push(arg);
-        }
-        
-        let fast_ptr = code_ptr as usize as i64;
-        let callee = builder.ins().iconst(types::I64, fast_ptr);
-        
-        let mut sig = self.module.make_signature();
-        for _ in 0..header.param_count {
-            sig.params.push(AbiParam::new(cranelift_type));
-        }
-        sig.returns.push(AbiParam::new(cranelift_type));
-        
-        let sig_ref = builder.import_signature(sig);
-        
-        let call = builder.ins().call_indirect(sig_ref, callee, &args);
-        let res = builder.inst_results(call)[0];
-        
-        let res_reg = header.result_reg as i32;
-        let offset_tag = res_reg * 16;
-        let offset_data = res_reg * 16 + 8;
-        
-        let tag = if main_type == JitType::Float {
-            builder.ins().iconst(types::I8, 3) // Float tag
-        } else {
-            builder.ins().iconst(types::I8, 2) // Integer tag
-        };
-        
-        let res_store = if main_type == JitType::Float {
-            builder.ins().bitcast(types::I64, MemFlags::new(), res)
-        } else {
-            res
-        };
-        
-        builder.ins().store(MemFlags::trusted(), tag, regs_ptr, offset_tag);
-        builder.ins().store(MemFlags::trusted(), res_store, regs_ptr, offset_data);
-        
-        builder.ins().return_(&[]);
-        builder.seal_all_blocks();
-        builder.finalize();
-        
-        let wrapper_name = format!("wrapper_{}", start_addr);
-        let wrapper_id = match self.module.declare_function(&wrapper_name, Linkage::Local, &wrapper_ctx.func.signature) {
-            Ok(id) => {
-                id
-            },
-            Err(e) => { println!("Declare wrapper failed: {}", e); return None; }
-        };
-        if let Err(e) = self.module.define_function(wrapper_id, &mut wrapper_ctx) {
-            println!("Define wrapper failed: {:?}", e);
-            println!("{}", wrapper_ctx.func.display());
-            return None;
-        }
-        // self.module.clear_context(&mut self.ctx); // Not needed for local ctx
-        if let Err(e) = self.module.finalize_definitions() {
-             println!("Finalize wrapper failed: {}", e);
-             return None;
-        }
-        let wrapper_ptr = self.module.get_finalized_function(wrapper_id);
-
         prog.cursor.set_position(original_pos);
-        Some(wrapper_ptr)
+        Some(fast_func_id)
     }
 
     pub fn compile(&mut self, global_vars: &Vec<LispValue>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Result<fn(*mut Vm, *mut VirtualProgram, *mut LispValue), String> {
@@ -839,6 +939,7 @@ impl Jit {
         }
 
         if let Some(wrapper) = self.try_compile_fast(global_vars, prog, start_addr, end_addr) {
+            // println!("Fast JIT success for {}", start_addr);
             self.cache.insert(start_addr, wrapper);
             return Ok(unsafe { std::mem::transmute(wrapper) });
         }
@@ -2061,23 +2162,36 @@ unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, 
     
     let jit_code = jit_code_cell.map(|c| c.get()).unwrap_or(0);
     if jit_code != 0 {
-         let func: unsafe extern "C" fn(*mut Vm, *mut VirtualProgram, *mut LispValue) = std::mem::transmute(jit_code as *const u8);
-         func(vm, prog, vm.registers.as_mut_ptr().add(vm.window_start));
+         vm.tail_call_pending = true;
+         vm.next_jit_code = jit_code;
     } else {
          let end_addr = vm.scan_function_end(prog, address);
-         vm.run_jit_function(prog, address, end_addr);
-         
-         // Update cache in FunctionData
-         if let Some(cell) = jit_code_cell {
-             if let Some(&code) = vm.jit.cache.get(&address) {
-                 cell.set(code as u64);
+         if let Ok(func) = vm.jit.compile(&vm.global_vars, prog, address, end_addr) {
+             if let Some(cell) = jit_code_cell {
+                 if let Some(&code) = vm.jit.cache.get(&address) {
+                     cell.set(code as u64);
+                 }
              }
-         }
-         if let Some(cell) = fast_jit_code_cell {
-             if let Some(&code) = vm.jit.fast_cache.get(&address) {
-                 cell.set(code as u64);
+             if let Some(cell) = fast_jit_code_cell {
+                 if let Some(&code) = vm.jit.fast_cache.get(&address) {
+                     cell.set(code as u64);
+                 }
              }
+             
+             vm.tail_call_pending = true;
+             vm.next_jit_code = func as usize as u64;
+         } else {
+             println!("JIT compilation failed in call");
          }
+    }
+
+    while vm.tail_call_pending {
+        vm.tail_call_pending = false;
+        let code = vm.next_jit_code;
+        if code != 0 {
+             let func: unsafe extern "C" fn(*mut Vm, *mut VirtualProgram, *mut LispValue) = std::mem::transmute(code as *const u8);
+             func(vm, prog, vm.registers.as_mut_ptr().add(vm.window_start));
+        }
     }
     
     let state = vm.call_states.pop().unwrap();
@@ -2155,17 +2269,21 @@ unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut VirtualProg
 
     let jit_code = jit_code_cell.map(|c| c.get()).unwrap_or(0);
     if jit_code != 0 {
-         let func: unsafe extern "C" fn(*mut Vm, *mut VirtualProgram, *mut LispValue) = std::mem::transmute(jit_code as *const u8);
-         func(vm, prog, vm.registers.as_mut_ptr().add(vm.window_start));
+         vm.tail_call_pending = true;
+         vm.next_jit_code = jit_code;
     } else {
          let end_addr = vm.scan_function_end(prog, address);
-         vm.run_jit_function(prog, address, end_addr);
-         
-         // Update cache in FunctionData
-         if let Some(cell) = jit_code_cell {
-             if let Some(&code) = vm.jit.cache.get(&address) {
-                 cell.set(code as u64);
+         if let Ok(func) = vm.jit.compile(&vm.global_vars, prog, address, end_addr) {
+             if let Some(cell) = jit_code_cell {
+                 if let Some(&code) = vm.jit.cache.get(&address) {
+                     cell.set(code as u64);
+                 }
              }
+             
+             vm.tail_call_pending = true;
+             vm.next_jit_code = func as usize as u64;
+         } else {
+             println!("JIT compilation failed in tail call");
          }
     }
 }

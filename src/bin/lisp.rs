@@ -50,7 +50,9 @@ fn main() {
 
     let mut compiler = Compiler::new(generate_asm);
     let Ok(mut prog) = compiler.compile(&list.0, &list.1) else {
-        eprintln!("Compilation failed");
+        if let Err(e) = compiler.compile(&list.0, &list.1) {
+            eprintln!("Compilation failed: {}", e);
+        }
         return;
     };
 

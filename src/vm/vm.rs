@@ -100,19 +100,34 @@ pub struct Vm {
     pub jit: Jit,
     pub jit_enabled: bool,
     pub scratch_buffer: Vec<Value>,
+    pub tail_call_pending: bool,
+    pub next_jit_code: u64,
 }
 
 impl Vm {
     pub fn new(jit_enabled: bool) -> Vm {
         const EMPTY : Value = empty_value();
-        Vm {registers: vec![EMPTY; 64000], global_vars: Vec::new(), call_states: Vec::new(), window_start: 0, jit: Jit::new(), jit_enabled, scratch_buffer: Vec::with_capacity(32)}
+        Vm {registers: vec![EMPTY; 64000], global_vars: Vec::new(), call_states: Vec::new(), window_start: 0, jit: Jit::new(), jit_enabled, scratch_buffer: Vec::with_capacity(32), tail_call_pending: false, next_jit_code: 0}
     }
 
     pub fn run_jit_function(&mut self, prog: *mut VirtualProgram, start_addr: u64, end_addr: u64) {
         match self.jit.compile(&self.global_vars, unsafe { &mut *prog }, start_addr, end_addr) {
             Ok(func) => {
                 unsafe {
-                    func(self as *mut Vm, prog, self.registers.as_mut_ptr().add(self.window_start));
+                    let mut current_func = func;
+                    loop {
+                        current_func(self as *mut Vm, prog, self.registers.as_mut_ptr().add(self.window_start));
+                        if !self.tail_call_pending {
+                            break;
+                        }
+                        self.tail_call_pending = false;
+                        if self.next_jit_code != 0 {
+                            current_func = std::mem::transmute(self.next_jit_code as *const u8);
+                        } else {
+                            // Should not happen if tail_call_pending is true
+                            break;
+                        }
+                    }
                 }
             },
             Err(e) => {
