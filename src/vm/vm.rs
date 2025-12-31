@@ -109,7 +109,7 @@ impl Vm {
     }
 
     pub fn run_jit_function(&mut self, prog: *mut VirtualProgram, start_addr: u64, end_addr: u64) {
-        match self.jit.compile(unsafe { &mut *prog }, start_addr, end_addr) {
+        match self.jit.compile(&self.global_vars, unsafe { &mut *prog }, start_addr, end_addr) {
             Ok(func) => {
                 unsafe {
                     func(self as *mut Vm, prog, self.registers.as_mut_ptr().add(self.window_start));
@@ -332,7 +332,7 @@ impl Vm {
                     };
                     let func_addr = header_addr as usize + std::mem::size_of::<FunctionHeader>();
                     // eprintln!("LoadFuncRef: header_addr={}, func_addr={}", header_addr, func_addr);
-                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(Rc::new(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(0)})));
+                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(Rc::new(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(0), fast_jit_code: Cell::new(0)})));
                 },
                 Ok(Instr::CallSymbol) => {
                     let func_reg = opcode[1] as usize + self.window_start;

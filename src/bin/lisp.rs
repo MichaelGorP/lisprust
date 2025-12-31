@@ -49,8 +49,8 @@ fn main() {
     let list = parser.parse(&tokens).unwrap_or((SExpression::from(parser::Atom::Boolean(false)), parser::SourceMap::Leaf(0..0), 0));
 
     let mut compiler = Compiler::new(generate_asm);
-    println!("Value size: {}", std::mem::size_of::<lisp::vm::vp::Value>());
     let Ok(mut prog) = compiler.compile(&list.0, &list.1) else {
+        eprintln!("Compilation failed");
         return;
     };
 

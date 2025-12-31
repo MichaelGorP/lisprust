@@ -9,6 +9,12 @@ use cranelift_module::{DataDescription, Linkage, Module};
 use super::vp::{Value as LispValue, Instr, JumpCondition, VirtualProgram, FunctionHeader, FunctionData, HeapValue};
 use super::vm::Vm;
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum JitType {
+    Int,
+    Float,
+}
+
 // Constants for Value layout
 // Assumes #[repr(C, u8)] for Value enum
 const TAG_OFFSET: i32 = 0;
@@ -22,6 +28,8 @@ pub struct Jit {
     _data_ctx: DataDescription,
     module: JITModule,
     cache: HashMap<u64, *const u8>,
+    fast_cache: HashMap<u64, *const u8>,
+    signatures: HashMap<u64, (Vec<JitType>, JitType)>,
     pub function_map: Arc<Mutex<Vec<(usize, usize, String)>>>,
 }
 
@@ -30,6 +38,7 @@ impl Jit {
         let mut flag_builder = settings::builder();
         flag_builder.set("use_colocated_libcalls", "false").unwrap();
         flag_builder.set("is_pic", "false").unwrap();
+        flag_builder.set("opt_level", "speed").unwrap();
         let isa_builder = cranelift_native::builder().unwrap_or_else(|msg| {
             panic!("host machine is not supported: {}", msg);
         });
@@ -61,14 +70,783 @@ impl Jit {
             _data_ctx: DataDescription::new(),
             module,
             cache: HashMap::new(),
+            fast_cache: HashMap::new(),
+            signatures: HashMap::new(),
             function_map: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    pub fn compile(&mut self, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Result<fn(*mut Vm, *mut VirtualProgram, *mut LispValue), String> {
+    fn analyze_function(prog: &mut VirtualProgram, start_addr: u64, end_addr: u64, param_count: u8) -> Option<(Vec<JitType>, JitType, HashMap<usize, JitType>)> {
+        let original_pos = prog.cursor.position();
+        let mut has_float = false;
+        let mut defined_regs = HashSet::new();
+        let mut used_regs = HashSet::new();
+        
+        for i in 0..param_count {
+            defined_regs.insert(i as usize);
+        }
+        
+        let mut worklist = vec![start_addr];
+        let mut visited = HashSet::new();
+        
+        while let Some(addr) = worklist.pop() {
+            if visited.contains(&addr) { continue; }
+            visited.insert(addr);
+            
+            prog.cursor.set_position(addr);
+            
+            loop {
+                if prog.cursor.position() >= end_addr { break; }
+                let opcode = match prog.read_opcode() {
+                    Some(o) => o,
+                    None => break,
+                };
+                let instr: Instr = match opcode[0].try_into() {
+                    Ok(i) => i,
+                    Err(_) => break,
+                };
+                
+                match instr {
+                    Instr::LoadFloat => {
+                        has_float = true;
+                        prog.read_int();
+                        defined_regs.insert(opcode[1] as usize);
+                    },
+                    Instr::LoadInt | Instr::LoadString | Instr::LoadGlobal | Instr::Define => { 
+                        prog.read_int(); 
+                        defined_regs.insert(opcode[1] as usize);
+                    },
+                    Instr::LoadBool => {
+                        defined_regs.insert(opcode[1] as usize);
+                    },
+                    Instr::CopyReg => {
+                        used_regs.insert(opcode[2] as usize);
+                        defined_regs.insert(opcode[1] as usize);
+                    },
+                    Instr::Add | Instr::Sub | Instr::Mul | Instr::Div | Instr::Eq | Instr::Neq | Instr::Lt | Instr::Gt | Instr::Leq | Instr::Geq => {
+                        used_regs.insert(opcode[2] as usize);
+                        used_regs.insert(opcode[3] as usize);
+                        defined_regs.insert(opcode[1] as usize);
+                    },
+                    Instr::Not => {
+                        used_regs.insert(opcode[2] as usize);
+                        defined_regs.insert(opcode[1] as usize);
+                         // Check for fused jump
+                         let pos = prog.cursor.position();
+                         if let Some(next_op) = prog.read_opcode() {
+                             if let Ok(Instr::Jump) = next_op[0].try_into() {
+                                 let dist = prog.read_int().unwrap_or(0);
+                                 let target = (prog.cursor.position() as i64 + dist) as u64;
+                                 worklist.push(target);
+                                 // Jump is conditional (fused with Not), so we also fall through
+                             } else {
+                                 prog.cursor.set_position(pos);
+                             }
+                         }
+                    },
+                    Instr::Jump => { 
+                        let dist = prog.read_int().unwrap_or(0);
+                        let target = (prog.cursor.position() as i64 + dist) as u64;
+                        worklist.push(target);
+                        
+                        if opcode[2] == JumpCondition::Jump as u8 { // Unconditional
+                            break; // Stop scanning this block
+                        } else {
+                            // Conditional
+                            used_regs.insert(opcode[1] as usize);
+                        }
+                    },
+                    Instr::LoadFuncRef => { return None; },
+                    Instr::MakeClosure => { return None; },
+                    Instr::TailCallSymbol => {
+                        used_regs.insert(opcode[1] as usize);
+                        break; // Tail call ends block
+                    },
+                    Instr::CallSymbol | Instr::CallFunction => {
+                        used_regs.insert(opcode[1] as usize);
+                        defined_regs.insert(opcode[3] as usize);
+                    },
+                    Instr::Ret => {
+                        // Ret uses result_reg from header, but we don't have header here.
+                        // Assuming result_reg is defined.
+                        break;
+                    },
+                    _ => {}
+                }
+            }
+        }
+        
+        prog.cursor.set_position(original_pos);
+        
+        // Check for captures
+        for reg in used_regs {
+            if !defined_regs.contains(&reg) {
+                // println!("Analysis failed: Reg {} used but not defined (capture)", reg);
+                return None;
+            }
+        }
+        
+        let main_type = if has_float { JitType::Float } else { JitType::Int };
+        let reg_types = HashMap::new();
+        let mut params = Vec::new();
+        
+        for _ in 0..param_count {
+            params.push(main_type);
+        }
+        
+        Some((params, main_type, reg_types))
+    }
+
+    fn scan_function_end(prog: &mut VirtualProgram, start_addr: u64) -> u64 {
+        let original = prog.cursor.position();
+        prog.cursor.set_position(start_addr);
+        loop {
+            let opcode = match prog.read_opcode() {
+                Some(o) => o,
+                None => break,
+            };
+            let instr: Result<Instr, _> = opcode[0].try_into();
+            if let Ok(Instr::Ret) = instr {
+                // Ret marks the end of the function in this simple JIT.
+            }
+        }
+        
+        // Perform a basic block traversal to find the maximum reachable address.
+        let mut max_addr = start_addr;
+        let mut worklist = vec![start_addr];
+        let mut visited = HashSet::new();
+        
+        while let Some(addr) = worklist.pop() {
+            if visited.contains(&addr) { continue; }
+            visited.insert(addr);
+            if addr > max_addr { max_addr = addr; }
+            
+            prog.cursor.set_position(addr);
+            loop {
+                let pos = prog.cursor.position();
+                if pos > max_addr { max_addr = pos; }
+                
+                let opcode = match prog.read_opcode() {
+                    Some(o) => o,
+                    None => break,
+                };
+                let instr: Instr = match opcode[0].try_into() {
+                    Ok(i) => i,
+                    Err(_) => break,
+                };
+                
+                match instr {
+                    Instr::Jump => {
+                        let dist = prog.read_int().unwrap_or(0);
+                        let target = (prog.cursor.position() as i64 + dist) as u64;
+                        worklist.push(target);
+                        if opcode[2] == JumpCondition::Jump as u8 { break; }
+                    },
+                    Instr::Not => {
+                         if let Some(next) = prog.read_opcode() {
+                             if let Ok(Instr::Jump) = next[0].try_into() {
+                                 let dist = prog.read_int().unwrap_or(0);
+                                 let target = (prog.cursor.position() as i64 + dist) as u64;
+                                 worklist.push(target);
+                             } else {
+                                 prog.cursor.set_position(pos + 1 + 8); // Skip Not opcode + args
+                             }
+                         }
+                    },
+                    Instr::Ret => break,
+                    _ => {
+                        // Advance cursor
+                        match instr {
+                            Instr::LoadInt | Instr::LoadFloat | Instr::LoadGlobal | Instr::Define | Instr::LoadFuncRef => { prog.read_int(); },
+                            Instr::LoadString => { prog.read_string(); },
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        prog.cursor.set_position(original);
+        max_addr + 1 // Approximate
+    }
+
+    fn try_compile_fast(&mut self, global_vars: &Vec<LispValue>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Option<*const u8> {
+        if let Some(&code) = self.fast_cache.get(&start_addr) {
+            return Some(code);
+        }
+
+        let original_pos = prog.current_address();
+        let header_addr = start_addr - std::mem::size_of::<FunctionHeader>() as u64;
+        prog.cursor.set_position(header_addr);
+        let header = FunctionHeader::read(&mut prog.cursor);
+        
+        if header.param_count > 6 {
+            prog.cursor.set_position(original_pos);
+            return None;
+        }
+
+        // Analyze
+        let (param_types, main_type, _) = match Self::analyze_function(prog, start_addr, end_addr, header.param_count) {
+            Some(res) => res,
+            None => {
+                println!("Analysis failed for fast JIT");
+                prog.cursor.set_position(original_pos);
+                return None;
+            }
+        };
+        self.signatures.insert(start_addr, (param_types.clone(), main_type));
+
+        let cranelift_type = match main_type {
+            JitType::Int => types::I64,
+            JitType::Float => types::F64,
+        };
+
+        self.module.clear_context(&mut self.ctx);
+        self.ctx.func.signature.clear(self.module.isa().default_call_conv());
+        
+        for _ in 0..header.param_count {
+            self.ctx.func.signature.params.push(AbiParam::new(cranelift_type));
+        }
+        self.ctx.func.signature.returns.push(AbiParam::new(cranelift_type));
+        
+        let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_context);
+        
+        let entry_block = builder.create_block();
+        builder.append_block_params_for_function_params(entry_block);
+        
+        builder.switch_to_block(entry_block);
+        
+        let mut vars = Vec::new();
+        for i in 0..header.register_count {
+            let var = Variable::new(i as usize);
+            builder.declare_var(var, cranelift_type);
+            vars.push(var);
+        }
+
+        for i in 0..header.param_count {
+            let val = builder.block_params(entry_block)[i as usize];
+            builder.def_var(vars[i as usize], val);
+        }
+        
+        let body_block = builder.create_block();
+        builder.ins().jump(body_block, &[]);
+
+        let mut sig = self.module.make_signature();
+        for _ in 0..header.param_count {
+            sig.params.push(AbiParam::new(cranelift_type));
+        }
+        sig.returns.push(AbiParam::new(cranelift_type));
+        
+        let fast_name = format!("fast_{}", start_addr);
+        let fast_func_id = match self.module.declare_function(&fast_name, Linkage::Local, &sig) {
+            Ok(id) => {
+                id
+            },
+            Err(e) => { println!("Declare func failed: {}", e); return None; }
+        };
+        let _local_fast_func = self.module.declare_func_in_func(fast_func_id, &mut builder.func);
+
+        let mut blocks = HashMap::new();
+        blocks.insert(start_addr, body_block);
+        
+        let mut worklist = vec![start_addr];
+        let mut visited = HashSet::new();
+        
+        while let Some(addr) = worklist.pop() {
+            if visited.contains(&addr) { continue; }
+            visited.insert(addr);
+            
+            prog.cursor.set_position(addr);
+            loop {
+                if prog.cursor.position() >= end_addr { break; }
+                let opcode = match prog.read_opcode() {
+                    Some(o) => o,
+                    None => { println!("Read opcode failed"); return None; }
+                };
+                let instr: Instr = match opcode[0].try_into() {
+                    Ok(i) => i,
+                    Err(_) => { println!("Invalid opcode {}", opcode[0]); return None; }
+                };
+                
+                match instr {
+                    Instr::Jump => {
+                        let dist = prog.read_int()?;
+                        let target = (prog.cursor.position() as i64 + dist) as u64;
+                        if !blocks.contains_key(&target) {
+                            blocks.insert(target, builder.create_block());
+                            worklist.push(target);
+                        }
+                        if opcode[2] != JumpCondition::Jump as u8 {
+                             let fallthrough = prog.cursor.position();
+                             if !blocks.contains_key(&fallthrough) {
+                                 blocks.insert(fallthrough, builder.create_block());
+                                 worklist.push(fallthrough);
+                             }
+                        }
+                        if opcode[2] == JumpCondition::Jump as u8 {
+                            break;
+                        }
+                    },
+                    Instr::Not => {
+                        let pos = prog.cursor.position();
+                        if let Some(next_op) = prog.read_opcode() {
+                            if let Ok(Instr::Jump) = next_op[0].try_into() {
+                                let dist = prog.read_int()?;
+                                let target = (prog.cursor.position() as i64 + dist) as u64;
+                                let fallthrough = prog.cursor.position();
+                                
+                                if !blocks.contains_key(&target) {
+                                    blocks.insert(target, builder.create_block());
+                                    worklist.push(target);
+                                }
+                                if !blocks.contains_key(&fallthrough) {
+                                    blocks.insert(fallthrough, builder.create_block());
+                                    worklist.push(fallthrough);
+                                }
+                                break;
+                            }
+                        }
+                        prog.cursor.set_position(pos);
+                    },
+                    Instr::Ret => break,
+                    _ => {}
+                }
+            }
+        }
+        
+        let mut sorted_blocks: Vec<u64> = blocks.keys().cloned().collect();
+        sorted_blocks.sort();
+        
+        builder.seal_block(entry_block);
+
+        let mut const_funcs: HashMap<usize, u64> = HashMap::new();
+
+        for addr in sorted_blocks {
+            let block = blocks[&addr];
+            builder.switch_to_block(block);
+            
+            prog.cursor.set_position(addr);
+            
+            loop {
+                let current_pos = prog.cursor.position();
+                if current_pos != addr && blocks.contains_key(&current_pos) {
+                    let next_block = blocks[&current_pos];
+                    builder.ins().jump(next_block, &[]);
+                    break;
+                }
+
+                if prog.cursor.position() >= end_addr { break; }
+                let opcode = prog.read_opcode()?;
+                let instr: Instr = opcode[0].try_into().ok()?;
+                
+                match instr {
+                    Instr::LoadInt => {
+                        let val = match prog.read_int() { Some(v) => v, None => { println!("Read int failed"); return None; } };
+                        let v = if main_type == JitType::Float {
+                            builder.ins().f64const(val as f64)
+                        } else {
+                            builder.ins().iconst(types::I64, val)
+                        };
+                        builder.def_var(vars[opcode[1] as usize], v);
+                        const_funcs.remove(&(opcode[1] as usize));
+                    },
+                    Instr::LoadFloat => {
+                        let val = match prog.read_float() { Some(v) => v, None => { println!("Read float failed"); return None; } };
+                        let v = if main_type == JitType::Float {
+                            builder.ins().f64const(val)
+                        } else {
+                            builder.ins().iconst(types::I64, val as i64)
+                        };
+                        builder.def_var(vars[opcode[1] as usize], v);
+                        const_funcs.remove(&(opcode[1] as usize));
+                    },
+                    Instr::LoadBool => {
+                        let dest = opcode[1] as usize;
+                        let val = opcode[2] != 0;
+                        let v = if main_type == JitType::Float {
+                            builder.ins().f64const(if val { 1.0 } else { 0.0 })
+                        } else {
+                            builder.ins().iconst(types::I64, if val { 1 } else { 0 })
+                        };
+                        builder.def_var(vars[dest], v);
+                        const_funcs.remove(&dest);
+                    },
+                    Instr::CopyReg => {
+                        let v = builder.use_var(vars[opcode[2] as usize]);
+                        builder.def_var(vars[opcode[1] as usize], v);
+                        if let Some(&addr) = const_funcs.get(&(opcode[2] as usize)) {
+                            const_funcs.insert(opcode[1] as usize, addr);
+                        } else {
+                            const_funcs.remove(&(opcode[1] as usize));
+                        }
+                    },
+                    Instr::Add => {
+                        let v1 = builder.use_var(vars[opcode[2] as usize]);
+                        let v2 = builder.use_var(vars[opcode[3] as usize]);
+                        let res = if main_type == JitType::Float {
+                            builder.ins().fadd(v1, v2)
+                        } else {
+                            builder.ins().iadd(v1, v2)
+                        };
+                        builder.def_var(vars[opcode[1] as usize], res);
+                        const_funcs.remove(&(opcode[1] as usize));
+                    },
+                    Instr::Sub => {
+                        let v1 = builder.use_var(vars[opcode[2] as usize]);
+                        let v2 = builder.use_var(vars[opcode[3] as usize]);
+                        let res = if main_type == JitType::Float {
+                            builder.ins().fsub(v1, v2)
+                        } else {
+                            builder.ins().isub(v1, v2)
+                        };
+                        builder.def_var(vars[opcode[1] as usize], res);
+                        const_funcs.remove(&(opcode[1] as usize));
+                    },
+                    Instr::Mul => {
+                        let v1 = builder.use_var(vars[opcode[2] as usize]);
+                        let v2 = builder.use_var(vars[opcode[3] as usize]);
+                        let res = if main_type == JitType::Float {
+                            builder.ins().fmul(v1, v2)
+                        } else {
+                            builder.ins().imul(v1, v2)
+                        };
+                        builder.def_var(vars[opcode[1] as usize], res);
+                        const_funcs.remove(&(opcode[1] as usize));
+                    },
+                    Instr::Div => {
+                        let v1 = builder.use_var(vars[opcode[2] as usize]);
+                        let v2 = builder.use_var(vars[opcode[3] as usize]);
+                        let res = if main_type == JitType::Float {
+                            builder.ins().fdiv(v1, v2)
+                        } else {
+                            builder.ins().sdiv(v1, v2)
+                        };
+                        builder.def_var(vars[opcode[1] as usize], res);
+                        const_funcs.remove(&(opcode[1] as usize));
+                    },
+                    Instr::Lt => {
+                        let v1 = builder.use_var(vars[opcode[2] as usize]);
+                        let v2 = builder.use_var(vars[opcode[3] as usize]);
+                        let res = if main_type == JitType::Float {
+                            builder.ins().fcmp(FloatCC::LessThan, v1, v2)
+                        } else {
+                            builder.ins().icmp(IntCC::SignedLessThan, v1, v2)
+                        };
+                        let val = if main_type == JitType::Float {
+                            let b_int = builder.ins().uextend(types::I64, res);
+                            builder.ins().fcvt_from_uint(types::F64, b_int)
+                        } else {
+                            builder.ins().uextend(types::I64, res)
+                        };
+                        builder.def_var(vars[opcode[1] as usize], val);
+                        const_funcs.remove(&(opcode[1] as usize));
+                    },
+                    Instr::Gt => {
+                        let v1 = builder.use_var(vars[opcode[2] as usize]);
+                        let v2 = builder.use_var(vars[opcode[3] as usize]);
+                        let res = if main_type == JitType::Float {
+                            builder.ins().fcmp(FloatCC::GreaterThan, v1, v2)
+                        } else {
+                            builder.ins().icmp(IntCC::SignedGreaterThan, v1, v2)
+                        };
+                        let val = if main_type == JitType::Float {
+                            let b_int = builder.ins().uextend(types::I64, res);
+                            builder.ins().fcvt_from_uint(types::F64, b_int)
+                        } else {
+                            builder.ins().uextend(types::I64, res)
+                        };
+                        builder.def_var(vars[opcode[1] as usize], val);
+                        const_funcs.remove(&(opcode[1] as usize));
+                    },
+                    Instr::Eq => {
+                        let v1 = builder.use_var(vars[opcode[2] as usize]);
+                        let v2 = builder.use_var(vars[opcode[3] as usize]);
+                        let res = if main_type == JitType::Float {
+                            builder.ins().fcmp(FloatCC::Equal, v1, v2)
+                        } else {
+                            builder.ins().icmp(IntCC::Equal, v1, v2)
+                        };
+                        let val = if main_type == JitType::Float {
+                            let b_int = builder.ins().uextend(types::I64, res);
+                            builder.ins().fcvt_from_uint(types::F64, b_int)
+                        } else {
+                            builder.ins().uextend(types::I64, res)
+                        };
+                        builder.def_var(vars[opcode[1] as usize], val);
+                        const_funcs.remove(&(opcode[1] as usize));
+                    },
+                    Instr::LoadGlobal => {
+                        let sym_id = prog.read_int()?;
+                        if let Some(val) = global_vars.get(sym_id as usize) {
+                            if let Some(f) = val.as_func_ref() {
+                                const_funcs.insert(opcode[1] as usize, f.address);
+                            } else {
+                                const_funcs.remove(&(opcode[1] as usize));
+                            }
+                        }
+                    },
+                    Instr::CallSymbol => {
+                        let func_reg = opcode[1] as usize;
+                        let target_addr = if let Some(&addr) = const_funcs.get(&func_reg) {
+                            addr
+                        } else {
+                            prog.cursor.set_position(original_pos);
+                            return None;
+                        };
+
+                        // Analyze target
+                        let target_end = Self::scan_function_end(prog, target_addr);
+                        let h_addr = target_addr - std::mem::size_of::<FunctionHeader>() as u64;
+                        let pos = prog.cursor.position();
+                        prog.cursor.set_position(h_addr);
+                        let h = FunctionHeader::read(&mut prog.cursor);
+                        prog.cursor.set_position(pos);
+                        
+                        let (_, tgt_ret, _) = Self::analyze_function(prog, target_addr, target_end, h.param_count)?;
+                        
+                        if tgt_ret != main_type {
+                            prog.cursor.set_position(original_pos);
+                            return None;
+                        }
+                        
+                        let param_start = opcode[2];
+                        let target_reg = opcode[3];
+                        
+                        let mut args = Vec::new();
+                        for i in 0..h.param_count {
+                            let arg_reg = param_start + i;
+                            args.push(builder.use_var(vars[arg_reg as usize]));
+                        }
+                        
+                        let tgt_name = format!("fast_{}", target_addr);
+                        let mut tgt_sig = self.module.make_signature();
+                        for _ in 0..h.param_count {
+                            tgt_sig.params.push(AbiParam::new(cranelift_type));
+                        }
+                        tgt_sig.returns.push(AbiParam::new(cranelift_type));
+                        
+                        let tgt_id = self.module.declare_function(&tgt_name, Linkage::Local, &tgt_sig).ok()?;
+                        let local_tgt = self.module.declare_func_in_func(tgt_id, &mut builder.func);
+                        
+                        let call = builder.ins().call(local_tgt, &args);
+                        let res = builder.inst_results(call)[0];
+                        builder.def_var(vars[target_reg as usize], res);
+                        const_funcs.remove(&(target_reg as usize));
+                    },
+                    Instr::Not => {
+                        let pos = prog.cursor.position();
+                        let fused = false;
+                        if let Some(next_op) = prog.read_opcode() {
+                            if let Ok(Instr::Jump) = next_op[0].try_into() {
+                                let dist = match prog.read_int() { Some(v) => v, None => { println!("Read int failed (Not Jump)"); return None; } };
+                                let target = (prog.cursor.position() as i64 + dist) as u64;
+                                let fallthrough = prog.cursor.position();
+                                
+                                let cond_val = builder.use_var(vars[opcode[2] as usize]);
+                                let cond_bool = if main_type == JitType::Float {
+                                    let zero = builder.ins().f64const(0.0);
+                                    builder.ins().fcmp(FloatCC::NotEqual, cond_val, zero)
+                                } else {
+                                    builder.ins().icmp_imm(IntCC::NotEqual, cond_val, 0)
+                                };
+                                let not_cond = builder.ins().bnot(cond_bool);
+                                
+                                let target_block = blocks[&target];
+                                let fallthrough_block = blocks[&fallthrough];
+                                
+                                if next_op[2] == JumpCondition::JumpTrue as u8 {
+                                    builder.ins().brif(not_cond, target_block, &[], fallthrough_block, &[]);
+                                } else {
+                                    builder.ins().brif(not_cond, fallthrough_block, &[], target_block, &[]);
+                                }
+                                
+                                break;
+                            }
+                        }
+                        if !fused {
+                            prog.cursor.set_position(pos);
+                            let v = builder.use_var(vars[opcode[2] as usize]);
+                            let b = if main_type == JitType::Float {
+                                let zero = builder.ins().f64const(0.0);
+                                builder.ins().fcmp(FloatCC::Equal, v, zero)
+                            } else {
+                                builder.ins().icmp_imm(IntCC::Equal, v, 0)
+                            };
+                            let res = if main_type == JitType::Float {
+                                let b_int = builder.ins().uextend(types::I64, b);
+                                builder.ins().fcvt_from_uint(types::F64, b_int)
+                            } else {
+                                builder.ins().uextend(types::I64, b)
+                            };
+                            builder.def_var(vars[opcode[1] as usize], res);
+                            const_funcs.remove(&(opcode[1] as usize));
+                        }
+                    },
+                    Instr::Jump => {
+                        let dist = match prog.read_int() { Some(v) => v, None => { println!("Read int failed (Jump)"); return None; } };
+                        let target = (prog.cursor.position() as i64 + dist) as u64;
+                        let target_block = blocks[&target];
+                        
+                        if opcode[2] == JumpCondition::Jump as u8 {
+                            builder.ins().jump(target_block, &[]);
+                        } else {
+                            let v = builder.use_var(vars[opcode[1] as usize]);
+                            let cond = if main_type == JitType::Float {
+                                let zero = builder.ins().f64const(0.0);
+                                builder.ins().fcmp(FloatCC::NotEqual, v, zero)
+                            } else {
+                                builder.ins().icmp_imm(IntCC::NotEqual, v, 0)
+                            };
+                            let fallthrough = prog.cursor.position();
+                            let fallthrough_block = blocks[&fallthrough];
+                            
+                            if opcode[2] == JumpCondition::JumpTrue as u8 {
+                                builder.ins().brif(cond, target_block, &[], fallthrough_block, &[]);
+                            } else {
+                                builder.ins().brif(cond, fallthrough_block, &[], target_block, &[]);
+                            }
+                        }
+                        break;
+                    },
+                    Instr::Ret => {
+                        let res = builder.use_var(vars[header.result_reg as usize]);
+                        builder.ins().return_(&[res]);
+                        break;
+                    },
+                    _ => {
+                        println!("Fast JIT: Unsupported instr {:?}", instr);
+                        prog.cursor.set_position(original_pos);
+                        return None;
+                    }
+                }
+            }
+        }
+        
+        builder.seal_all_blocks();
+        builder.finalize();
+        
+        let id = match self.module.declare_function(&fast_name, Linkage::Local, &self.ctx.func.signature) {
+            Ok(id) => id,
+            Err(e) => { println!("Declare fast func failed: {}", e); return None; }
+        };
+        if let Err(e) = self.module.define_function(id, &mut self.ctx) {
+            println!("Define fast func failed: {}", e);
+            println!("{}", self.ctx.func.display());
+            return None;
+        }
+        self.module.clear_context(&mut self.ctx);
+        self.ctx.func.clear(); // Explicit clear
+        
+        if let Err(e) = self.module.finalize_definitions() {
+             println!("Finalize definitions failed: {}", e);
+             return None;
+        }
+        let code_ptr = self.module.get_finalized_function(id);
+        
+        self.fast_cache.insert(start_addr, code_ptr);
+        
+        // Generate Wrapper
+        let mut wrapper_ctx = codegen::Context::new();
+        wrapper_ctx.func.signature.clear(self.module.isa().default_call_conv());
+        let ptr_type = self.module.target_config().pointer_type();
+        wrapper_ctx.func.signature.params.push(AbiParam::new(ptr_type)); // vm
+        wrapper_ctx.func.signature.params.push(AbiParam::new(ptr_type)); // prog
+        wrapper_ctx.func.signature.params.push(AbiParam::new(ptr_type)); // registers
+        
+        let mut builder = FunctionBuilder::new(&mut wrapper_ctx.func, &mut self.builder_context);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        
+        let regs_ptr = builder.block_params(entry)[2];
+        
+        let mut args = Vec::new();
+        for i in 0..header.param_count {
+             let offset = (i as i32) * 16 + 8;
+             let val = builder.ins().load(types::I64, MemFlags::trusted(), regs_ptr, offset);
+             let arg = if main_type == JitType::Float {
+                 builder.ins().bitcast(types::F64, MemFlags::new(), val)
+             } else {
+                 val
+             };
+             args.push(arg);
+        }
+        
+        let fast_ptr = code_ptr as usize as i64;
+        let callee = builder.ins().iconst(types::I64, fast_ptr);
+        
+        let mut sig = self.module.make_signature();
+        for _ in 0..header.param_count {
+            sig.params.push(AbiParam::new(cranelift_type));
+        }
+        sig.returns.push(AbiParam::new(cranelift_type));
+        
+        let sig_ref = builder.import_signature(sig);
+        
+        let call = builder.ins().call_indirect(sig_ref, callee, &args);
+        let res = builder.inst_results(call)[0];
+        
+        let res_reg = header.result_reg as i32;
+        let offset_tag = res_reg * 16;
+        let offset_data = res_reg * 16 + 8;
+        
+        let tag = if main_type == JitType::Float {
+            builder.ins().iconst(types::I8, 3) // Float tag
+        } else {
+            builder.ins().iconst(types::I8, 2) // Integer tag
+        };
+        
+        let res_store = if main_type == JitType::Float {
+            builder.ins().bitcast(types::I64, MemFlags::new(), res)
+        } else {
+            res
+        };
+        
+        builder.ins().store(MemFlags::trusted(), tag, regs_ptr, offset_tag);
+        builder.ins().store(MemFlags::trusted(), res_store, regs_ptr, offset_data);
+        
+        builder.ins().return_(&[]);
+        builder.seal_all_blocks();
+        builder.finalize();
+        
+        let wrapper_name = format!("wrapper_{}", start_addr);
+        let wrapper_id = match self.module.declare_function(&wrapper_name, Linkage::Local, &wrapper_ctx.func.signature) {
+            Ok(id) => {
+                id
+            },
+            Err(e) => { println!("Declare wrapper failed: {}", e); return None; }
+        };
+        if let Err(e) = self.module.define_function(wrapper_id, &mut wrapper_ctx) {
+            println!("Define wrapper failed: {:?}", e);
+            println!("{}", wrapper_ctx.func.display());
+            return None;
+        }
+        // self.module.clear_context(&mut self.ctx); // Not needed for local ctx
+        if let Err(e) = self.module.finalize_definitions() {
+             println!("Finalize wrapper failed: {}", e);
+             return None;
+        }
+        let wrapper_ptr = self.module.get_finalized_function(wrapper_id);
+
+        prog.cursor.set_position(original_pos);
+        Some(wrapper_ptr)
+    }
+
+    pub fn compile(&mut self, global_vars: &Vec<LispValue>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Result<fn(*mut Vm, *mut VirtualProgram, *mut LispValue), String> {
+        self.module.clear_context(&mut self.ctx);
+        
         if let Some(&code) = self.cache.get(&start_addr) {
             return Ok(unsafe { std::mem::transmute(code) });
         }
+
+        if let Some(wrapper) = self.try_compile_fast(global_vars, prog, start_addr, end_addr) {
+            self.cache.insert(start_addr, wrapper);
+            return Ok(unsafe { std::mem::transmute(wrapper) });
+        }
+
+        // Clear context if Fast JIT failed, as it might have left partial state
+        self.module.clear_context(&mut self.ctx);
+        self.ctx.func.signature.clear(self.module.isa().default_call_conv());
+        self.builder_context = FunctionBuilderContext::new();
 
         // Define signature: fn(*mut Vm, *mut VirtualProgram, *mut LispValue) -> ()
         let ptr_type = self.module.target_config().pointer_type();
@@ -443,6 +1221,21 @@ impl Jit {
                     
                     is_terminated = false;
                 },
+                Instr::LoadBool => {
+                    let dest_reg = opcode[1] as i64;
+                    let val = opcode[2] != 0;
+                    
+                    let val_size = std::mem::size_of::<LispValue>() as i64;
+                    let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
+                    
+                    let const_tag = builder.ins().iconst(types::I8, 1); // Value::Boolean
+                    let val_const = builder.ins().iconst(types::I64, if val { 1 } else { 0 });
+                    
+                    builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
+                    builder.ins().store(MemFlags::trusted(), val_const, dest_ptr, DATA_OFFSET);
+                    
+                    is_terminated = false;
+                },
                 Instr::LoadGlobal => {
                     let dest_reg = opcode[1] as i64;
                     let sym_id = prog.read_int().unwrap();
@@ -474,7 +1267,7 @@ impl Jit {
                     builder.ins().call(local_helper_load_func_ref, &[vm_ptr, prog_ptr, registers_ptr, dest_reg_const, header_addr_const]);
                     is_terminated = false;
                 },
-                Instr::CallSymbol => {
+                Instr::CallSymbol | Instr::CallFunction => {
                     let func_reg = opcode[1] as i64;
                     let param_start = opcode[2] as i64;
                     let target_reg = opcode[3] as i64;
@@ -1120,7 +1913,6 @@ unsafe extern "C" fn helper_op(vm: *mut Vm, _prog: *mut VirtualProgram, register
                     (LispValue::Float(lhs), LispValue::Float(rhs)) => *registers.add(res_reg) = LispValue::Float(lhs $op rhs),
                     (LispValue::Float(lhs), LispValue::Integer(rhs)) => *registers.add(res_reg) = LispValue::Float(lhs $op rhs as f64),
                     (_v1, _v2) => {
-                        // println!("DEBUG: Binary op failed: {:?} {:?} {:?}", opcode[0], v1, v2);
                     } 
                  }
             }
@@ -1173,7 +1965,6 @@ unsafe extern "C" fn helper_op(vm: *mut Vm, _prog: *mut VirtualProgram, register
              *registers.add(dest_reg) = val;
         },
         _ => {
-            // println!("JIT helper: Unimplemented op {:?}", opcode[0]);
         }
     }
 }
@@ -1206,7 +1997,6 @@ unsafe extern "C" fn helper_load_global(vm: *mut Vm, registers: *mut LispValue, 
 unsafe extern "C" fn helper_define(vm: *mut Vm, registers: *mut LispValue, src_reg: usize, sym_id: i64) {
     let vm = &mut *vm;
     let val = (*registers.add(src_reg)).clone();
-    // println!("DEBUG: Define sym {} = {:?}", sym_id, val);
     if sym_id as usize >= vm.global_vars.len() {
         vm.global_vars.resize(sym_id as usize + 1, LispValue::Empty);
     }
@@ -1220,7 +2010,7 @@ unsafe extern "C" fn helper_load_func_ref(vm: *mut Vm, prog: *mut VirtualProgram
     let func_addr = header_addr as usize + std::mem::size_of::<FunctionHeader>();
     
     let jit_code = vm.jit.cache.get(&(func_addr as u64)).map(|&ptr| ptr as u64).unwrap_or(0);
-    *registers.add(dest_reg) = LispValue::Object(Rc::new(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(jit_code)})));
+    *registers.add(dest_reg) = LispValue::Object(Rc::new(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(jit_code), fast_jit_code: Cell::new(0)})));
 }
 
 unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, func_reg: usize, param_start: usize, target_reg: usize) {
@@ -1229,25 +2019,23 @@ unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, 
     
     let func = &*registers.add(func_reg);
     
-    let (header, address, captures, jit_code_cell) = if let Some(r) = func.as_ref() {
+    let (header, address, captures, jit_code_cell, fast_jit_code_cell) = if let Some(r) = func.as_ref() {
         // If it's in a RefCell, we can't safely get a reference to the Cell that outlives the borrow.
         // So we just return None for the cell, meaning we won't update the cache.
         let inner = r.borrow();
         if let Some(f) = inner.as_func_ref() {
-            (f.header, f.address, None, None)
+            (f.header, f.address, None, None, None)
         } else if let Some(c) = inner.as_closure() {
-            (c.function.header, c.function.address, Some(c.captures.clone()), None)
+            (c.function.header, c.function.address, Some(c.captures.clone()), None, None)
         } else {
-            // println!("DEBUG: CallSymbol failed: Not a function at reg {}: {:?}", func_reg, inner);
             return
         }
     } else {
         if let Some(f) = func.as_func_ref() {
-            (f.header, f.address, None, Some(&f.jit_code))
+            (f.header, f.address, None, Some(&f.jit_code), Some(&f.fast_jit_code))
         } else if let Some(c) = func.as_closure() {
-            (c.function.header, c.function.address, Some(c.captures.clone()), Some(&c.function.jit_code))
+            (c.function.header, c.function.address, Some(c.captures.clone()), Some(&c.function.jit_code), Some(&c.function.fast_jit_code))
         } else {
-            // println!("DEBUG: CallSymbol failed: Not a function at reg {}: {:?}", func_reg, func);
             return
         }
     };
@@ -1285,6 +2073,11 @@ unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, 
                  cell.set(code as u64);
              }
          }
+         if let Some(cell) = fast_jit_code_cell {
+             if let Some(&code) = vm.jit.fast_cache.get(&address) {
+                 cell.set(code as u64);
+             }
+         }
     }
     
     let state = vm.call_states.pop().unwrap();
@@ -1295,8 +2088,10 @@ unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, 
     vm.window_start = old_ws;
 }
 
+
 unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, func_reg: usize, param_start: usize) {
     let vm = &mut *vm;
+    let prog = &mut *prog;
     let prog = &mut *prog;
 
     let func = &*registers.add(func_reg);

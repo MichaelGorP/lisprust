@@ -119,7 +119,7 @@ impl FunctionHeader {
          unsafe { core::slice::from_raw_parts((self as *const FunctionHeader) as *const u8, std::mem::size_of::<FunctionHeader>()) }
     }
 
-    fn read(reader: &mut Cursor<Vec<u8>>) -> FunctionHeader {
+    pub fn read(reader: &mut Cursor<Vec<u8>>) -> FunctionHeader {
         let mut buf = [0; std::mem::size_of::<FunctionHeader>()];
         let _ = reader.read(&mut buf);
         let header: FunctionHeader = unsafe { std::mem::transmute(buf) };
@@ -133,7 +133,8 @@ impl FunctionHeader {
 pub struct FunctionData {
     pub header: FunctionHeader,
     pub address: u64,
-    pub jit_code: Cell<u64> // 0 if None
+    pub jit_code: Cell<u64>, // 0 if None
+    pub fast_jit_code: Cell<u64> // 0 if None
 }
 
 impl PartialEq for FunctionData {
@@ -234,7 +235,7 @@ pub type VmCallableFunction = fn(&[Value]) -> Value;
 #[derive(Clone)]
 pub struct VirtualProgram {
     listing: String,
-    cursor: Cursor<Vec<u8>>,
+    pub cursor: Cursor<Vec<u8>>,
     functions: Vec<VmCallableFunction>,
     result_reg: u8,
     pub source_map: Vec<(usize, Range<usize>)>,
