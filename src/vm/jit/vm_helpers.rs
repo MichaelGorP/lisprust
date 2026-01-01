@@ -1,5 +1,5 @@
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::cell::Cell;
+use gc::{Gc, GcCell};
 use crate::vm::vm::{Vm, CallState};
 use crate::vm::vp::{VirtualProgram, Value as LispValue, FunctionHeader, FunctionData, HeapValue, ClosureData, Instr};
 
@@ -101,14 +101,14 @@ pub unsafe extern "C" fn helper_op(vm: *mut Vm, prog: *mut VirtualProgram, regis
              let prog = &mut *prog;
              if let Some(s) = prog.read_string() {
                  let dest_reg = opcode[1] as usize;
-                 *registers.add(dest_reg) = LispValue::Object(Rc::new(HeapValue::String(s)));
+                 *registers.add(dest_reg) = LispValue::Object(Gc::new(HeapValue::String(s)));
              }
         },
         Ok(Instr::LoadSymbol) => {
              let prog = &mut *prog;
              if let Some(s) = prog.read_string() {
                  let dest_reg = opcode[1] as usize;
-                 *registers.add(dest_reg) = LispValue::Object(Rc::new(HeapValue::Symbol(s)));
+                 *registers.add(dest_reg) = LispValue::Object(Gc::new(HeapValue::Symbol(s)));
              }
         },
         Ok(Instr::LoadNil) => {
@@ -161,7 +161,7 @@ pub unsafe extern "C" fn helper_load_func_ref(vm: *mut Vm, prog: *mut VirtualPro
     let func_addr = header_addr as usize + std::mem::size_of::<FunctionHeader>();
     
     let jit_code = vm.jit.cache.get(&(func_addr as u64)).map(|&ptr| ptr as u64).unwrap_or(0);
-    *registers.add(dest_reg) = LispValue::Object(Rc::new(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(jit_code), fast_jit_code: Cell::new(0)})));
+    *registers.add(dest_reg) = LispValue::Object(Gc::new(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(jit_code), fast_jit_code: Cell::new(0)})));
 }
 
 pub unsafe extern "C" fn helper_call_function(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, start_reg: usize, reg_count: usize, func_id: i64) {
@@ -369,7 +369,7 @@ pub unsafe extern "C" fn helper_make_closure(_vm: *mut Vm, prog: *mut VirtualPro
     if let Some(fd) = func_val.as_func_ref() {
         // Avoid cloning FunctionData if possible, but it's small (copy)
         // The main cost is Rc allocation for ClosureData
-        *registers.add(dest_reg) = LispValue::Object(Rc::new(HeapValue::Closure(ClosureData{function: fd.clone(), captures})));
+        *registers.add(dest_reg) = LispValue::Object(Gc::new(HeapValue::Closure(ClosureData{function: fd.clone(), captures})));
     } else {
         *registers.add(dest_reg) = LispValue::Empty;
     }
@@ -377,7 +377,7 @@ pub unsafe extern "C" fn helper_make_closure(_vm: *mut Vm, prog: *mut VirtualPro
 
 pub unsafe extern "C" fn helper_make_ref(_vm: *mut Vm, registers: *mut LispValue, dest_reg: usize) {
     let val = (*registers.add(dest_reg)).clone();
-    *registers.add(dest_reg) = LispValue::Object(Rc::new(HeapValue::Ref(RefCell::new(val))));
+    *registers.add(dest_reg) = LispValue::Object(Gc::new(HeapValue::Ref(GcCell::new(val))));
 }
 
 pub unsafe extern "C" fn helper_set_ref(_vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, src_reg: usize) {

@@ -1,5 +1,4 @@
-use std::rc::Rc;
-use std::cell::Cell;
+use gc::{Gc, GcCell};
 use super::{compiler::Compiler, vp::Value, vp::Pair, vp::HeapValue};
 
 pub fn register_functions(compiler: &mut Compiler) {
@@ -33,9 +32,9 @@ fn cons(args: &[Value]) -> Value {
     if args.len() != 2 {
         panic!("cons expects 2 arguments");
     }
-    Value::Object(Rc::new(HeapValue::Pair(Pair {
-        car: Cell::new(args[0].clone()),
-        cdr: Cell::new(args[1].clone()),
+    Value::Object(Gc::new(HeapValue::Pair(Pair {
+        car: GcCell::new(args[0].clone()),
+        cdr: GcCell::new(args[1].clone()),
     })))
 }
 
@@ -91,9 +90,9 @@ fn is_null(args: &[Value]) -> Value {
 fn list(args: &[Value]) -> Value {
     let mut result = Value::Empty;
     for val in args.iter().rev() {
-        result = Value::Object(Rc::new(HeapValue::Pair(Pair {
-            car: Cell::new(val.clone()),
-            cdr: Cell::new(result),
+        result = Value::Object(Gc::new(HeapValue::Pair(Pair {
+            car: GcCell::new(val.clone()),
+            cdr: GcCell::new(result),
         })));
     }
     result
@@ -149,9 +148,9 @@ fn append(args: &[Value]) -> Value {
         
         // Rebuild list with result as tail
         for val in elements.iter().rev() {
-            result = Value::Object(Rc::new(HeapValue::Pair(Pair {
-                car: Cell::new(val.clone()),
-                cdr: Cell::new(result),
+            result = Value::Object(Gc::new(HeapValue::Pair(Pair {
+                car: GcCell::new(val.clone()),
+                cdr: GcCell::new(result),
             })));
         }
     }
@@ -169,9 +168,9 @@ fn reverse(args: &[Value]) -> Value {
             Value::Empty => break,
             Value::Object(o) => match &*o {
                 HeapValue::Pair(p) => {
-                    result = Value::Object(Rc::new(HeapValue::Pair(Pair {
-                        car: Cell::new(p.get_car()),
-                        cdr: Cell::new(result),
+                    result = Value::Object(Gc::new(HeapValue::Pair(Pair {
+                        car: GcCell::new(p.get_car()),
+                        cdr: GcCell::new(result),
                     })));
                     current = p.get_cdr();
                 },
@@ -329,7 +328,7 @@ fn set_car(args: &[Value]) -> Value {
     match &args[0] {
         Value::Object(o) => match &**o {
             HeapValue::Pair(p) => {
-                p.car.set(args[1].clone());
+                *p.car.borrow_mut() = args[1].clone();
                 Value::Empty // or undefined
             },
             _ => panic!("set-car! expects a pair"),
@@ -343,7 +342,7 @@ fn set_cdr(args: &[Value]) -> Value {
     match &args[0] {
         Value::Object(o) => match &**o {
             HeapValue::Pair(p) => {
-                p.cdr.set(args[1].clone());
+                *p.cdr.borrow_mut() = args[1].clone();
                 Value::Empty
             },
             _ => panic!("set-cdr! expects a pair"),

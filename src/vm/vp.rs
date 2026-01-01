@@ -1,4 +1,5 @@
-use std::{cell::{Cell, RefCell}, io::{Cursor, Read}, mem::size_of, rc::{Rc}, ops::Range, collections::HashMap};
+use std::{cell::Cell, io::{Cursor, Read}, mem::size_of, ops::Range, collections::HashMap};
+use gc::{Gc, GcCell, Trace, Finalize};
 
 use enum_display::EnumDisplay;
 
@@ -141,6 +142,14 @@ pub struct FunctionData {
     pub fast_jit_code: Cell<u64> // 0 if None
 }
 
+impl Finalize for FunctionData {}
+unsafe impl Trace for FunctionData {
+    unsafe fn trace(&self) {}
+    unsafe fn root(&self) {}
+    unsafe fn unroot(&self) {}
+    fn finalize_glue(&self) { self.finalize(); }
+}
+
 impl PartialEq for FunctionData {
     fn eq(&self, other: &Self) -> bool {
         self.header == other.header && self.address == other.address
@@ -148,28 +157,47 @@ impl PartialEq for FunctionData {
 }
 
 pub struct Pair {
-    pub car: Cell<Value>,
-    pub cdr: Cell<Value>,
+    pub car: GcCell<Value>,
+    pub cdr: GcCell<Value>,
+}
+
+impl Finalize for Pair {}
+unsafe impl Trace for Pair {
+    unsafe fn trace(&self) {
+        self.car.trace();
+        self.cdr.trace();
+    }
+    unsafe fn root(&self) {
+        self.car.root();
+        self.cdr.root();
+    }
+    unsafe fn unroot(&self) {
+        self.car.unroot();
+        self.cdr.unroot();
+    }
+    fn finalize_glue(&self) {
+        self.finalize();
+        self.car.finalize_glue();
+        self.cdr.finalize_glue();
+    }
 }
 
 impl Clone for Pair {
     fn clone(&self) -> Self {
         Pair {
-            car: Cell::new(self.get_car()),
-            cdr: Cell::new(self.get_cdr()),
+            car: GcCell::new(self.get_car()),
+            cdr: GcCell::new(self.get_cdr()),
         }
     }
 }
 
 impl Pair {
     pub fn get_car(&self) -> Value {
-        let ptr = self.car.as_ptr();
-        unsafe { (*ptr).clone() }
+        self.car.borrow().clone()
     }
 
     pub fn get_cdr(&self) -> Value {
-        let ptr = self.cdr.as_ptr();
-        unsafe { (*ptr).clone() }
+        self.cdr.borrow().clone()
     }
 }
 
@@ -194,6 +222,27 @@ pub struct ClosureData {
     pub captures: Vec<Value>
 }
 
+impl Finalize for ClosureData {}
+unsafe impl Trace for ClosureData {
+    unsafe fn trace(&self) {
+        self.function.trace();
+        self.captures.trace();
+    }
+    unsafe fn root(&self) {
+        self.function.root();
+        self.captures.root();
+    }
+    unsafe fn unroot(&self) {
+        self.function.unroot();
+        self.captures.unroot();
+    }
+    fn finalize_glue(&self) {
+        self.finalize();
+        self.function.finalize_glue();
+        self.captures.finalize_glue();
+    }
+}
+
 #[derive(PartialEq, Clone, Debug)]
 pub enum HeapValue {
     String(String),
@@ -201,7 +250,48 @@ pub enum HeapValue {
     Pair(Pair),
     FuncRef(FunctionData),
     Closure(ClosureData),
-    Ref(RefCell<Value>)
+    Ref(GcCell<Value>)
+}
+
+impl Finalize for HeapValue {}
+unsafe impl Trace for HeapValue {
+    unsafe fn trace(&self) {
+        match self {
+            HeapValue::String(_) | HeapValue::Symbol(_) => {},
+            HeapValue::Pair(p) => p.trace(),
+            HeapValue::FuncRef(f) => f.trace(),
+            HeapValue::Closure(c) => c.trace(),
+            HeapValue::Ref(r) => r.trace(),
+        }
+    }
+    unsafe fn root(&self) {
+        match self {
+            HeapValue::String(_) | HeapValue::Symbol(_) => {},
+            HeapValue::Pair(p) => p.root(),
+            HeapValue::FuncRef(f) => f.root(),
+            HeapValue::Closure(c) => c.root(),
+            HeapValue::Ref(r) => r.root(),
+        }
+    }
+    unsafe fn unroot(&self) {
+        match self {
+            HeapValue::String(_) | HeapValue::Symbol(_) => {},
+            HeapValue::Pair(p) => p.unroot(),
+            HeapValue::FuncRef(f) => f.unroot(),
+            HeapValue::Closure(c) => c.unroot(),
+            HeapValue::Ref(r) => r.unroot(),
+        }
+    }
+    fn finalize_glue(&self) {
+        self.finalize();
+        match self {
+            HeapValue::String(_) | HeapValue::Symbol(_) => {},
+            HeapValue::Pair(p) => p.finalize_glue(),
+            HeapValue::FuncRef(f) => f.finalize_glue(),
+            HeapValue::Closure(c) => c.finalize_glue(),
+            HeapValue::Ref(r) => r.finalize_glue(),
+        }
+    }
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -211,7 +301,36 @@ pub enum Value {
     Boolean(bool),
     Integer(i64),
     Float(f64),
-    Object(Rc<HeapValue>)
+    Object(Gc<HeapValue>)
+}
+
+impl Finalize for Value {}
+unsafe impl Trace for Value {
+    unsafe fn trace(&self) {
+        match self {
+            Value::Object(o) => o.trace(),
+            _ => {}
+        }
+    }
+    unsafe fn root(&self) {
+        match self {
+            Value::Object(o) => o.root(),
+            _ => {}
+        }
+    }
+    unsafe fn unroot(&self) {
+        match self {
+            Value::Object(o) => o.unroot(),
+            _ => {}
+        }
+    }
+    fn finalize_glue(&self) {
+        self.finalize();
+        match self {
+            Value::Object(o) => o.finalize_glue(),
+            _ => {}
+        }
+    }
 }
 
 impl Value {
@@ -240,7 +359,7 @@ impl Value {
         None
     }
     
-    pub fn as_ref(&self) -> Option<&RefCell<Value>> {
+    pub fn as_ref(&self) -> Option<&GcCell<Value>> {
         if let Value::Object(o) = self {
             if let HeapValue::Ref(r) = &**o {
                 return Some(r);

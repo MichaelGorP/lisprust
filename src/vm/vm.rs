@@ -1,5 +1,5 @@
-use std::rc::Rc;
-use std::cell::{Cell, RefCell};
+use gc::{Gc, GcCell};
+use std::cell::Cell;
 use std::collections::HashSet;
 
 use crate::parser::{SExpression, Atom};
@@ -250,13 +250,13 @@ impl Vm {
                     let Some(val) = prog.read_string() else {
                         return None;
                     };
-                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(Rc::new(HeapValue::String(val)));
+                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(Gc::new(HeapValue::String(val)));
                 },
                 Ok(Instr::LoadSymbol) => {
                     let Some(val) = prog.read_string() else {
                         return None;
                     };
-                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(Rc::new(HeapValue::Symbol(val)));
+                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(Gc::new(HeapValue::Symbol(val)));
                 },
                 Ok(Instr::LoadNil) => {
                     self.registers[opcode[1] as usize + self.window_start] = Value::Empty;
@@ -356,7 +356,7 @@ impl Vm {
                     };
                     let func_addr = header_addr as usize + std::mem::size_of::<FunctionHeader>();
                     // eprintln!("LoadFuncRef: header_addr={}, func_addr={}", header_addr, func_addr);
-                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(Rc::new(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(0), fast_jit_code: Cell::new(0)})));
+                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(Gc::new(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(0), fast_jit_code: Cell::new(0)})));
                 },
                 Ok(Instr::CallSymbol) => {
                     let func_reg = opcode[1] as usize + self.window_start;
@@ -367,7 +367,7 @@ impl Vm {
                     } else if let Some(c) = resolved_func.as_closure() {
                         (c.function.header, c.function.address, Some(c.captures.clone()))
                     } else {
-                        break;
+                        return None;
                     };
 
                     let param_start = opcode[2];
@@ -412,7 +412,7 @@ impl Vm {
                     } else if let Some(c) = resolved_func.as_closure() {
                         (c.function.header, c.function.address, Some(c.captures.clone()))
                     } else {
-                        break;
+                        return None;
                     };
 
                     // eprintln!("TailCallSymbol: jumping to {}, param_count={}", address, header.param_count);
@@ -493,7 +493,7 @@ impl Vm {
                     let func_val = &self.registers[func_reg];
 
                     if let Some(fd) = func_val.as_func_ref() {
-                        self.registers[dest_reg] = Value::Object(Rc::new(HeapValue::Closure(ClosureData{function: fd.clone(), captures})));
+                        self.registers[dest_reg] = Value::Object(Gc::new(HeapValue::Closure(ClosureData{function: fd.clone(), captures})));
                     } else {
                         self.registers[dest_reg] = Value::Empty; 
                     }
@@ -501,7 +501,7 @@ impl Vm {
                 Ok(Instr::MakeRef) => {
                     let reg = opcode[1] as usize + self.window_start;
                     let val = self.registers[reg].clone();
-                    self.registers[reg] = Value::Object(Rc::new(HeapValue::Ref(RefCell::new(val))));
+                    self.registers[reg] = Value::Object(Gc::new(HeapValue::Ref(GcCell::new(val))));
                 },
                 Ok(Instr::SetRef) => {
                     let dest_reg = opcode[1] as usize + self.window_start;
