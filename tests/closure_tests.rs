@@ -1,11 +1,7 @@
 use lisp::parser::{SExpression, Atom};
 
 mod common;
-use common::{parse_and_exec, parse_compile_and_exec};
-
-fn compare_expr<T>(expr: SExpression, value: T) -> bool where T: Into<Atom> {
-    expr == <SExpression>::from(value)
-}
+use common::{parse_and_exec, parse_compile_and_exec, compare_expr};
 
 #[test]
 fn test_closure_as_argument() {

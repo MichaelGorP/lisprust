@@ -1,27 +1,8 @@
 
-use lisp::parser::{SExpression, Atom, Parser, SourceMap};
-use lisp::lexer;
-use lisp::vm::compiler::Compiler;
-use lisp::vm::math_functions;
-use lisp::vm::vm::Vm;
+use lisp::parser::{SExpression, Atom};
 
 mod common;
-use common::parse_and_exec;
-
-fn compare_expr<T>(expr: SExpression, value: T) -> bool where T: Into<Atom> {
-    expr == <SExpression>::from(value)
-}
-
-fn compile_and_run(prog: &str) -> Option<SExpression> {
-    let mut compiler = Compiler::new(false);
-    math_functions::register_functions(&mut compiler);
-    let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
-    let parser = Parser::new();
-    let (expr, map, _) = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), SourceMap::Leaf(0..0), 0));
-    let mut prog = compiler.compile(&expr, &map).unwrap();
-    let mut vm = Vm::new(false);
-    vm.run(&mut prog)
-}
+use common::{parse_and_exec, parse_and_exec_opt, compare_expr};
 
 #[test]
 fn test_binary_operations() {
@@ -125,10 +106,10 @@ fn test_let() {
 
 #[test]
 fn test_compiler_comparisons() {
-    let res = compile_and_run("(> 10 (+ 2 3) (* 2 2)))");
+    let res = parse_and_exec_opt("(> 10 (+ 2 3) (* 2 2)))");
     assert!(matches!(res, Some(SExpression::Atom(Atom::Boolean(true)))));
 
-    let res = compile_and_run("(< 4 (+ 2 3) (* 2 6)))");
+    let res = parse_and_exec_opt("(< 4 (+ 2 3) (* 2 6)))");
     assert!(matches!(res, Some(SExpression::Atom(Atom::Boolean(true)))));
 }
 
@@ -146,7 +127,7 @@ fn test_letrec_factorial() {
 
 #[test]
 fn test_let_negative_unbound() {
-    let res = compile_and_run("(let ((f (lambda () (g))) (g (lambda () (f)))) (f))");
+    let res = parse_and_exec_opt("(let ((f (lambda () (g))) (g (lambda () (f)))) (f))");
     assert!(matches!(res, None));
 }
 

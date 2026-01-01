@@ -2,11 +2,7 @@
 use lisp::parser::{SExpression, Atom};
 
 mod common;
-use common::{parse_compile_and_exec};
-
-fn compare_expr<T>(expr: SExpression, value: T) -> bool where T: Into<Atom> {
-    expr == <SExpression>::from(value)
-}
+use common::{parse_and_exec, compare_expr};
 
 #[test]
 fn test_let_shadowing() {
@@ -15,7 +11,7 @@ fn test_let_shadowing() {
       (let ((x 2))
         x))
     ";
-    let res = parse_compile_and_exec(prog, false);
+    let res = parse_and_exec(prog);
     assert!(compare_expr(res, 2));
 }
 
@@ -27,7 +23,7 @@ fn test_let_shadowing_outer_access() {
         (let ((x 2))
           y)))
     ";
-    let res = parse_compile_and_exec(prog, false);
+    let res = parse_and_exec(prog);
     assert!(compare_expr(res, 1));
 }
 
@@ -37,7 +33,7 @@ fn test_let_star_shadowing() {
     (let* ((x 1) (x 2))
       x)
     ";
-    let res = parse_compile_and_exec(prog, false);
+    let res = parse_and_exec(prog);
     assert!(compare_expr(res, 2));
 }
 
@@ -47,10 +43,11 @@ fn test_let_star_shadowing_reference() {
     (let* ((x 1) (y x) (x 2))
       y)
     ";
-    let res = parse_compile_and_exec(prog, false);
+    let res = parse_and_exec(prog);
     assert!(compare_expr(res, 1));
 }
 
+#[test]
 #[test]
 fn test_lambda_shadowing() {
     let prog = "
@@ -58,7 +55,7 @@ fn test_lambda_shadowing() {
        ((lambda (x) x) 2))
      1)
     ";
-    let res = parse_compile_and_exec(prog, false);
+    let res = parse_and_exec(prog);
     assert!(compare_expr(res, 2));
 }
 
@@ -70,7 +67,7 @@ fn test_internal_define_shadowing() {
       x))
     (f 1)
     ";
-    let res = parse_compile_and_exec(prog, false);
+    let res = parse_and_exec(prog);
     assert!(compare_expr(res, 2));
 }
 
@@ -83,7 +80,7 @@ fn test_mixed_shadowing() {
           x)))
       (f 2))
     ";
-    let res = parse_compile_and_exec(prog, false);
+    let res = parse_and_exec(prog);
     assert!(compare_expr(res, 3));
 }
 
@@ -95,7 +92,7 @@ fn test_recursion_shadowing_param() {
     (define g (lambda (g) g))
     (g 10)
     ";
-    let res = parse_compile_and_exec(prog, false);
+    let res = parse_and_exec(prog);
     assert!(compare_expr(res, 10));
 }
 
@@ -107,7 +104,7 @@ fn test_recursion_shadowing_let() {
         f)))
     (f 5)
     ";
-    let res = parse_compile_and_exec(prog, false);
+    let res = parse_and_exec(prog);
     assert!(compare_expr(res, 10));
 }
 
@@ -126,6 +123,6 @@ fn test_recursion_shadowing_let() {
         (f 4)
         ";
         // If this fails, it means we have let* semantics (sequential), not letrec.
-        let res = parse_compile_and_exec(prog, false);
+        let res = parse_and_exec(prog);
         assert!(compare_expr(res, true));
     }

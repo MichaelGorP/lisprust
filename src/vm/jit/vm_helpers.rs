@@ -146,6 +146,17 @@ pub unsafe extern "C" fn helper_load_func_ref(vm: *mut Vm, prog: *mut VirtualPro
     *registers.add(dest_reg) = LispValue::Object(Rc::new(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(jit_code), fast_jit_code: Cell::new(0)})));
 }
 
+pub unsafe extern "C" fn helper_call_function(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, start_reg: usize, reg_count: usize, func_id: i64) {
+    let vm = &mut *vm;
+    let prog = &mut *prog;
+    
+    let Some(function) = prog.get_function(func_id) else { return };
+    
+    let args = std::slice::from_raw_parts(registers.add(start_reg), reg_count);
+    let result = function(args);
+    *registers.add(dest_reg) = result;
+}
+
 pub unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, func_reg: usize, param_start: usize, target_reg: usize) {
     let vm = &mut *vm;
     let prog = &mut *prog;

@@ -9,6 +9,19 @@ pub fn parse_and_exec(prog: &str) -> SExpression {
     parse_compile_and_exec(prog, true)
 }
 
+pub fn parse_and_exec_opt(prog: &str) -> Option<SExpression> {
+    let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
+    let parser = Parser::new();
+    let (expr, map, _) = parser.parse(&tokens).unwrap_or((SExpression::Atom(Atom::Boolean(false)), SourceMap::Leaf(0..0), 0));
+
+    let mut compiler = Compiler::new(false);
+    math_functions::register_functions(&mut compiler);
+    list_functions::register_functions(&mut compiler);
+    let mut prog = compiler.compile(&expr, &map).unwrap();
+    let mut vm = Vm::new(false);
+    vm.run(&mut prog)
+}
+
 pub fn parse_compile_and_exec(prog: &str, use_jit: bool) -> SExpression {
     let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
     let parser = Parser::new();
@@ -35,4 +48,8 @@ pub fn parse_compile_and_exec(prog: &str, use_jit: bool) -> SExpression {
     }
     
     res
+}
+
+pub fn compare_expr<T>(expr: SExpression, value: T) -> bool where T: Into<Atom> {
+    expr == <SExpression>::from(value)
 }

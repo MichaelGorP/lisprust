@@ -553,12 +553,31 @@ fn value_to_sexpr(value: &Value) -> Option<SExpression> {
         Value::Float(f) => Some(SExpression::Atom(Atom::Float(*f))),
         Value::Object(o) => match &**o {
             HeapValue::String(s) => Some(SExpression::Atom(Atom::String(s.clone()))),
-            HeapValue::List(l) => {
-                let mut expressions = Vec::with_capacity(l.len());
-                let data_ref = l.values();
-                for value in &data_ref[l.offset() .. l.offset() + l.len()] {
-                    let sexpr = value_to_sexpr(value);
-                    expressions.push(sexpr.unwrap_or(SExpression::Atom(Atom::Integer(0))));
+            HeapValue::Pair(_) => {
+                let mut expressions = Vec::new();
+                let mut current = Value::Object(o.clone());
+                loop {
+                    match current {
+                        Value::Empty => break,
+                        Value::Object(obj) => match &*obj {
+                            HeapValue::Pair(pair) => {
+                                let car = pair.car.borrow();
+                                let sexpr = value_to_sexpr(&*car);
+                                expressions.push(sexpr.unwrap_or(SExpression::Atom(Atom::Integer(0))));
+                                current = pair.cdr.borrow().clone();
+                            },
+                            _ => {
+                                let sexpr = value_to_sexpr(&Value::Object(obj.clone()));
+                                expressions.push(sexpr.unwrap_or(SExpression::Atom(Atom::Integer(0))));
+                                break;
+                            }
+                        },
+                        _ => {
+                             let sexpr = value_to_sexpr(&current);
+                             expressions.push(sexpr.unwrap_or(SExpression::Atom(Atom::Integer(0))));
+                             break;
+                        }
+                    }
                 }
                 Some(SExpression::List(expressions))
             },

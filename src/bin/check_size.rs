@@ -25,10 +25,9 @@ impl PartialEq for FunctionData {
 }
 
 #[derive(PartialEq, Clone, Debug)]
-pub struct ListSlice {
-    data_ptr: Rc<RefCell<Vec<Value>>>,
-    offset: usize,
-    length: usize
+pub struct Pair {
+    pub car: RefCell<Value>,
+    pub cdr: RefCell<Value>,
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -40,7 +39,7 @@ pub struct ClosureData {
 #[derive(PartialEq, Clone, Debug)]
 pub enum HeapValue {
     String(String),
-    List(ListSlice),
+    Pair(Pair),
     FuncRef(FunctionData),
     Closure(ClosureData),
     Ref(RefCell<Value>)
@@ -59,7 +58,7 @@ pub enum Value {
 fn main() {
     println!("Size of Value: {}", size_of::<Value>());
     println!("Size of HeapValue: {}", size_of::<HeapValue>());
-    println!("Size of ListSlice: {}", size_of::<ListSlice>());
+    println!("Size of Pair: {}", size_of::<Pair>());
     println!("Size of FunctionData: {}", size_of::<FunctionData>());
     
     println!("Align of Value: {}", std::mem::align_of::<Value>());

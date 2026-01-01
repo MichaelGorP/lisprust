@@ -57,6 +57,7 @@ impl Jit {
         builder.symbol("helper_set_ref", helper_set_ref as *const u8);
         builder.symbol("helper_deref", helper_deref as *const u8);
         builder.symbol("helper_get_registers_ptr", helper_get_registers_ptr as *const u8);
+        builder.symbol("helper_call_function", helper_call_function as *const u8);
 
         let module = JITModule::new(builder);
         
@@ -929,6 +930,17 @@ impl Jit {
         let callee_helper_get_registers_ptr = self.module.declare_function("helper_get_registers_ptr", Linkage::Import, &sig_helper_get_registers_ptr).map_err(|e| e.to_string())?;
         let local_helper_get_registers_ptr = self.module.declare_func_in_func(callee_helper_get_registers_ptr, &mut builder.func);
 
+        let mut sig_helper_call_function = self.module.make_signature();
+        sig_helper_call_function.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_call_function.params.push(AbiParam::new(ptr_type)); // prog
+        sig_helper_call_function.params.push(AbiParam::new(ptr_type)); // registers
+        sig_helper_call_function.params.push(AbiParam::new(types::I64)); // dest_reg
+        sig_helper_call_function.params.push(AbiParam::new(types::I64)); // start_reg
+        sig_helper_call_function.params.push(AbiParam::new(types::I64)); // reg_count
+        sig_helper_call_function.params.push(AbiParam::new(types::I64)); // func_id
+        let callee_helper_call_function = self.module.declare_function("helper_call_function", Linkage::Import, &sig_helper_call_function).map_err(|e| e.to_string())?;
+        let local_helper_call_function = self.module.declare_func_in_func(callee_helper_call_function, &mut builder.func);
+
         // --- PASS 2: Generate Code ---
         prog.jump_to(start_addr);
         
@@ -1113,7 +1125,7 @@ impl Jit {
                     builder.ins().call(local_helper_load_func_ref, &[vm_ptr, prog_ptr, registers_ptr, dest_reg_const, header_addr_const]);
                     is_terminated = false;
                 },
-                Instr::CallSymbol | Instr::CallFunction => {
+                Instr::CallSymbol => {
                     let func_reg = opcode[1] as i64;
                     let param_start = opcode[2] as i64;
                     let target_reg = opcode[3] as i64;
@@ -1128,6 +1140,43 @@ impl Jit {
                     let call_inst = builder.ins().call(local_helper_get_registers_ptr, &[vm_ptr]);
                     registers_ptr = builder.inst_results(call_inst)[0];
                     
+                    is_terminated = false;
+                },
+                Instr::CallFunction => {
+                    let dest_reg = opcode[1] as i64;
+                    let start_reg = opcode[2] as i64;
+                    let reg_count = opcode[3] as i64;
+                    
+                    // Skip func_id in JIT stream (it's read by helper)
+                    // Wait, helper reads it from prog. prog cursor must be at the right place.
+                    // But JIT compilation scans the code.
+                    // When running JIT code, `prog` cursor is NOT updated by JIT code unless we call helpers that do it.
+                    // `helper_call_function` reads from `prog`.
+                    // But `prog` passed to JIT is the same `prog`.
+                    // However, `prog.cursor` position during JIT execution?
+                    // JIT execution doesn't use `prog.cursor` for control flow (it uses jumps).
+                    // But helpers might use it.
+                    // `helper_call_function` reads `func_id`.
+                    // We need to ensure `prog.cursor` points to `func_id` when `helper_call_function` is called.
+                    // But `prog.cursor` is not maintained by JIT code!
+                    // JIT code is just machine code.
+                    
+                    // Solution: Pass `func_id` explicitly to helper?
+                    // But `helper_call_function` reads it from `prog`.
+                    // If I change `helper_call_function` to take `func_id`, I can pass it as constant.
+                    // `func_id` is in the bytecode stream. I can read it during compilation.
+                    
+                    let func_id = prog.read_int().unwrap();
+                    
+                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    let start_reg_const = builder.ins().iconst(types::I64, start_reg);
+                    let reg_count_const = builder.ins().iconst(types::I64, reg_count);
+                    let func_id_const = builder.ins().iconst(types::I64, func_id);
+                    
+                    // I need to update helper_call_function signature to take func_id
+                    // and NOT read from prog.
+                    
+                    builder.ins().call(local_helper_call_function, &[vm_ptr, prog_ptr, registers_ptr, dest_reg_const, start_reg_const, reg_count_const, func_id_const]);
                     is_terminated = false;
                 },
                 Instr::TailCallSymbol => {
