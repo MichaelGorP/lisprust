@@ -175,3 +175,62 @@ fn test_short_circuit_logic() {
     let res = parse_and_exec("(or false false true false)");
     assert!(compare_expr(res, true));
 }
+
+#[test]
+fn test_cond() {
+    let code = "
+    (cond ((= 1 1) 1)
+          (else 2))
+    ";
+    let res = parse_and_exec(code);
+    assert!(compare_expr(res, 1));
+
+    let code = "
+    (cond ((= 1 2) 1)
+          ((= 2 2) 2)
+          (else 3))
+    ";
+    let res = parse_and_exec(code);
+    assert!(compare_expr(res, 2));
+
+    let code = "
+    (cond ((= 1 2) 1)
+          ((= 2 3) 2)
+          (else 3))
+    ";
+    let res = parse_and_exec(code);
+    assert!(compare_expr(res, 3));
+    
+    let code = "(cond ((= 1 2) 1))";
+    let res = parse_and_exec(code);
+    assert!(compare_expr(res, false));
+}
+
+#[test]
+fn test_define_syntax() {
+    let code = "
+    (define (add a b) (+ a b))
+    (add 1 2)
+    ";
+    let res = parse_and_exec(code);
+    assert!(compare_expr(res, 3));
+
+    let code = "
+    (define (fact n)
+        (if (= n 0)
+            1
+            (* n (fact (- n 1)))))
+    (fact 5)
+    ";
+    let res = parse_and_exec(code);
+    assert!(compare_expr(res, 120));
+    
+    let code = "
+    (define (foo x)
+        (define y (+ x 1))
+        (+ x y))
+    (foo 10)
+    ";
+    let res = parse_and_exec(code);
+    assert!(compare_expr(res, 21));
+}

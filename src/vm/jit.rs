@@ -685,7 +685,6 @@ impl Jit {
         }
 
         if let Some(wrapper) = self.try_compile_fast(global_vars, prog, start_addr, end_addr) {
-            // println!("Fast JIT success for {}", start_addr);
             self.cache.insert(start_addr, wrapper);
             return Ok(unsafe { std::mem::transmute(wrapper) });
         }

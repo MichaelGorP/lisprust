@@ -257,6 +257,7 @@ fn compile_quoted_expr(compiler: &mut Compiler, expr: &SExpression) -> Result<u8
                 Instruction::Let => "let",
                 Instruction::LetStar => "let*",
                 Instruction::Letrec => "letrec",
+                Instruction::Cond => "cond",
                 Instruction::Not => "not",
                 Instruction::And => "and",
                 Instruction::Or => "or",

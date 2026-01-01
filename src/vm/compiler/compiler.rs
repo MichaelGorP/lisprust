@@ -215,8 +215,6 @@ impl<'a> Compiler<'a> {
                                     false
                                 };
                                 
-                                // println!("DEBUG: Recursion check for {}: is_tail={}, self_reg={:?}, found_sym={:?}, is_shadowed={}", s, is_tail, self_reg, self.scopes.find_symbol(s), is_shadowed);
-
                                 if !is_shadowed {
                                     is_recursive = true;
                                     target_addr = *addr;
@@ -270,7 +268,13 @@ impl<'a> Compiler<'a> {
                             // The VM handles unpacking captures from the closure object.
                             
                             let mut arg_regs = Vec::new();
-                            for (expr, sub_map) in list.iter().skip(1).zip(map_list.iter().skip(1)) {
+                            
+                            // Fix for map mismatch: if map_list is shorter than list (e.g. synthetic lambda), reuse last map or current map
+                            let dummy_map = self.current_map();
+                            let mut map_iter = map_list.iter().skip(1);
+                            
+                            for expr in list.iter().skip(1) {
+                                let sub_map = map_iter.next().unwrap_or(dummy_map);
                                 self.push_map(sub_map);
                                 let reg = self.compile_expr(expr, &[], false)?;
                                 self.pop_map();
@@ -383,7 +387,7 @@ impl<'a> Compiler<'a> {
             }
         }
         else {
-            Err(CompilationError::from("Empty list")) //TODO
+            Err(CompilationError::from("Illegal empty application"))
         }
     }
 
@@ -561,7 +565,6 @@ impl<'a> Compiler<'a> {
         // We want to jump from (jump_addr + 12) to pos.
         // dist = pos - (jump_addr + 12)
         let dist = pos - jump_addr - 12;
-        // println!("Compiling lambda: jump_addr={}, pos={}, dist={}", jump_addr, pos, dist);
         
         // Store distance at jump_addr + 4 (skipping OpCode)
         self.bytecode.store_and_reset_pos(jump_addr + 4, &dist.to_le_bytes());
@@ -592,6 +595,7 @@ impl<'a> Compiler<'a> {
             Instruction::Let => ops::bindings::compile_let(self, args, is_tail),
             Instruction::LetStar => ops::bindings::compile_let_star(self, args, is_tail),
             Instruction::Letrec => ops::bindings::compile_letrec(self, args, is_tail),
+            Instruction::Cond => ops::control::compile_cond(self, args, is_tail, 1),
             Instruction::Quote => ops::bindings::compile_quote(self, args),
             Instruction::And => ops::logic::compile_and(self, args, is_tail),
             Instruction::Or => ops::logic::compile_or(self, args, is_tail),

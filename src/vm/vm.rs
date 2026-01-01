@@ -170,7 +170,6 @@ impl Vm {
             loop {
                 let Some(opcode) = prog.read_opcode() else { break; };
                 let instr: Result<Instr, _> = opcode[0].try_into();
-                // eprintln!("Exec: {:?} {:?}", instr, opcode);
                 
                 match instr {
                     Ok(Instr::Jump) => {
@@ -226,9 +225,6 @@ impl Vm {
             let Some(opcode) = prog.read_opcode() else {
                 break;
             };
-            // let pc = prog.current_address() - 4;
-            // let instr: Result<Instr, _> = opcode[0].try_into();
-            // eprintln!("PC: {}, Instr: {:?}", pc, instr);
 
             match opcode[0].try_into() {
                 Ok(Instr::LoadInt) => {
@@ -275,7 +271,38 @@ impl Vm {
                 Ok(Instr::Sub) => binary_op!(self, opcode, -),
                 Ok(Instr::Mul) => binary_op!(self, opcode, *),
                 Ok(Instr::Div) => binary_op!(self, opcode, /),
-                Ok(Instr::Eq) => comparison_op!(self, opcode, prog, debugger, ==),
+                Ok(Instr::Eq) => {
+                    let v1 = self.resolve_value(&self.registers[opcode[2] as usize + self.window_start]);
+                    let v2 = self.resolve_value(&self.registers[opcode[3] as usize + self.window_start]);
+                    let res_reg = opcode[1] as usize + self.window_start;
+                    
+                    let matches = v1 == v2;
+                    self.registers[res_reg] = Value::Boolean(matches);
+
+                    if debugger.is_none() {
+                        if let Some(opcode) = prog.read_opcode() {
+                            if let Ok(Instr::Jump) = opcode[0].try_into() {
+                                if let Some(distance) = prog.read_int() {
+                                    if opcode[2] == JumpCondition::Jump as u8 {
+                                        prog.jump(distance);
+                                        continue;
+                                    }
+                                    let check = self.registers[opcode[1] as usize + self.window_start].is_true();
+                                    if (check && opcode[2] == JumpCondition::JumpTrue as u8) || (!check && opcode[2] == JumpCondition::JumpFalse as u8) {
+                                        prog.jump(distance);
+                                    }
+                                    continue;
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                prog.jump(-4);
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                },
                 Ok(Instr::Neq) => comparison_op!(self, opcode, prog, debugger, !=),
                 Ok(Instr::Lt) => comparison_op!(self, opcode, prog, debugger, <),
                 Ok(Instr::Gt) => comparison_op!(self, opcode, prog, debugger, >),
@@ -355,7 +382,6 @@ impl Vm {
                         break;
                     };
                     let func_addr = header_addr as usize + std::mem::size_of::<FunctionHeader>();
-                    // eprintln!("LoadFuncRef: header_addr={}, func_addr={}", header_addr, func_addr);
                     self.registers[opcode[1] as usize + self.window_start] = Value::Object(Gc::new(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(0), fast_jit_code: Cell::new(0)})));
                 },
                 Ok(Instr::CallSymbol) => {
@@ -415,8 +441,6 @@ impl Vm {
                         return None;
                     };
 
-                    // eprintln!("TailCallSymbol: jumping to {}, param_count={}", address, header.param_count);
-
                     let size = self.window_start + header.register_count as usize;
                     if size >= self.registers.len() {
                         self.registers.resize(size, empty_value());
@@ -449,7 +473,6 @@ impl Vm {
 
                     if self.jit_enabled {
                         let end_addr = self.scan_function_end(prog, address);
-                        // println!("Scanned end for {}: {}", address, end_addr);
                         self.run_jit_function(prog as *mut VirtualProgram, address, end_addr);
                         
                         // Simulate Ret

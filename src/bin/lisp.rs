@@ -7,6 +7,9 @@ use lisp::vm::compiler::Compiler;
 use lisp::vm::vm::Vm;
 use lisp::lexer;
 use lisp::parser;
+use lisp::vm::list_functions;
+use lisp::vm::math_functions;
+use lisp::vm::misc_functions;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -49,6 +52,9 @@ fn main() {
     let list = parser.parse(&tokens).unwrap_or((SExpression::from(parser::Atom::Boolean(false)), parser::SourceMap::Leaf(0..0), 0));
 
     let mut compiler = Compiler::new(generate_asm);
+    list_functions::register_functions(&mut compiler);
+    math_functions::register_functions(&mut compiler);
+    misc_functions::register_functions(&mut compiler);
     let Ok(mut prog) = compiler.compile(&list.0, &list.1) else {
         if let Err(e) = compiler.compile(&list.0, &list.1) {
             eprintln!("Compilation failed: {}", e);
@@ -77,8 +83,8 @@ fn main() {
         p.stop();
     }
 
-    if let Some(SExpression::Atom(lit)) = res {
-        println!("VM result: {}", lit)
+    if let Some(res) = res {
+        println!("VM result: {}", res)
     } else {
         println!("VM result: None");
     }

@@ -9,6 +9,7 @@ pub enum Instruction {
     Let,
     LetStar,
     Letrec,
+    Cond,
     Not,
     And,
     Or,
