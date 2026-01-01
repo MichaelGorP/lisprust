@@ -29,7 +29,7 @@ pub unsafe extern "C" fn helper_check_self_recursion(vm: *mut Vm, func_reg: usiz
     if address == start_addr { 1 } else { 0 }
 }
 
-pub unsafe extern "C" fn helper_op(vm: *mut Vm, _prog: *mut VirtualProgram, registers: *mut LispValue, opcode_val: u32) {
+pub unsafe extern "C" fn helper_op(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, opcode_val: u32) {
     let opcode = opcode_val.to_le_bytes();
     let vm = &mut *vm;
 
@@ -96,6 +96,24 @@ pub unsafe extern "C" fn helper_op(vm: *mut Vm, _prog: *mut VirtualProgram, regi
              let val = (*registers.add(src_reg)).clone();
 
              *registers.add(dest_reg) = val;
+        },
+        Ok(Instr::LoadString) => {
+             let prog = &mut *prog;
+             if let Some(s) = prog.read_string() {
+                 let dest_reg = opcode[1] as usize;
+                 *registers.add(dest_reg) = LispValue::Object(Rc::new(HeapValue::String(s)));
+             }
+        },
+        Ok(Instr::LoadSymbol) => {
+             let prog = &mut *prog;
+             if let Some(s) = prog.read_string() {
+                 let dest_reg = opcode[1] as usize;
+                 *registers.add(dest_reg) = LispValue::Object(Rc::new(HeapValue::Symbol(s)));
+             }
+        },
+        Ok(Instr::LoadNil) => {
+             let dest_reg = opcode[1] as usize;
+             *registers.add(dest_reg) = LispValue::Empty;
         },
         _ => {
         }

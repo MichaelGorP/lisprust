@@ -592,6 +592,7 @@ impl<'a> Compiler<'a> {
             Instruction::Let => ops::bindings::compile_let(self, args, is_tail),
             Instruction::LetStar => ops::bindings::compile_let_star(self, args, is_tail),
             Instruction::Letrec => ops::bindings::compile_letrec(self, args, is_tail),
+            Instruction::Quote => ops::bindings::compile_quote(self, args),
             Instruction::And => ops::logic::compile_and(self, args, is_tail),
             Instruction::Or => ops::logic::compile_or(self, args, is_tail),
             Instruction::Not => ops::logic::compile_not(self, args),

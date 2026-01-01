@@ -774,7 +774,7 @@ impl Jit {
                     Instr::LoadInt | Instr::LoadFloat | Instr::Define | Instr::LoadGlobal | Instr::LoadFuncRef => {
                         let _ = prog.read_int();
                     },
-                    Instr::LoadString => {
+                    Instr::LoadString | Instr::LoadSymbol => {
                         let _ = prog.read_string();
                     },
                     Instr::MakeClosure => {
@@ -987,7 +987,7 @@ impl Jit {
                     Instr::Jump | Instr::LoadInt | Instr::LoadGlobal | Instr::Define | Instr::LoadFuncRef | Instr::LoadFloat => {
                         prog.read_int().unwrap();
                     },
-                    Instr::LoadString => {
+                    Instr::LoadString | Instr::LoadSymbol => {
                         prog.read_string().unwrap();
                     },
                     Instr::MakeClosure => {
@@ -1698,7 +1698,7 @@ impl Jit {
                     // Advance cursor for arguments
                     match instr {
                         Instr::LoadFloat => { prog.read_int(); },
-                        Instr::LoadString => { prog.read_string(); },
+                        Instr::LoadString | Instr::LoadSymbol => { prog.read_string(); },
                         _ => {}
                     }
                     is_terminated = false;

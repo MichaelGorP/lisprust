@@ -39,6 +39,8 @@ pub enum Token {
     LParen,
     #[token(")")]
     RParen,
+    #[token("'")]
+    Quote,
     #[regex(r"[+-]?(0|[1-9][_0-9]*)", |lex| { lex.slice().parse() }, priority = 3)]
     Integer(i64),
     #[regex(r"(true|false|#t|#f)", |lex| {
@@ -52,7 +54,7 @@ pub enum Token {
     Float(f64),
     #[regex("\"*\"", |lex| lex.slice().parse())]
     String(String),
-    #[regex("[^ \\t\\r\\n\\f\"\\(\\)]+", |lex| lex.slice().parse())]
+    #[regex("[^ \\t\\r\\n\\f\"\\(\\)\']+", |lex| lex.slice().parse())]
     Symbol(String),
 }
 

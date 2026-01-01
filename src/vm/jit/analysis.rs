@@ -35,14 +35,18 @@ pub fn analyze_function(prog: &mut VirtualProgram, start_addr: u64, end_addr: u6
             match instr {
                 Instr::LoadFloat => {
                     has_float = true;
-                    prog.read_int();
+                    prog.read_float();
                     defined_regs.insert(opcode[1] as usize);
                 },
-                Instr::LoadInt | Instr::LoadString | Instr::LoadGlobal | Instr::Define => { 
+                Instr::LoadString | Instr::LoadSymbol => { 
+                    prog.read_string(); 
+                    defined_regs.insert(opcode[1] as usize);
+                },
+                Instr::LoadInt | Instr::LoadGlobal | Instr::Define => { 
                     prog.read_int(); 
                     defined_regs.insert(opcode[1] as usize);
                 },
-                Instr::LoadBool => {
+                Instr::LoadBool | Instr::LoadNil => {
                     defined_regs.insert(opcode[1] as usize);
                 },
                 Instr::CopyReg => {
@@ -187,7 +191,7 @@ pub fn scan_function_end(prog: &mut VirtualProgram, start_addr: u64) -> u64 {
                     // Advance cursor
                     match instr {
                         Instr::LoadInt | Instr::LoadFloat | Instr::LoadGlobal | Instr::Define | Instr::LoadFuncRef => { prog.read_int(); },
-                        Instr::LoadString => { prog.read_string(); },
+                        Instr::LoadString | Instr::LoadSymbol => { prog.read_string(); },
                         _ => {}
                     }
                 }

@@ -20,5 +20,6 @@ pub enum Instruction {
     Lt,
     Gt,
     Leq,
-    Geq
+    Geq,
+    Quote
 }

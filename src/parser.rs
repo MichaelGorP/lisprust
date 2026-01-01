@@ -111,7 +111,43 @@ impl Parser {
         parser.instructions.insert(">", instructions::Instruction::Gt);
         parser.instructions.insert("<=", instructions::Instruction::Leq);
         parser.instructions.insert(">=", instructions::Instruction::Geq);
+        parser.instructions.insert("quote", instructions::Instruction::Quote);
         parser
+    }
+
+    fn parse_single(&self, tokens: &[(Token, std::ops::Range<usize>)]) -> Result<(SExpression, SourceMap, usize), ParseError> {
+        if tokens.is_empty() {
+             return Err(ParseError{error: "Unexpected end of input".to_string()});
+        }
+        let (token, span) = &tokens[0];
+        let current_span = span.clone();
+        
+        match token {
+            Token::Integer(n) => Ok((SExpression::Atom(Atom::Integer(*n)), SourceMap::Leaf(current_span), 1)),
+            Token::Float(f) => Ok((SExpression::Atom(Atom::Float(*f)), SourceMap::Leaf(current_span), 1)),
+            Token::Boolean(b) => Ok((SExpression::Atom(Atom::Boolean(*b)), SourceMap::Leaf(current_span), 1)),
+            Token::String(s) => Ok((SExpression::Atom(Atom::String(s.clone())), SourceMap::Leaf(current_span), 1)),
+            Token::Symbol(s) => {
+                let it = self.instructions.get(s.as_str());
+                match it {
+                    Some(&instr) => Ok((SExpression::BuiltIn(instr), SourceMap::Leaf(current_span), 1)),
+                    None => Ok((SExpression::Symbol(s.clone()), SourceMap::Leaf(current_span), 1))
+                }
+            },
+            Token::Quote => {
+                let (expr, map, consumed) = self.parse_single(&tokens[1..])?;
+                let quote_sym = SExpression::BuiltIn(instructions::Instruction::Quote);
+                let list_expr = SExpression::List(vec![quote_sym, expr]);
+                let full_span = span.start..map.span().end;
+                let full_map = SourceMap::List(full_span, vec![SourceMap::Leaf(span.clone()), map]);
+                Ok((list_expr, full_map, consumed + 1))
+            },
+            Token::LParen => {
+                let (list_expr, map, consumed) = self.parse(&tokens[1..])?;
+                Ok((list_expr, map, consumed + 1))
+            },
+            Token::RParen => Err(ParseError{error: "Unexpected )".to_string()}),
+        }
     }
 
     pub fn parse(&self, tokens: &[(Token, std::ops::Range<usize>)]) -> Result<(SExpression, SourceMap, usize), ParseError> {
@@ -125,56 +161,15 @@ impl Parser {
         let start_span = tokens[0].1.start;
 
         while i < tokens.len() {
-            let (token, span) = &tokens[i];
-            let current_span = span.clone();
-            
-            match token {
-                Token::Integer(n) => {
-                    list.push(SExpression::Atom(Atom::Integer(*n)));
-                    map_list.push(SourceMap::Leaf(current_span));
-                },
-                Token::Float(f) => {
-                    list.push(SExpression::Atom(Atom::Float(*f)));
-                    map_list.push(SourceMap::Leaf(current_span));
-                },
-                Token::Boolean(b) => {
-                    list.push(SExpression::Atom(Atom::Boolean(*b)));
-                    map_list.push(SourceMap::Leaf(current_span));
-                },
-                Token::String(s) => {
-                    list.push(SExpression::Atom(Atom::String(s.clone())));
-                    map_list.push(SourceMap::Leaf(current_span));
-                },
-                Token::LParen => {
-                    let sub_list_res = self.parse(&tokens[i + 1..])?;
-                    let sub_list = sub_list_res.0;
-                    let sub_map = sub_list_res.1;
-                    let consumed = sub_list_res.2;
-                    
-                    list.push(sub_list);
-                    map_list.push(sub_map);
-
-                    i += consumed;
-                }
-                Token::RParen => { 
-                    let end_span = span.end;
-                    return Ok((SExpression::List(list), SourceMap::List(start_span..end_span, map_list), i + 1));
-                },
-                Token::Symbol(s) => {
-                    let it = self.instructions.get(s.as_str());
-                    match it {
-                        Some(&instr) => {
-                            list.push(SExpression::BuiltIn(instr));
-                            map_list.push(SourceMap::Leaf(current_span));
-                        },
-                        None => {
-                            list.push(SExpression::Symbol(s.clone()));
-                            map_list.push(SourceMap::Leaf(current_span));
-                        }
-                    }
-                }
+            if let Token::RParen = tokens[i].0 {
+                 let end_span = tokens[i].1.end;
+                 return Ok((SExpression::List(list), SourceMap::List(start_span..end_span, map_list), i + 1));
             }
-            i += 1;
+            
+            let (expr, map, consumed) = self.parse_single(&tokens[i..])?;
+            list.push(expr);
+            map_list.push(map);
+            i += consumed;
         }
         let end_span = if tokens.len() > 0 { tokens[tokens.len()-1].1.end } else { 0 };
         Ok((SExpression::List(list), SourceMap::List(start_span..end_span, map_list), tokens.len()))

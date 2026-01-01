@@ -10,6 +10,8 @@ pub(super) enum Instr {
     LoadFloat,
     LoadBool,
     LoadString,
+    LoadSymbol,
+    LoadNil,
     CopyReg,
     SwapReg,
     //arithmetic
@@ -58,6 +60,8 @@ impl TryFrom<u8> for Instr {
             x if x == Instr::LoadFloat as u8 => Ok(Instr::LoadFloat),
             x if x == Instr::LoadBool as u8 => Ok(Instr::LoadBool),
             x if x == Instr::LoadString as u8 => Ok(Instr::LoadString),
+            x if x == Instr::LoadSymbol as u8 => Ok(Instr::LoadSymbol),
+            x if x == Instr::LoadNil as u8 => Ok(Instr::LoadNil),
             x if x == Instr::CopyReg as u8 => Ok(Instr::CopyReg),
             x if x == Instr::SwapReg as u8 => Ok(Instr::SwapReg),
             x if x == Instr::Add as u8 => Ok(Instr::Add),
@@ -193,6 +197,7 @@ pub struct ClosureData {
 #[derive(PartialEq, Clone, Debug)]
 pub enum HeapValue {
     String(String),
+    Symbol(String),
     Pair(Pair),
     FuncRef(FunctionData),
     Closure(ClosureData),

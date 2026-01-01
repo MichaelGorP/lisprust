@@ -252,6 +252,15 @@ impl Vm {
                     };
                     self.registers[opcode[1] as usize + self.window_start] = Value::Object(Rc::new(HeapValue::String(val)));
                 },
+                Ok(Instr::LoadSymbol) => {
+                    let Some(val) = prog.read_string() else {
+                        return None;
+                    };
+                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(Rc::new(HeapValue::Symbol(val)));
+                },
+                Ok(Instr::LoadNil) => {
+                    self.registers[opcode[1] as usize + self.window_start] = Value::Empty;
+                },
                 Ok(Instr::CopyReg) => {
                     self.registers[opcode[1] as usize + self.window_start] = self.registers[opcode[2] as usize + self.window_start].clone();
                 },
@@ -547,12 +556,13 @@ impl Vm {
 
 fn value_to_sexpr(value: &Value) -> Option<SExpression> {
     match value {
-        Value::Empty => None,
+        Value::Empty => Some(SExpression::List(vec![])),
         Value::Boolean(b) => Some(SExpression::Atom(Atom::Boolean(*b))),
         Value::Integer(i) => Some(SExpression::Atom(Atom::Integer(*i))),
         Value::Float(f) => Some(SExpression::Atom(Atom::Float(*f))),
         Value::Object(o) => match &**o {
             HeapValue::String(s) => Some(SExpression::Atom(Atom::String(s.clone()))),
+            HeapValue::Symbol(s) => Some(SExpression::Symbol(s.clone())),
             HeapValue::Pair(_) => {
                 let mut expressions = Vec::new();
                 let mut current = Value::Object(o.clone());

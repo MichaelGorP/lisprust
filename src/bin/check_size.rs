@@ -37,6 +37,7 @@ pub struct ClosureData {
 
 pub enum HeapValue {
     String(String),
+    Symbol(String),
     Pair(Pair),
     FuncRef(FunctionData),
     Closure(ClosureData),

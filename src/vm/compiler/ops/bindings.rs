@@ -1,4 +1,5 @@
 use crate::parser::{SExpression, SourceMap};
+use crate::instructions::Instruction;
 use crate::vm::vp::Instr;
 use crate::vm::compiler::{Compiler, CompilationError};
 use std::collections::HashSet;
@@ -226,3 +227,89 @@ pub fn compile_letrec(compiler: &mut Compiler, args: &[SExpression], is_tail: bo
         }
     }
 }
+
+pub fn compile_quote(compiler: &mut Compiler, args: &[SExpression]) -> Result<u8, CompilationError> {
+    if args.len() != 1 {
+        return Err(CompilationError::from("quote expects exactly 1 argument"));
+    }
+    compile_quoted_expr(compiler, &args[0])
+}
+
+fn compile_quoted_expr(compiler: &mut Compiler, expr: &SExpression) -> Result<u8, CompilationError> {
+    match expr {
+        SExpression::Atom(atom) => {
+            let reg = compiler.scopes.allocate_reg()?;
+            compiler.bytecode.load_atom(atom, reg);
+            Ok(reg)
+        },
+        SExpression::Symbol(s) => {
+            let reg = compiler.scopes.allocate_reg()?;
+            compiler.bytecode.store_opcode(Instr::LoadSymbol, reg, 0, 0);
+            compiler.bytecode.store_value(&(s.len() as i64).to_le_bytes());
+            compiler.bytecode.store_value(s.as_bytes());
+            Ok(reg)
+        },
+        SExpression::BuiltIn(instr) => {
+            let s = match instr {
+                Instruction::Define => "define",
+                Instruction::Lambda => "lambda",
+                Instruction::If => "if",
+                Instruction::Let => "let",
+                Instruction::LetStar => "let*",
+                Instruction::Letrec => "letrec",
+                Instruction::Not => "not",
+                Instruction::And => "and",
+                Instruction::Or => "or",
+                Instruction::Plus => "+",
+                Instruction::Minus => "-",
+                Instruction::Multiply => "*",
+                Instruction::Divide => "/",
+                Instruction::Eq => "=", 
+                Instruction::Lt => "<",
+                Instruction::Gt => ">",
+                Instruction::Leq => "<=",
+                Instruction::Geq => ">=",
+                Instruction::Quote => "quote",
+            };
+            let reg = compiler.scopes.allocate_reg()?;
+            compiler.bytecode.store_opcode(Instr::LoadSymbol, reg, 0, 0);
+            compiler.bytecode.store_value(&(s.len() as i64).to_le_bytes());
+            compiler.bytecode.store_value(s.as_bytes());
+            Ok(reg)
+        },
+        SExpression::List(list) => {
+            if list.is_empty() {
+                let reg = compiler.scopes.allocate_reg()?;
+                compiler.bytecode.store_opcode(Instr::LoadNil, reg, 0, 0);
+                Ok(reg)
+            } else {
+                let mut last_reg = compiler.scopes.allocate_reg()?;
+                compiler.bytecode.store_opcode(Instr::LoadNil, last_reg, 0, 0);
+
+                let cons_func = compiler.functions.get_registered_function("cons")
+                    .ok_or(CompilationError::from("cons function not found"))?;
+                let cons_id = compiler.functions.get_or_insert_used_function("cons", cons_func);
+
+                for item in list.iter().rev() {
+                    let item_reg = compile_quoted_expr(compiler, item)?;
+                    
+                    let start_reg = compiler.scopes.allocate_reg()?;
+                    let _ = compiler.scopes.allocate_reg()?;
+                    
+                    compiler.bytecode.store_opcode(Instr::CopyReg, start_reg, item_reg, 0);
+                    compiler.bytecode.store_opcode(Instr::CopyReg, start_reg + 1, last_reg, 0);
+                    
+                    let result_reg = compiler.scopes.allocate_reg()?;
+                    compiler.bytecode.store_opcode(Instr::CallFunction, result_reg, start_reg, 2);
+                    let id: i64 = cons_id as i64;
+                    compiler.bytecode.store_value(&id.to_le_bytes());
+                    
+                    last_reg = result_reg;
+                }
+                Ok(last_reg)
+            }
+        }
+        _ => Err(CompilationError::from("Unsupported type in quote")),
+    }
+}
+
