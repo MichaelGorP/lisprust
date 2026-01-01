@@ -193,7 +193,7 @@ impl Vm {
                         if prog.current_address() > max_addr { max_addr = prog.current_address(); }
                         break;
                     },
-                    Ok(Instr::LoadInt) | Ok(Instr::LoadFloat) | Ok(Instr::Define) | Ok(Instr::LoadGlobal) | Ok(Instr::LoadFuncRef) => { let _ = prog.read_int(); },
+                    Ok(Instr::LoadInt) | Ok(Instr::LoadFloat) | Ok(Instr::Define) | Ok(Instr::LoadGlobal) | Ok(Instr::LoadFuncRef) | Ok(Instr::CallFunction) => { let _ = prog.read_int(); },
                     Ok(Instr::LoadString) => { let _ = prog.read_string(); },
                     Ok(Instr::MakeClosure) => {
                         let count = opcode[3];

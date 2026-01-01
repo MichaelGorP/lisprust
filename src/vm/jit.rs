@@ -58,6 +58,8 @@ impl Jit {
         builder.symbol("helper_deref", helper_deref as *const u8);
         builder.symbol("helper_get_registers_ptr", helper_get_registers_ptr as *const u8);
         builder.symbol("helper_call_function", helper_call_function as *const u8);
+        builder.symbol("helper_load_string", helper_load_string as *const u8);
+        builder.symbol("helper_load_symbol", helper_load_symbol as *const u8);
 
         let module = JITModule::new(builder);
         
@@ -742,6 +744,8 @@ impl Jit {
                     Err(_) => break // Stop scanning if invalid opcode (likely data)
                 };
                 
+                // println!("Pass 1: {:?} at {}", instr, prog.current_address() - 4);
+
                 match instr {
                     Instr::Jump => {
                         let cond_byte = opcode[2];
@@ -770,7 +774,7 @@ impl Jit {
                         break; // End of block
                     },
                     // Instructions with arguments
-                    Instr::LoadInt | Instr::LoadFloat | Instr::Define | Instr::LoadGlobal | Instr::LoadFuncRef => {
+                    Instr::LoadInt | Instr::LoadFloat | Instr::Define | Instr::LoadGlobal | Instr::LoadFuncRef | Instr::CallFunction => {
                         let _ = prog.read_int();
                     },
                     Instr::LoadString | Instr::LoadSymbol => {
@@ -940,6 +944,24 @@ impl Jit {
         let callee_helper_call_function = self.module.declare_function("helper_call_function", Linkage::Import, &sig_helper_call_function).map_err(|e| e.to_string())?;
         let local_helper_call_function = self.module.declare_func_in_func(callee_helper_call_function, &mut builder.func);
 
+        let mut sig_helper_load_string = self.module.make_signature();
+        sig_helper_load_string.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_load_string.params.push(AbiParam::new(ptr_type)); // prog
+        sig_helper_load_string.params.push(AbiParam::new(ptr_type)); // registers
+        sig_helper_load_string.params.push(AbiParam::new(types::I64)); // dest_reg
+        sig_helper_load_string.params.push(AbiParam::new(types::I64)); // offset
+        let callee_helper_load_string = self.module.declare_function("helper_load_string", Linkage::Import, &sig_helper_load_string).map_err(|e| e.to_string())?;
+        let local_helper_load_string = self.module.declare_func_in_func(callee_helper_load_string, &mut builder.func);
+
+        let mut sig_helper_load_symbol = self.module.make_signature();
+        sig_helper_load_symbol.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_load_symbol.params.push(AbiParam::new(ptr_type)); // prog
+        sig_helper_load_symbol.params.push(AbiParam::new(ptr_type)); // registers
+        sig_helper_load_symbol.params.push(AbiParam::new(types::I64)); // dest_reg
+        sig_helper_load_symbol.params.push(AbiParam::new(types::I64)); // offset
+        let callee_helper_load_symbol = self.module.declare_function("helper_load_symbol", Linkage::Import, &sig_helper_load_symbol).map_err(|e| e.to_string())?;
+        let local_helper_load_symbol = self.module.declare_func_in_func(callee_helper_load_symbol, &mut builder.func);
+
         // --- PASS 2: Generate Code ---
         prog.jump_to(start_addr);
         
@@ -983,7 +1005,7 @@ impl Jit {
             
             if is_terminated {
                  match instr {
-                    Instr::Jump | Instr::LoadInt | Instr::LoadGlobal | Instr::Define | Instr::LoadFuncRef | Instr::LoadFloat => {
+                    Instr::Jump | Instr::LoadInt | Instr::LoadGlobal | Instr::Define | Instr::LoadFuncRef | Instr::LoadFloat | Instr::CallFunction => {
                         prog.read_int().unwrap();
                     },
                     Instr::LoadString | Instr::LoadSymbol => {
@@ -1122,6 +1144,28 @@ impl Jit {
                     let header_addr_const = builder.ins().iconst(types::I64, header_addr);
                     
                     builder.ins().call(local_helper_load_func_ref, &[vm_ptr, prog_ptr, registers_ptr, dest_reg_const, header_addr_const]);
+                    is_terminated = false;
+                },
+                Instr::LoadString => {
+                    let dest_reg = opcode[1] as i64;
+                    let offset = prog.current_address() as i64;
+                    prog.read_string().unwrap();
+                    
+                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    let offset_const = builder.ins().iconst(types::I64, offset);
+                    
+                    builder.ins().call(local_helper_load_string, &[vm_ptr, prog_ptr, registers_ptr, dest_reg_const, offset_const]);
+                    is_terminated = false;
+                },
+                Instr::LoadSymbol => {
+                    let dest_reg = opcode[1] as i64;
+                    let offset = prog.current_address() as i64;
+                    prog.read_string().unwrap();
+                    
+                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    let offset_const = builder.ins().iconst(types::I64, offset);
+                    
+                    builder.ins().call(local_helper_load_symbol, &[vm_ptr, prog_ptr, registers_ptr, dest_reg_const, offset_const]);
                     is_terminated = false;
                 },
                 Instr::CallSymbol => {

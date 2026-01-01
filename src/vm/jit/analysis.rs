@@ -132,17 +132,6 @@ pub fn analyze_function(prog: &mut VirtualProgram, start_addr: u64, end_addr: u6
 
 pub fn scan_function_end(prog: &mut VirtualProgram, start_addr: u64) -> u64 {
     let original = prog.cursor.position();
-    prog.cursor.set_position(start_addr);
-    loop {
-        let opcode = match prog.read_opcode() {
-            Some(o) => o,
-            None => break,
-        };
-        let instr: Result<Instr, _> = opcode[0].try_into();
-        if let Ok(Instr::Ret) = instr {
-            // Ret marks the end of the function in this simple JIT.
-        }
-    }
     
     // Perform a basic block traversal to find the maximum reachable address.
     let mut max_addr = start_addr;
@@ -176,22 +165,30 @@ pub fn scan_function_end(prog: &mut VirtualProgram, start_addr: u64) -> u64 {
                     if opcode[2] == JumpCondition::Jump as u8 { break; }
                 },
                 Instr::Not => {
+                        let after_not = prog.cursor.position();
                         if let Some(next) = prog.read_opcode() {
                             if let Ok(Instr::Jump) = next[0].try_into() {
                                 let dist = prog.read_int().unwrap_or(0);
                                 let target = (prog.cursor.position() as i64 + dist) as u64;
                                 worklist.push(target);
+                                // Conditional jump, fallthrough
                             } else {
-                                prog.cursor.set_position(pos + 1 + 8); // Skip Not opcode + args
+                                prog.cursor.set_position(after_not);
                             }
                         }
                 },
-                Instr::Ret => break,
+                Instr::Ret | Instr::TailCallSymbol => break,
+                Instr::MakeClosure => {
+                    let count = opcode[3];
+                    for _ in 0..count {
+                        let _ = prog.read_byte();
+                    }
+                },
                 _ => {
                     // Advance cursor
                     match instr {
-                        Instr::LoadInt | Instr::LoadFloat | Instr::LoadGlobal | Instr::Define | Instr::LoadFuncRef => { prog.read_int(); },
-                        Instr::LoadString | Instr::LoadSymbol => { prog.read_string(); },
+                        Instr::LoadInt | Instr::LoadFloat | Instr::LoadGlobal | Instr::Define | Instr::LoadFuncRef | Instr::CallFunction => { let _ = prog.read_int(); },
+                        Instr::LoadString | Instr::LoadSymbol => { let _ = prog.read_string(); },
                         _ => {}
                     }
                 }

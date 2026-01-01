@@ -76,8 +76,18 @@ pub unsafe extern "C" fn helper_op(vm: *mut Vm, prog: *mut VirtualProgram, regis
         Ok(Instr::Sub) => jit_binary_op!(-),
         Ok(Instr::Mul) => jit_binary_op!(*),
         Ok(Instr::Div) => jit_binary_op!(/),
-        Ok(Instr::Eq) => jit_comparison_op!(==),
-        Ok(Instr::Neq) => jit_comparison_op!(!=),
+        Ok(Instr::Eq) => {
+             let v1 = resolve_value(vm, registers, opcode[2]);
+             let v2 = resolve_value(vm, registers, opcode[3]);
+             let res_reg = opcode[1] as usize;
+             *registers.add(res_reg) = LispValue::Boolean(v1 == v2);
+        },
+        Ok(Instr::Neq) => {
+             let v1 = resolve_value(vm, registers, opcode[2]);
+             let v2 = resolve_value(vm, registers, opcode[3]);
+             let res_reg = opcode[1] as usize;
+             *registers.add(res_reg) = LispValue::Boolean(v1 != v2);
+        },
         Ok(Instr::Lt) => jit_comparison_op!(<),
         Ok(Instr::Gt) => jit_comparison_op!(>),
         Ok(Instr::Leq) => jit_comparison_op!(<=),
@@ -396,3 +406,42 @@ pub unsafe extern "C" fn helper_get_registers_ptr(vm: *mut Vm) -> *mut LispValue
     let vm = &mut *vm;
     vm.registers.as_mut_ptr().add(vm.window_start)
 }
+
+pub unsafe extern "C" fn helper_load_string(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, offset: u64) {
+    let _vm = &mut *vm;
+    let prog = &mut *prog;
+    let bytecode = prog.get_bytecode();
+    let offset = offset as usize;
+    
+    if offset + 8 <= bytecode.len() {
+        let len_bytes = &bytecode[offset..offset+8];
+        let len = i64::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+        
+        if offset + 8 + len <= bytecode.len() {
+            let str_bytes = &bytecode[offset+8..offset+8+len];
+            if let Ok(s) = std::str::from_utf8(str_bytes) {
+                *registers.add(dest_reg) = LispValue::Object(Gc::new(HeapValue::String(s.to_string())));
+            }
+        }
+    }
+}
+
+pub unsafe extern "C" fn helper_load_symbol(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, offset: u64) {
+    let _vm = &mut *vm;
+    let prog = &mut *prog;
+    let bytecode = prog.get_bytecode();
+    let offset = offset as usize;
+    
+    if offset + 8 <= bytecode.len() {
+        let len_bytes = &bytecode[offset..offset+8];
+        let len = i64::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+        
+        if offset + 8 + len <= bytecode.len() {
+            let str_bytes = &bytecode[offset+8..offset+8+len];
+            if let Ok(s) = std::str::from_utf8(str_bytes) {
+                *registers.add(dest_reg) = LispValue::Object(Gc::new(HeapValue::Symbol(s.to_string())));
+            }
+        }
+    }
+}
+
