@@ -147,7 +147,7 @@ pub unsafe extern "C" fn helper_load_func_ref(vm: *mut Vm, prog: *mut VirtualPro
 }
 
 pub unsafe extern "C" fn helper_call_function(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, start_reg: usize, reg_count: usize, func_id: i64) {
-    let vm = &mut *vm;
+    let _vm = &mut *vm;
     let prog = &mut *prog;
     
     let Some(function) = prog.get_function(func_id) else { return };

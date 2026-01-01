@@ -561,10 +561,10 @@ fn value_to_sexpr(value: &Value) -> Option<SExpression> {
                         Value::Empty => break,
                         Value::Object(obj) => match &*obj {
                             HeapValue::Pair(pair) => {
-                                let car = pair.car.borrow();
-                                let sexpr = value_to_sexpr(&*car);
+                                let car = pair.get_car();
+                                let sexpr = value_to_sexpr(&car);
                                 expressions.push(sexpr.unwrap_or(SExpression::Atom(Atom::Integer(0))));
-                                current = pair.cdr.borrow().clone();
+                                current = pair.get_cdr();
                             },
                             _ => {
                                 let sexpr = value_to_sexpr(&Value::Object(obj.clone()));

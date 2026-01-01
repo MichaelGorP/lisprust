@@ -143,10 +143,45 @@ impl PartialEq for FunctionData {
     }
 }
 
-#[derive(PartialEq, Clone, Debug)]
 pub struct Pair {
-    pub car: RefCell<Value>,
-    pub cdr: RefCell<Value>,
+    pub car: Cell<Value>,
+    pub cdr: Cell<Value>,
+}
+
+impl Clone for Pair {
+    fn clone(&self) -> Self {
+        Pair {
+            car: Cell::new(self.get_car()),
+            cdr: Cell::new(self.get_cdr()),
+        }
+    }
+}
+
+impl Pair {
+    pub fn get_car(&self) -> Value {
+        let ptr = self.car.as_ptr();
+        unsafe { (*ptr).clone() }
+    }
+
+    pub fn get_cdr(&self) -> Value {
+        let ptr = self.cdr.as_ptr();
+        unsafe { (*ptr).clone() }
+    }
+}
+
+impl PartialEq for Pair {
+    fn eq(&self, other: &Self) -> bool {
+        self.get_car() == other.get_car() && self.get_cdr() == other.get_cdr()
+    }
+}
+
+impl std::fmt::Debug for Pair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pair")
+         .field("car", &self.get_car())
+         .field("cdr", &self.get_cdr())
+         .finish()
+    }
 }
 
 #[derive(PartialEq, Clone, Debug)]

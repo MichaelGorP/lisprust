@@ -1,6 +1,6 @@
 use std::mem::size_of;
 use std::rc::Rc;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 #[derive(PartialEq, Clone, Debug)]
 #[repr(C)]
@@ -24,19 +24,17 @@ impl PartialEq for FunctionData {
     }
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[repr(C)]
 pub struct Pair {
-    pub car: RefCell<Value>,
-    pub cdr: RefCell<Value>,
+    pub car: Cell<Value>,
+    pub cdr: Cell<Value>,
 }
 
-#[derive(PartialEq, Clone, Debug)]
 pub struct ClosureData {
     pub function: FunctionData,
     pub captures: Vec<Value>
 }
 
-#[derive(PartialEq, Clone, Debug)]
 pub enum HeapValue {
     String(String),
     Pair(Pair),
@@ -45,7 +43,6 @@ pub enum HeapValue {
     Ref(RefCell<Value>)
 }
 
-#[derive(PartialEq, Clone, Debug)]
 #[repr(C, u8)]
 pub enum Value {
     Empty,

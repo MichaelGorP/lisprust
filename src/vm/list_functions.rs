@@ -1,5 +1,5 @@
 use std::rc::Rc;
-use std::cell::RefCell;
+use std::cell::Cell;
 use super::{compiler::Compiler, vp::Value, vp::Pair, vp::HeapValue};
 
 pub fn register_functions(compiler: &mut Compiler) {
@@ -34,8 +34,8 @@ fn cons(args: &[Value]) -> Value {
         panic!("cons expects 2 arguments");
     }
     Value::Object(Rc::new(HeapValue::Pair(Pair {
-        car: RefCell::new(args[0].clone()),
-        cdr: RefCell::new(args[1].clone()),
+        car: Cell::new(args[0].clone()),
+        cdr: Cell::new(args[1].clone()),
     })))
 }
 
@@ -45,7 +45,7 @@ fn car(args: &[Value]) -> Value {
     }
     match &args[0] {
         Value::Object(o) => match &**o {
-            HeapValue::Pair(p) => p.car.borrow().clone(),
+            HeapValue::Pair(p) => p.get_car(),
             _ => panic!("car expects a pair"),
         },
         _ => panic!("car expects a pair"),
@@ -58,7 +58,7 @@ fn cdr(args: &[Value]) -> Value {
     }
     match &args[0] {
         Value::Object(o) => match &**o {
-            HeapValue::Pair(p) => p.cdr.borrow().clone(),
+            HeapValue::Pair(p) => p.get_cdr(),
             _ => panic!("cdr expects a pair"),
         },
         _ => panic!("cdr expects a pair"),
@@ -92,8 +92,8 @@ fn list(args: &[Value]) -> Value {
     let mut result = Value::Empty;
     for val in args.iter().rev() {
         result = Value::Object(Rc::new(HeapValue::Pair(Pair {
-            car: RefCell::new(val.clone()),
-            cdr: RefCell::new(result),
+            car: Cell::new(val.clone()),
+            cdr: Cell::new(result),
         })));
     }
     result
@@ -111,7 +111,7 @@ fn length(args: &[Value]) -> Value {
             Value::Object(o) => match &*o {
                 HeapValue::Pair(p) => {
                     count += 1;
-                    current = p.cdr.borrow().clone();
+                    current = p.get_cdr();
                 },
                 _ => panic!("length expects a proper list"),
             },
@@ -138,8 +138,8 @@ fn append(args: &[Value]) -> Value {
                 Value::Empty => break,
                 Value::Object(o) => match &*o {
                     HeapValue::Pair(p) => {
-                        elements.push(p.car.borrow().clone());
-                        list = p.cdr.borrow().clone();
+                        elements.push(p.get_car());
+                        list = p.get_cdr();
                     },
                     _ => panic!("append expects proper lists (except last argument)"),
                 },
@@ -150,8 +150,8 @@ fn append(args: &[Value]) -> Value {
         // Rebuild list with result as tail
         for val in elements.iter().rev() {
             result = Value::Object(Rc::new(HeapValue::Pair(Pair {
-                car: RefCell::new(val.clone()),
-                cdr: RefCell::new(result),
+                car: Cell::new(val.clone()),
+                cdr: Cell::new(result),
             })));
         }
     }
@@ -170,10 +170,10 @@ fn reverse(args: &[Value]) -> Value {
             Value::Object(o) => match &*o {
                 HeapValue::Pair(p) => {
                     result = Value::Object(Rc::new(HeapValue::Pair(Pair {
-                        car: RefCell::new(p.car.borrow().clone()),
-                        cdr: RefCell::new(result),
+                        car: Cell::new(p.get_car()),
+                        cdr: Cell::new(result),
                     })));
-                    current = p.cdr.borrow().clone();
+                    current = p.get_cdr();
                 },
                 _ => panic!("reverse expects a proper list"),
             },
@@ -204,9 +204,9 @@ fn list_ref(args: &[Value]) -> Value {
             Value::Object(o) => match &*o {
                 HeapValue::Pair(p) => {
                     if current_index == index {
-                        return p.car.borrow().clone();
+                        return p.get_car();
                     }
-                    list = p.cdr.borrow().clone();
+                    list = p.get_cdr();
                     current_index += 1;
                 },
                 _ => panic!("list-ref expects a proper list"),
@@ -239,7 +239,7 @@ fn list_tail(args: &[Value]) -> Value {
             Value::Empty => panic!("list-tail index out of bounds"),
             Value::Object(o) => match &*o {
                 HeapValue::Pair(p) => {
-                    list = p.cdr.borrow().clone();
+                    list = p.get_cdr();
                     current_index += 1;
                 },
                 _ => panic!("list-tail expects a proper list"),
@@ -256,10 +256,10 @@ fn cadr(args: &[Value]) -> Value {
     match l {
         Value::Object(o) => match &*o {
             HeapValue::Pair(p) => {
-                let cdr = p.cdr.borrow().clone();
+                let cdr = p.get_cdr();
                 match cdr {
                     Value::Object(o2) => match &*o2 {
-                        HeapValue::Pair(p2) => p2.car.borrow().clone(),
+                        HeapValue::Pair(p2) => p2.get_car(),
                         _ => panic!("cadr expects a list of at least length 2"),
                     },
                     _ => panic!("cadr expects a list of at least length 2"),
@@ -278,14 +278,14 @@ fn caddr(args: &[Value]) -> Value {
     match l {
         Value::Object(o) => match &*o {
             HeapValue::Pair(p) => {
-                let cdr = p.cdr.borrow().clone();
+                let cdr = p.get_cdr();
                 match cdr {
                     Value::Object(o2) => match &*o2 {
                         HeapValue::Pair(p2) => {
-                            let cddr = p2.cdr.borrow().clone();
+                            let cddr = p2.get_cdr();
                             match cddr {
                                 Value::Object(o3) => match &*o3 {
-                                    HeapValue::Pair(p3) => p3.car.borrow().clone(),
+                                    HeapValue::Pair(p3) => p3.get_car(),
                                     _ => panic!("caddr expects a list of at least length 3"),
                                 },
                                 _ => panic!("caddr expects a list of at least length 3"),
@@ -309,10 +309,10 @@ fn cddr(args: &[Value]) -> Value {
     match l {
         Value::Object(o) => match &*o {
             HeapValue::Pair(p) => {
-                let cdr = p.cdr.borrow().clone();
+                let cdr = p.get_cdr();
                 match cdr {
                     Value::Object(o2) => match &*o2 {
-                        HeapValue::Pair(p2) => p2.cdr.borrow().clone(),
+                        HeapValue::Pair(p2) => p2.get_cdr(),
                         _ => panic!("cddr expects a list of at least length 2"),
                     },
                     _ => panic!("cddr expects a list of at least length 2"),
@@ -329,7 +329,7 @@ fn set_car(args: &[Value]) -> Value {
     match &args[0] {
         Value::Object(o) => match &**o {
             HeapValue::Pair(p) => {
-                *p.car.borrow_mut() = args[1].clone();
+                p.car.set(args[1].clone());
                 Value::Empty // or undefined
             },
             _ => panic!("set-car! expects a pair"),
@@ -343,7 +343,7 @@ fn set_cdr(args: &[Value]) -> Value {
     match &args[0] {
         Value::Object(o) => match &**o {
             HeapValue::Pair(p) => {
-                *p.cdr.borrow_mut() = args[1].clone();
+                p.cdr.set(args[1].clone());
                 Value::Empty
             },
             _ => panic!("set-cdr! expects a pair"),
@@ -362,13 +362,11 @@ fn memq(args: &[Value]) -> Value {
             Value::Empty => return Value::Boolean(false),
             Value::Object(o) => match &**o {
                 HeapValue::Pair(p) => {
-                    let car = p.car.borrow();
-                    if *car == *obj {
-                         drop(car);
+                    let car = p.get_car();
+                    if car == *obj {
                          return list.clone();
                     }
-                    drop(car);
-                    p.cdr.borrow().clone()
+                    p.get_cdr()
                 },
                 _ => panic!("memq expects a proper list"),
             },
@@ -392,13 +390,12 @@ fn assq(args: &[Value]) -> Value {
             Value::Empty => return Value::Boolean(false),
             Value::Object(o) => match &**o {
                 HeapValue::Pair(p) => {
-                    let entry = p.car.borrow().clone();
+                    let entry = p.get_car();
                     match &entry {
                         Value::Object(oe) => match &**oe {
                             HeapValue::Pair(pe) => {
-                                let key = pe.car.borrow();
-                                if *key == *obj {
-                                    drop(key);
+                                let key = pe.get_car();
+                                if key == *obj {
                                     return entry.clone();
                                 }
                             },
@@ -406,7 +403,7 @@ fn assq(args: &[Value]) -> Value {
                         },
                         _ => {}
                     }
-                    p.cdr.borrow().clone()
+                    p.get_cdr()
                 },
                 _ => panic!("assq expects a proper list"),
             },
