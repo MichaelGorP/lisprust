@@ -60,7 +60,14 @@ impl fmt::Display for SExpression {
             SExpression::Atom(l) => write!(f, "{}", l),
             SExpression::BuiltIn(b) => write!(f, "{}", b),
             SExpression::Symbol(s) => write!(f, "{}", s),
-            SExpression::List(l) => write!(f, "{:?}", l),
+            SExpression::List(l) => {
+                write!(f, "(")?;
+                for (i, e) in l.iter().enumerate() {
+                    if i > 0 { write!(f, " ")?; }
+                    write!(f, "{}", e)?;
+                }
+                write!(f, ")")
+            },
             SExpression::Lambda(_) => write!(f, "Lambda")
         }
     }

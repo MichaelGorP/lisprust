@@ -216,10 +216,19 @@ impl std::fmt::Debug for Pair {
     }
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Clone)]
 pub struct ClosureData {
     pub function: FunctionData,
     pub captures: Vec<Value>
+}
+
+impl std::fmt::Debug for ClosureData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClosureData")
+         .field("function", &self.function)
+         .field("captures", &self.captures)
+         .finish()
+    }
 }
 
 impl Finalize for ClosureData {}
@@ -243,7 +252,7 @@ unsafe impl Trace for ClosureData {
     }
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Clone)]
 pub enum HeapValue {
     String(String),
     Symbol(String),
@@ -251,6 +260,51 @@ pub enum HeapValue {
     FuncRef(FunctionData),
     Closure(ClosureData),
     Ref(GcCell<Value>)
+}
+
+impl std::fmt::Debug for HeapValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
+impl std::fmt::Display for HeapValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeapValue::String(s) => write!(f, "{:?}", s),
+            HeapValue::Symbol(s) => write!(f, "{}", s),
+            HeapValue::Pair(p) => {
+                write!(f, "(")?;
+                write!(f, "{}", p.get_car())?;
+                let mut current = p.get_cdr();
+                loop {
+                    match current {
+                        Value::Empty => break,
+                        Value::Object(o) => {
+                            match &*o {
+                                HeapValue::Pair(next_p) => {
+                                    write!(f, " {}", next_p.get_car())?;
+                                    current = next_p.get_cdr();
+                                },
+                                _ => {
+                                    write!(f, " . {}", o)?;
+                                    break;
+                                }
+                            }
+                        },
+                        _ => {
+                            write!(f, " . {}", current)?;
+                            break;
+                        }
+                    }
+                }
+                write!(f, ")")
+            },
+            HeapValue::FuncRef(_) => write!(f, "#<function>"),
+            HeapValue::Closure(_) => write!(f, "#<closure>"),
+            HeapValue::Ref(r) => write!(f, "#<ref {}>", r.borrow()),
+        }
+    }
 }
 
 impl Finalize for HeapValue {}
@@ -294,7 +348,7 @@ unsafe impl Trace for HeapValue {
     }
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Clone)]
 #[repr(C, u8)]
 pub enum Value {
     Empty,
@@ -302,6 +356,24 @@ pub enum Value {
     Integer(i64),
     Float(f64),
     Object(Gc<HeapValue>)
+}
+
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Empty => write!(f, "()"),
+            Value::Boolean(b) => write!(f, "{}", if *b { "#t" } else { "#f" }),
+            Value::Integer(i) => write!(f, "{}", i),
+            Value::Float(fl) => write!(f, "{}", fl),
+            Value::Object(o) => write!(f, "{}", o),
+        }
+    }
 }
 
 impl Finalize for Value {}
