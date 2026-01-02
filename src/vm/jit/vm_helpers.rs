@@ -1,29 +1,30 @@
 use std::cell::Cell;
-use gc::{Gc, GcCell};
 use crate::vm::vm::{Vm, CallState};
 use crate::vm::vp::{VirtualProgram, Value as LispValue, FunctionHeader, FunctionData, HeapValue, ClosureData, Instr};
 
 pub unsafe extern "C" fn helper_check_self_recursion(vm: *mut Vm, func_reg: usize, start_addr: u64) -> i32 {
     let vm = &mut *vm;
-    let func = &vm.registers[vm.window_start + func_reg];
+    let func = vm.registers[vm.window_start + func_reg];
     
-    let address = if let Some(r) = func.as_ref() {
-        let inner = r.borrow();
-        if let Some(f) = inner.as_func_ref() {
-            f.address
-        } else if let Some(c) = inner.as_closure() {
-            c.function.address
-        } else {
-            return 0;
+    let address = if let LispValue::Object(handle) = func {
+        match vm.heap.get(handle) {
+            Some(HeapValue::FuncRef(f)) => f.address,
+            Some(HeapValue::Closure(c)) => c.function.address,
+            Some(HeapValue::Ref(inner)) => {
+                if let LispValue::Object(inner_handle) = *inner {
+                    match vm.heap.get(inner_handle) {
+                        Some(HeapValue::FuncRef(f)) => f.address,
+                        Some(HeapValue::Closure(c)) => c.function.address,
+                        _ => return 0
+                    }
+                } else {
+                    return 0;
+                }
+            },
+            _ => return 0
         }
     } else {
-        if let Some(f) = func.as_func_ref() {
-            f.address
-        } else if let Some(c) = func.as_closure() {
-            c.function.address
-        } else {
-            return 0;
-        }
+        return 0;
     };
     
     if address == start_addr { 1 } else { 0 }
@@ -111,14 +112,14 @@ pub unsafe extern "C" fn helper_op(vm: *mut Vm, prog: *mut VirtualProgram, regis
              let prog = &mut *prog;
              if let Some(s) = prog.read_string() {
                  let dest_reg = opcode[1] as usize;
-                 *registers.add(dest_reg) = LispValue::Object(Gc::new(HeapValue::String(s)));
+                 *registers.add(dest_reg) = LispValue::Object(vm.heap.alloc(HeapValue::String(s)));
              }
         },
         Ok(Instr::LoadSymbol) => {
              let prog = &mut *prog;
              if let Some(s) = prog.read_string() {
                  let dest_reg = opcode[1] as usize;
-                 *registers.add(dest_reg) = LispValue::Object(Gc::new(HeapValue::Symbol(s)));
+                 *registers.add(dest_reg) = LispValue::Object(vm.heap.alloc(HeapValue::Symbol(s)));
              }
         },
         Ok(Instr::LoadNil) => {
@@ -135,13 +136,14 @@ pub unsafe extern "C" fn helper_check_condition(_vm: *mut Vm, registers: *mut Li
     if val.is_true() { 1 } else { 0 }
 }
 
-unsafe fn resolve_value(_vm: &Vm, registers: *mut LispValue, reg_idx: u8) -> LispValue {
-    let val = &*registers.add(reg_idx as usize);
-    if let Some(r) = val.as_ref() {
-        r.borrow().clone()
-    } else {
-        val.clone()
+unsafe fn resolve_value(vm: &Vm, registers: *mut LispValue, reg_idx: u8) -> LispValue {
+    let val = *registers.add(reg_idx as usize);
+    if let LispValue::Object(handle) = val {
+        if let Some(HeapValue::Ref(inner)) = vm.heap.get(handle) {
+            return *inner;
+        }
     }
+    val
 }
 
 pub unsafe extern "C" fn helper_load_global(vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, sym_id: i64) {
@@ -171,7 +173,8 @@ pub unsafe extern "C" fn helper_load_func_ref(vm: *mut Vm, prog: *mut VirtualPro
     let func_addr = header_addr as usize + std::mem::size_of::<FunctionHeader>();
     
     let jit_code = vm.jit.cache.get(&(func_addr as u64)).map(|&ptr| ptr as u64).unwrap_or(0);
-    *registers.add(dest_reg) = LispValue::Object(Gc::new(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(jit_code), fast_jit_code: Cell::new(0)})));
+    vm.collect_garbage();
+    *registers.add(dest_reg) = LispValue::Object(vm.heap.alloc(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(jit_code), fast_jit_code: Cell::new(0)})));
 }
 
 pub unsafe extern "C" fn helper_call_function(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, start_reg: usize, reg_count: usize, func_id: i64) {
@@ -193,27 +196,27 @@ pub unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgr
     let vm = &mut *vm;
     let prog = &mut *prog;
     
-    let func = &*registers.add(func_reg);
+    let resolved_func = resolve_value(vm, registers, func_reg as u8);
     
-    let (header, address, captures, jit_code_cell, fast_jit_code_cell) = if let Some(r) = func.as_ref() {
-        // If it's in a RefCell, we can't safely get a reference to the Cell that outlives the borrow.
-        // So we just return None for the cell, meaning we won't update the cache.
-        let inner = r.borrow();
-        if let Some(f) = inner.as_func_ref() {
-            (f.header, f.address, None, None, None)
-        } else if let Some(c) = inner.as_closure() {
-            (c.function.header, c.function.address, Some(c.captures.clone()), None, None)
-        } else {
-            return
+    let (header, address, captures, jit_code_cell, fast_jit_code_cell) = if let LispValue::Object(handle) = resolved_func {
+        match vm.heap.get(handle) {
+            Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, Some(&f.jit_code), Some(&f.fast_jit_code)),
+            Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), Some(&c.function.jit_code), Some(&c.function.fast_jit_code)),
+            Some(HeapValue::Ref(inner)) => {
+                 if let LispValue::Object(inner_handle) = *inner {
+                     match vm.heap.get(inner_handle) {
+                        Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, None, None),
+                        Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), None, None),
+                        _ => return
+                     }
+                 } else {
+                     return
+                 }
+            },
+            _ => return
         }
     } else {
-        if let Some(f) = func.as_func_ref() {
-            (f.header, f.address, None, Some(&f.jit_code), Some(&f.fast_jit_code))
-        } else if let Some(c) = func.as_closure() {
-            (c.function.header, c.function.address, Some(c.captures.clone()), Some(&c.function.jit_code), Some(&c.function.fast_jit_code))
-        } else {
-            return
-        }
+        return
     };
 
     let size = param_start + header.register_count as usize + vm.window_start;
@@ -241,7 +244,7 @@ pub unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgr
          vm.next_jit_code = jit_code;
     } else {
          let end_addr = super::analysis::scan_function_end(prog, address);
-         if let Ok(func) = vm.jit.compile(&vm.global_vars, prog, address, end_addr) {
+         if let Ok(func) = vm.jit.compile(&vm.global_vars, &vm.heap, prog, address, end_addr) {
              if let Some(cell) = jit_code_cell {
                  if let Some(&code) = vm.jit.cache.get(&address) {
                      cell.set(code as u64);
@@ -282,25 +285,26 @@ pub unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut Virtual
     let vm = &mut *vm;
     let prog = &mut *prog;
 
-    let func = &*registers.add(func_reg);
+    let func = *registers.add(func_reg);
     
-    let (header, address, captures, jit_code_cell) = if let Some(r) = func.as_ref() {
-        let inner = r.borrow();
-        if let Some(f) = inner.as_func_ref() {
-            (f.header, f.address, None, None)
-        } else if let Some(c) = inner.as_closure() {
-            (c.function.header, c.function.address, Some(c.captures.clone()), None)
-        } else {
-            return
-        }
-    } else {
-        if let Some(f) = func.as_func_ref() {
-            (f.header, f.address, None, Some(&f.jit_code))
-        } else if let Some(c) = func.as_closure() {
-            (c.function.header, c.function.address, Some(c.captures.clone()), Some(&c.function.jit_code))
-        } else {
-            return
-        }
+    let (header, address, captures, jit_code_cell) = match func {
+        LispValue::Object(handle) => match vm.heap.get(handle) {
+            Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, Some(&f.jit_code)),
+            Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), Some(&c.function.jit_code)),
+            Some(HeapValue::Ref(inner)) => {
+                 if let LispValue::Object(inner_handle) = *inner {
+                     match vm.heap.get(inner_handle) {
+                        Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, None),
+                        Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), None),
+                        _ => return
+                     }
+                 } else {
+                     return
+                 }
+            },
+            _ => return
+        },
+        _ => return
     };
 
     let size = vm.window_start + header.register_count as usize;
@@ -347,7 +351,7 @@ pub unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut Virtual
          vm.next_jit_code = jit_code;
     } else {
          let end_addr = super::analysis::scan_function_end(prog, address);
-         if let Ok(func) = vm.jit.compile(&vm.global_vars, prog, address, end_addr) {
+         if let Ok(func) = vm.jit.compile(&vm.global_vars, &vm.heap, prog, address, end_addr) {
              if let Some(cell) = jit_code_cell {
                  if let Some(&code) = vm.jit.cache.get(&address) {
                      cell.set(code as u64);
@@ -362,7 +366,8 @@ pub unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut Virtual
     }
 }
 
-pub unsafe extern "C" fn helper_make_closure(_vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, func_reg: usize, count: usize, instr_addr: u64) {
+pub unsafe extern "C" fn helper_make_closure(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, func_reg: usize, count: usize, instr_addr: u64) {
+    let vm = &mut *vm;
     let prog = &mut *prog;
     
     let old_pos = prog.current_address();
@@ -372,37 +377,70 @@ pub unsafe extern "C" fn helper_make_closure(_vm: *mut Vm, prog: *mut VirtualPro
     for _ in 0..count {
         let reg_idx = prog.read_byte().unwrap();
         // Cloning values for capture is necessary as they escape the current scope
-        let val = (*registers.add(reg_idx as usize)).clone();
+        let val = *registers.add(reg_idx as usize);
         captures.push(val);
     }
     
     prog.jump_to(old_pos);
     
-    let func_val = &*registers.add(func_reg);
+    let func_val = *registers.add(func_reg);
     
-    if let Some(fd) = func_val.as_func_ref() {
-        // Avoid cloning FunctionData if possible, but it's small (copy)
-        // The main cost is Rc allocation for ClosureData
-        *registers.add(dest_reg) = LispValue::Object(Gc::new(HeapValue::Closure(ClosureData{function: fd.clone(), captures})));
+    if let LispValue::Object(handle) = func_val {
+        if let Some(HeapValue::FuncRef(fd)) = vm.heap.get(handle) {
+            let fd_clone = fd.clone();
+            for c in &captures {
+                vm.scratch_buffer.push(*c);
+            }
+            vm.collect_garbage();
+            for _ in &captures {
+                vm.scratch_buffer.pop();
+            }
+            *registers.add(dest_reg) = LispValue::Object(vm.heap.alloc(HeapValue::Closure(ClosureData{function: fd_clone, captures})));
+        } else {
+            *registers.add(dest_reg) = LispValue::Empty;
+        }
     } else {
         *registers.add(dest_reg) = LispValue::Empty;
     }
 }
 
-pub unsafe extern "C" fn helper_make_ref(_vm: *mut Vm, registers: *mut LispValue, dest_reg: usize) {
-    let val = (*registers.add(dest_reg)).clone();
-    *registers.add(dest_reg) = LispValue::Object(Gc::new(HeapValue::Ref(GcCell::new(val))));
+pub unsafe extern "C" fn helper_make_ref(vm: *mut Vm, registers: *mut LispValue, dest_reg: usize) {
+    let vm = &mut *vm;
+    let val = *registers.add(dest_reg);
+    vm.collect_garbage();
+    *registers.add(dest_reg) = LispValue::Object(vm.heap.alloc(HeapValue::Ref(val)));
 }
 
-pub unsafe extern "C" fn helper_set_ref(_vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, src_reg: usize) {
-    if let Some(r) = (*registers.add(dest_reg)).as_ref() {
-        *r.borrow_mut() = (*registers.add(src_reg)).clone();
+pub unsafe extern "C" fn helper_set_ref(vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, src_reg: usize) {
+    let vm = &mut *vm;
+    let dest = *registers.add(dest_reg);
+    let src = *registers.add(src_reg);
+    
+    if let LispValue::Object(handle) = dest {
+        if let Some(HeapValue::Ref(r)) = vm.heap.get_mut(handle) {
+            *r = src;
+        }
     }
 }
 
-pub unsafe extern "C" fn helper_deref(_vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, src_reg: usize) {
-    if let Some(r) = (*registers.add(src_reg)).as_ref() {
-        *registers.add(dest_reg) = r.borrow().clone();
+pub unsafe extern "C" fn helper_deref(vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, src_reg: usize) {
+    let vm = &mut *vm;
+    let src = *registers.add(src_reg);
+    
+    let val = if let LispValue::Object(handle) = src {
+        if let Some(HeapValue::Ref(r)) = vm.heap.get(handle) {
+            Some(*r)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    
+    if let Some(v) = val {
+        *registers.add(dest_reg) = v;
+    } else {
+        *registers.add(dest_reg) = src;
     }
 }
 
@@ -412,7 +450,7 @@ pub unsafe extern "C" fn helper_get_registers_ptr(vm: *mut Vm) -> *mut LispValue
 }
 
 pub unsafe extern "C" fn helper_load_string(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, offset: u64) {
-    let _vm = &mut *vm;
+    let vm = &mut *vm;
     let prog = &mut *prog;
     let bytecode = prog.get_bytecode();
     let offset = offset as usize;
@@ -424,14 +462,15 @@ pub unsafe extern "C" fn helper_load_string(vm: *mut Vm, prog: *mut VirtualProgr
         if offset + 8 + len <= bytecode.len() {
             let str_bytes = &bytecode[offset+8..offset+8+len];
             if let Ok(s) = std::str::from_utf8(str_bytes) {
-                *registers.add(dest_reg) = LispValue::Object(Gc::new(HeapValue::String(s.to_string())));
+                vm.collect_garbage();
+                *registers.add(dest_reg) = LispValue::Object(vm.heap.alloc(HeapValue::String(s.to_string())));
             }
         }
     }
 }
 
 pub unsafe extern "C" fn helper_load_symbol(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, offset: u64) {
-    let _vm = &mut *vm;
+    let vm = &mut *vm;
     let prog = &mut *prog;
     let bytecode = prog.get_bytecode();
     let offset = offset as usize;
@@ -443,7 +482,15 @@ pub unsafe extern "C" fn helper_load_symbol(vm: *mut Vm, prog: *mut VirtualProgr
         if offset + 8 + len <= bytecode.len() {
             let str_bytes = &bytecode[offset+8..offset+8+len];
             if let Ok(s) = std::str::from_utf8(str_bytes) {
-                *registers.add(dest_reg) = LispValue::Object(Gc::new(HeapValue::Symbol(s.to_string())));
+                vm.collect_garbage();
+                let handle = if let Some(&h) = vm.symbol_table.get(s) {
+                    h
+                } else {
+                    let h = vm.heap.alloc(HeapValue::Symbol(s.to_string()));
+                    vm.symbol_table.insert(s.to_string(), h);
+                    h
+                };
+                *registers.add(dest_reg) = LispValue::Object(handle);
             }
         }
     }

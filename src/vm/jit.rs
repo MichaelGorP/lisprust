@@ -5,8 +5,9 @@ use cranelift::prelude::*;
 use cranelift::codegen::ir::BlockArg;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, Linkage, Module};
-use crate::vm::vp::{Value as LispValue, Instr, JumpCondition, VirtualProgram, FunctionHeader};
+use crate::vm::vp::{Value as LispValue, Instr, JumpCondition, VirtualProgram, FunctionHeader, HeapValue};
 use crate::vm::vm::Vm;
+use crate::vm::gc::Arena;
 
 pub mod jit_types;
 pub mod analysis;
@@ -171,14 +172,14 @@ impl Jit {
         Some(self.module.get_finalized_function(wrapper_id))
     }
 
-    fn try_compile_fast(&mut self, global_vars: &Vec<LispValue>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Option<*const u8> {
+    fn try_compile_fast(&mut self, global_vars: &Vec<LispValue>, heap: &Arena<HeapValue>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Option<*const u8> {
         if let Some(&code) = self.fast_cache.get(&start_addr) {
             return self.generate_wrapper(prog, start_addr, code);
         }
 
         self.pending_funcs.clear();
         
-        let _ = self.compile_fast_internal(global_vars, prog, start_addr, end_addr)?;
+        let _ = self.compile_fast_internal(global_vars, heap, prog, start_addr, end_addr)?;
         
         if let Err(e) = self.module.finalize_definitions() {
              println!("Finalize definitions failed: {}", e);
@@ -196,7 +197,7 @@ impl Jit {
         self.generate_wrapper(prog, start_addr, *fast_ptr)
     }
 
-    fn compile_fast_internal(&mut self, global_vars: &Vec<LispValue>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Option<cranelift_module::FuncId> {
+    fn compile_fast_internal(&mut self, global_vars: &Vec<LispValue>, heap: &Arena<HeapValue>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Option<cranelift_module::FuncId> {
         if let Some(&id) = self.pending_funcs.get(&start_addr) {
             return Some(id);
         }
@@ -449,7 +450,7 @@ impl Jit {
                              builder.ins().return_call_indirect(sig_ref, callee, &args);
                              break;
                         } else {
-                             if let Some(tgt_id) = self.compile_fast_internal(global_vars, prog, target_addr, target_end) {
+                             if let Some(tgt_id) = self.compile_fast_internal(global_vars, heap, prog, target_addr, target_end) {
                                  let local_tgt = self.module.declare_func_in_func(tgt_id, &mut builder.func);
                                  builder.ins().return_call(local_tgt, &args);
                                  break;
@@ -509,8 +510,16 @@ impl Jit {
                     Instr::LoadGlobal => {
                         let sym_id = prog.read_int().unwrap();
                         if let Some(val) = global_vars.get(sym_id as usize) {
-                            if let Some(f) = val.as_func_ref() {
-                                const_funcs.insert(opcode[1] as usize, f.address);
+                            let addr = match val {
+                                LispValue::Object(handle) => match heap.get(*handle) {
+                                    Some(HeapValue::FuncRef(f)) => Some(f.address),
+                                    _ => None
+                                },
+                                _ => None
+                            };
+                            
+                            if let Some(address) = addr {
+                                const_funcs.insert(opcode[1] as usize, address);
                             } else {
                                 const_funcs.remove(&(opcode[1] as usize));
                             }
@@ -565,7 +574,7 @@ impl Jit {
                              let res = builder.inst_results(call)[0];
                              builder.def_var(vars[target_reg as usize], res);
                         } else {
-                             if let Some(tgt_id) = self.compile_fast_internal(global_vars, prog, target_addr, target_end) {
+                             if let Some(tgt_id) = self.compile_fast_internal(global_vars, heap, prog, target_addr, target_end) {
                                  let local_tgt = self.module.declare_func_in_func(tgt_id, &mut builder.func);
                                  let call = builder.ins().call(local_tgt, &args);
                                  let res = builder.inst_results(call)[0];
@@ -679,14 +688,14 @@ impl Jit {
         Some(fast_func_id)
     }
 
-    pub fn compile(&mut self, global_vars: &Vec<LispValue>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Result<fn(*mut Vm, *mut VirtualProgram, *mut LispValue), String> {
+    pub fn compile(&mut self, global_vars: &Vec<LispValue>, heap: &Arena<HeapValue>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Result<fn(*mut Vm, *mut VirtualProgram, *mut LispValue), String> {
         self.module.clear_context(&mut self.ctx);
         
         if let Some(&code) = self.cache.get(&start_addr) {
             return Ok(unsafe { std::mem::transmute(code) });
         }
 
-        if let Some(wrapper) = self.try_compile_fast(global_vars, prog, start_addr, end_addr) {
+        if let Some(wrapper) = self.try_compile_fast(global_vars, heap, prog, start_addr, end_addr) {
             self.cache.insert(start_addr, wrapper);
             return Ok(unsafe { std::mem::transmute(wrapper) });
         }

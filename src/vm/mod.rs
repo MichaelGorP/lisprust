@@ -1,6 +1,7 @@
 pub mod compiler;
 pub mod vm;
 pub mod vp;
+pub mod gc;
 pub mod math_functions;
 pub mod list_functions;
 pub mod misc_functions;

@@ -52,7 +52,10 @@ pub enum Token {
     Boolean(bool),
     #[regex(r"[+-]?((\d+\.?\d*)|(\.\d+))(([eE][+-]?)?\d+)?", |lex| { lex.slice().parse() }, priority = 2)]
     Float(f64),
-    #[regex("\"*\"", |lex| lex.slice().parse())]
+    #[regex(r#""([^"\\]|\\.)*""#, |lex| {
+        let s = lex.slice();
+        Ok::<String, TokenizingError>(s[1..s.len()-1].to_string())
+    })]
     String(String),
     #[regex("[^ \\t\\r\\n\\f\"\\(\\)\']+", |lex| lex.slice().parse())]
     Symbol(String),

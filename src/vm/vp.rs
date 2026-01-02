@@ -1,5 +1,5 @@
 use std::{cell::Cell, io::{Cursor, Read}, mem::size_of, ops::Range, collections::HashMap};
-use gc::{Gc, GcCell, Trace, Finalize};
+use crate::vm::gc::{Handle, Trace, Arena};
 
 use enum_display::EnumDisplay;
 
@@ -142,12 +142,8 @@ pub struct FunctionData {
     pub fast_jit_code: Cell<u64> // 0 if None
 }
 
-impl Finalize for FunctionData {}
-unsafe impl Trace for FunctionData {
-    unsafe fn trace(&self) {}
-    unsafe fn root(&self) {}
-    unsafe fn unroot(&self) {}
-    fn finalize_glue(&self) { self.finalize(); }
+impl Trace<HeapValue> for FunctionData {
+    fn trace(&self, _arena: &mut Arena<HeapValue>) {}
 }
 
 impl PartialEq for FunctionData {
@@ -156,63 +152,16 @@ impl PartialEq for FunctionData {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Pair {
-    pub car: GcCell<Value>,
-    pub cdr: GcCell<Value>,
+    pub car: Value,
+    pub cdr: Value,
 }
 
-impl Finalize for Pair {}
-unsafe impl Trace for Pair {
-    unsafe fn trace(&self) {
-        self.car.trace();
-        self.cdr.trace();
-    }
-    unsafe fn root(&self) {
-        self.car.root();
-        self.cdr.root();
-    }
-    unsafe fn unroot(&self) {
-        self.car.unroot();
-        self.cdr.unroot();
-    }
-    fn finalize_glue(&self) {
-        self.finalize();
-        self.car.finalize_glue();
-        self.cdr.finalize_glue();
-    }
-}
-
-impl Clone for Pair {
-    fn clone(&self) -> Self {
-        Pair {
-            car: GcCell::new(self.get_car()),
-            cdr: GcCell::new(self.get_cdr()),
-        }
-    }
-}
-
-impl Pair {
-    pub fn get_car(&self) -> Value {
-        self.car.borrow().clone()
-    }
-
-    pub fn get_cdr(&self) -> Value {
-        self.cdr.borrow().clone()
-    }
-}
-
-impl PartialEq for Pair {
-    fn eq(&self, other: &Self) -> bool {
-        self.get_car() == other.get_car() && self.get_cdr() == other.get_cdr()
-    }
-}
-
-impl std::fmt::Debug for Pair {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Pair")
-         .field("car", &self.get_car())
-         .field("cdr", &self.get_cdr())
-         .finish()
+impl Trace<HeapValue> for Pair {
+    fn trace(&self, arena: &mut Arena<HeapValue>) {
+        self.car.trace(arena);
+        self.cdr.trace(arena);
     }
 }
 
@@ -231,24 +180,12 @@ impl std::fmt::Debug for ClosureData {
     }
 }
 
-impl Finalize for ClosureData {}
-unsafe impl Trace for ClosureData {
-    unsafe fn trace(&self) {
-        self.function.trace();
-        self.captures.trace();
-    }
-    unsafe fn root(&self) {
-        self.function.root();
-        self.captures.root();
-    }
-    unsafe fn unroot(&self) {
-        self.function.unroot();
-        self.captures.unroot();
-    }
-    fn finalize_glue(&self) {
-        self.finalize();
-        self.function.finalize_glue();
-        self.captures.finalize_glue();
+impl Trace<HeapValue> for ClosureData {
+    fn trace(&self, arena: &mut Arena<HeapValue>) {
+        self.function.trace(arena);
+        for capture in &self.captures {
+            capture.trace(arena);
+        }
     }
 }
 
@@ -259,7 +196,7 @@ pub enum HeapValue {
     Pair(Pair),
     FuncRef(FunctionData),
     Closure(ClosureData),
-    Ref(GcCell<Value>)
+    Ref(Value)
 }
 
 impl std::fmt::Debug for HeapValue {
@@ -273,89 +210,34 @@ impl std::fmt::Display for HeapValue {
         match self {
             HeapValue::String(s) => write!(f, "{:?}", s),
             HeapValue::Symbol(s) => write!(f, "{}", s),
-            HeapValue::Pair(p) => {
-                write!(f, "(")?;
-                write!(f, "{}", p.get_car())?;
-                let mut current = p.get_cdr();
-                loop {
-                    match current {
-                        Value::Empty => break,
-                        Value::Object(o) => {
-                            match &*o {
-                                HeapValue::Pair(next_p) => {
-                                    write!(f, " {}", next_p.get_car())?;
-                                    current = next_p.get_cdr();
-                                },
-                                _ => {
-                                    write!(f, " . {}", o)?;
-                                    break;
-                                }
-                            }
-                        },
-                        _ => {
-                            write!(f, " . {}", current)?;
-                            break;
-                        }
-                    }
-                }
-                write!(f, ")")
-            },
+            HeapValue::Pair(_) => write!(f, "(...)"),
             HeapValue::FuncRef(_) => write!(f, "#<function>"),
             HeapValue::Closure(_) => write!(f, "#<closure>"),
-            HeapValue::Ref(r) => write!(f, "#<ref {}>", r.borrow()),
+            HeapValue::Ref(_) => write!(f, "#<ref>"),
         }
     }
 }
 
-impl Finalize for HeapValue {}
-unsafe impl Trace for HeapValue {
-    unsafe fn trace(&self) {
+impl Trace<HeapValue> for HeapValue {
+    fn trace(&self, arena: &mut Arena<HeapValue>) {
         match self {
             HeapValue::String(_) | HeapValue::Symbol(_) => {},
-            HeapValue::Pair(p) => p.trace(),
-            HeapValue::FuncRef(f) => f.trace(),
-            HeapValue::Closure(c) => c.trace(),
-            HeapValue::Ref(r) => r.trace(),
-        }
-    }
-    unsafe fn root(&self) {
-        match self {
-            HeapValue::String(_) | HeapValue::Symbol(_) => {},
-            HeapValue::Pair(p) => p.root(),
-            HeapValue::FuncRef(f) => f.root(),
-            HeapValue::Closure(c) => c.root(),
-            HeapValue::Ref(r) => r.root(),
-        }
-    }
-    unsafe fn unroot(&self) {
-        match self {
-            HeapValue::String(_) | HeapValue::Symbol(_) => {},
-            HeapValue::Pair(p) => p.unroot(),
-            HeapValue::FuncRef(f) => f.unroot(),
-            HeapValue::Closure(c) => c.unroot(),
-            HeapValue::Ref(r) => r.unroot(),
-        }
-    }
-    fn finalize_glue(&self) {
-        self.finalize();
-        match self {
-            HeapValue::String(_) | HeapValue::Symbol(_) => {},
-            HeapValue::Pair(p) => p.finalize_glue(),
-            HeapValue::FuncRef(f) => f.finalize_glue(),
-            HeapValue::Closure(c) => c.finalize_glue(),
-            HeapValue::Ref(r) => r.finalize_glue(),
+            HeapValue::Pair(p) => p.trace(arena),
+            HeapValue::FuncRef(f) => f.trace(arena),
+            HeapValue::Closure(c) => c.trace(arena),
+            HeapValue::Ref(v) => v.trace(arena),
         }
     }
 }
 
-#[derive(PartialEq, Clone)]
+#[derive(PartialEq, Clone, Copy)]
 #[repr(C, u8)]
 pub enum Value {
     Empty,
     Boolean(bool),
     Integer(i64),
     Float(f64),
-    Object(Gc<HeapValue>)
+    Object(Handle)
 }
 
 impl std::fmt::Debug for Value {
@@ -371,35 +253,15 @@ impl std::fmt::Display for Value {
             Value::Boolean(b) => write!(f, "{}", if *b { "#t" } else { "#f" }),
             Value::Integer(i) => write!(f, "{}", i),
             Value::Float(fl) => write!(f, "{}", fl),
-            Value::Object(o) => write!(f, "{}", o),
+            Value::Object(_) => write!(f, "#<object>"),
         }
     }
 }
 
-impl Finalize for Value {}
-unsafe impl Trace for Value {
-    unsafe fn trace(&self) {
+impl Trace<HeapValue> for Value {
+    fn trace(&self, arena: &mut Arena<HeapValue>) {
         match self {
-            Value::Object(o) => o.trace(),
-            _ => {}
-        }
-    }
-    unsafe fn root(&self) {
-        match self {
-            Value::Object(o) => o.root(),
-            _ => {}
-        }
-    }
-    unsafe fn unroot(&self) {
-        match self {
-            Value::Object(o) => o.unroot(),
-            _ => {}
-        }
-    }
-    fn finalize_glue(&self) {
-        self.finalize();
-        match self {
-            Value::Object(o) => o.finalize_glue(),
+            Value::Object(handle) => arena.mark(*handle),
             _ => {}
         }
     }
@@ -412,37 +274,15 @@ impl Value {
             _ => true
         }
     }
-
-    pub fn as_func_ref(&self) -> Option<&FunctionData> {
-        if let Value::Object(o) = self {
-            if let HeapValue::FuncRef(f) = &**o {
-                return Some(f);
-            }
-        }
-        None
-    }
-
-    pub fn as_closure(&self) -> Option<&ClosureData> {
-        if let Value::Object(o) = self {
-            if let HeapValue::Closure(c) = &**o {
-                return Some(c);
-            }
-        }
-        None
-    }
-    
-    pub fn as_ref(&self) -> Option<&GcCell<Value>> {
-        if let Value::Object(o) = self {
-            if let HeapValue::Ref(r) = &**o {
-                return Some(r);
-            }
-        }
-        None
-    }
 }
 
 
-pub trait VmContext {}
+pub trait VmContext {
+    fn heap(&mut self) -> &mut Arena<HeapValue>;
+    fn collect(&mut self);
+    fn push_scratch(&mut self, val: Value);
+    fn pop_scratch(&mut self);
+}
 
 pub type VmCallableFunction = fn(&mut dyn VmContext, &[Value]) -> Result<Value, String>;
 

@@ -1,8 +1,8 @@
-use gc::{Gc, GcCell};
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 
 use crate::parser::{SExpression, Atom};
+use crate::vm::gc::{Arena, Handle};
 
 use super::vp::{ClosureData, FunctionData, FunctionHeader, Instr, JumpCondition, Value, HeapValue, VirtualProgram, VmContext};
 use super::jit::Jit;
@@ -93,27 +93,78 @@ pub trait Debugger {
 
 #[repr(C)]
 pub struct Vm {
+    pub heap: Arena<HeapValue>,
     pub registers: Vec<Value>,
     pub global_vars: Vec<Value>,
+    pub symbol_table: HashMap<String, Handle>,
     pub(super) call_states: Vec<CallState>,
     pub window_start: usize,
     pub jit: Jit,
     pub jit_enabled: bool,
     pub scratch_buffer: Vec<Value>,
+    pub roots_buffer: Vec<Handle>,
     pub tail_call_pending: bool,
     pub next_jit_code: u64,
 }
 
-impl VmContext for Vm {}
+impl VmContext for Vm {
+    fn heap(&mut self) -> &mut Arena<HeapValue> {
+        &mut self.heap
+    }
+
+    fn collect(&mut self) {
+        self.collect_garbage();
+    }
+
+    fn push_scratch(&mut self, val: Value) {
+        self.scratch_buffer.push(val);
+    }
+
+    fn pop_scratch(&mut self) {
+        self.scratch_buffer.pop();
+    }
+}
 
 impl Vm {
     pub fn new(jit_enabled: bool) -> Vm {
         const EMPTY : Value = empty_value();
-        Vm {registers: vec![EMPTY; 64000], global_vars: Vec::new(), call_states: Vec::new(), window_start: 0, jit: Jit::new(), jit_enabled, scratch_buffer: Vec::with_capacity(32), tail_call_pending: false, next_jit_code: 0}
+        Vm {heap: Arena::new(), registers: vec![EMPTY; 64000], global_vars: Vec::new(), symbol_table: HashMap::new(), call_states: Vec::new(), window_start: 0, jit: Jit::new(), jit_enabled, scratch_buffer: Vec::with_capacity(32), roots_buffer: Vec::with_capacity(1024), tail_call_pending: false, next_jit_code: 0}
+    }
+
+    pub fn collect_garbage(&mut self) {
+        if self.heap.allocated_objects < self.heap.next_gc_threshold {
+            return;
+        }
+        
+        self.roots_buffer.clear();
+        
+        for v in &self.registers {
+            if let Value::Object(h) = v {
+                self.roots_buffer.push(*h);
+            }
+        }
+        
+        for v in &self.global_vars {
+            if let Value::Object(h) = v {
+                self.roots_buffer.push(*h);
+            }
+        }
+        
+        for h in self.symbol_table.values() {
+            self.roots_buffer.push(*h);
+        }
+        
+        for v in &self.scratch_buffer {
+            if let Value::Object(h) = v {
+                self.roots_buffer.push(*h);
+            }
+        }
+        
+        self.heap.collect(&self.roots_buffer);
     }
 
     pub fn run_jit_function(&mut self, prog: *mut VirtualProgram, start_addr: u64, end_addr: u64) {
-        match self.jit.compile(&self.global_vars, unsafe { &mut *prog }, start_addr, end_addr) {
+        match self.jit.compile(&self.global_vars, &self.heap, unsafe { &mut *prog }, start_addr, end_addr) {
             Ok(func) => {
                 unsafe {
                     let mut current_func = func;
@@ -148,12 +199,12 @@ impl Vm {
     }
 
     fn resolve_value(&self, val: &Value) -> Value {
-        if let Value::Object(o) = val {
-            if let HeapValue::Ref(r) = &**o {
-                return r.borrow().clone();
+        if let Value::Object(handle) = val {
+            if let Some(HeapValue::Ref(r)) = self.heap.get(*handle) {
+                return *r;
             }
         }
-        val.clone()
+        *val
     }
 
     pub(super) fn scan_function_end(&self, prog: &mut VirtualProgram, start_addr: u64) -> u64 {
@@ -248,19 +299,28 @@ impl Vm {
                     let Some(val) = prog.read_string() else {
                         return None;
                     };
-                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(Gc::new(HeapValue::String(val)));
+                    self.collect_garbage();
+                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(self.heap.alloc(HeapValue::String(val)));
                 },
                 Ok(Instr::LoadSymbol) => {
                     let Some(val) = prog.read_string() else {
                         return None;
                     };
-                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(Gc::new(HeapValue::Symbol(val)));
+                    self.collect_garbage();
+                    let handle = if let Some(&h) = self.symbol_table.get(&val) {
+                        h
+                    } else {
+                        let h = self.heap.alloc(HeapValue::Symbol(val.clone()));
+                        self.symbol_table.insert(val, h);
+                        h
+                    };
+                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(handle);
                 },
                 Ok(Instr::LoadNil) => {
                     self.registers[opcode[1] as usize + self.window_start] = Value::Empty;
                 },
                 Ok(Instr::CopyReg) => {
-                    self.registers[opcode[1] as usize + self.window_start] = self.registers[opcode[2] as usize + self.window_start].clone();
+                    self.registers[opcode[1] as usize + self.window_start] = self.registers[opcode[2] as usize + self.window_start];
                 },
                 Ok(Instr::SwapReg) => {
                     let src_reg = self.window_start + opcode[1] as usize;
@@ -384,16 +444,19 @@ impl Vm {
                         break;
                     };
                     let func_addr = header_addr as usize + std::mem::size_of::<FunctionHeader>();
-                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(Gc::new(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(0), fast_jit_code: Cell::new(0)})));
+                    self.collect_garbage();
+                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(self.heap.alloc(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(0), fast_jit_code: Cell::new(0)})));
                 },
                 Ok(Instr::CallSymbol) => {
                     let func_reg = opcode[1] as usize + self.window_start;
                     let resolved_func = self.resolve_value(&self.registers[func_reg]);
 
-                    let (header, address, captures) = if let Some(f) = resolved_func.as_func_ref() {
-                        (f.header, f.address, None)
-                    } else if let Some(c) = resolved_func.as_closure() {
-                        (c.function.header, c.function.address, Some(c.captures.clone()))
+                    let (header, address, captures) = if let Value::Object(handle) = resolved_func {
+                        match self.heap.get(handle) {
+                            Some(HeapValue::FuncRef(f)) => (f.header, f.address, None),
+                            Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone())),
+                            _ => return None
+                        }
                     } else {
                         return None;
                     };
@@ -435,10 +498,12 @@ impl Vm {
                     // For tail-calls, clone the function value instead of swapping it out.
                     let resolved_func = self.resolve_value(&self.registers[opcode[1] as usize + self.window_start]);
 
-                    let (header, address, captures) = if let Some(f) = resolved_func.as_func_ref() {
-                        (f.header, f.address, None)
-                    } else if let Some(c) = resolved_func.as_closure() {
-                        (c.function.header, c.function.address, Some(c.captures.clone()))
+                    let (header, address, captures) = if let Value::Object(handle) = resolved_func {
+                        match self.heap.get(handle) {
+                            Some(HeapValue::FuncRef(f)) => (f.header, f.address, None),
+                            Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone())),
+                            _ => return None
+                        }
                     } else {
                         return None;
                     };
@@ -515,35 +580,54 @@ impl Vm {
                     let mut captures = Vec::with_capacity(count);
                     for _ in 0..count {
                         let Some(reg_idx) = prog.read_byte() else { break; };
-                        let val = self.registers[reg_idx as usize + self.window_start].clone();
+                        let val = self.registers[reg_idx as usize + self.window_start];
                         captures.push(val);
                     }
                     
-                    let func_val = &self.registers[func_reg];
+                    let func_val = self.registers[func_reg];
 
-                    if let Some(fd) = func_val.as_func_ref() {
-                        self.registers[dest_reg] = Value::Object(Gc::new(HeapValue::Closure(ClosureData{function: fd.clone(), captures})));
+                    if let Value::Object(handle) = func_val {
+                        if let Some(HeapValue::FuncRef(fd)) = self.heap.get(handle) {
+                             let fd_clone = fd.clone();
+                             for c in &captures {
+                                 self.scratch_buffer.push(*c);
+                             }
+                             self.collect_garbage();
+                             for _ in &captures {
+                                 self.scratch_buffer.pop();
+                             }
+                             self.registers[dest_reg] = Value::Object(self.heap.alloc(HeapValue::Closure(ClosureData{function: fd_clone, captures})));
+                        } else {
+                             self.registers[dest_reg] = Value::Empty;
+                        }
                     } else {
                         self.registers[dest_reg] = Value::Empty; 
                     }
                 },
                 Ok(Instr::MakeRef) => {
                     let reg = opcode[1] as usize + self.window_start;
-                    let val = self.registers[reg].clone();
-                    self.registers[reg] = Value::Object(Gc::new(HeapValue::Ref(GcCell::new(val))));
+                    let val = self.registers[reg];
+                    self.collect_garbage();
+                    self.registers[reg] = Value::Object(self.heap.alloc(HeapValue::Ref(val)));
                 },
                 Ok(Instr::SetRef) => {
                     let dest_reg = opcode[1] as usize + self.window_start;
                     let src_reg = opcode[2] as usize + self.window_start;
-                    if let Some(r) = self.registers[dest_reg].as_ref() {
-                        *r.borrow_mut() = self.registers[src_reg].clone();
+                    if let Value::Object(handle) = self.registers[dest_reg] {
+                        if let Some(HeapValue::Ref(r)) = self.heap.get_mut(handle) {
+                            *r = self.registers[src_reg];
+                        }
                     }
                 },
                 Ok(Instr::Deref) => {
                     let dest_reg = opcode[1] as usize + self.window_start;
                     let src_reg = opcode[2] as usize + self.window_start;
-                    let val = if let Some(r) = self.registers[src_reg].as_ref() {
-                        Some(r.borrow().clone())
+                    let val = if let Value::Object(handle) = self.registers[src_reg] {
+                        if let Some(HeapValue::Ref(r)) = self.heap.get(handle) {
+                            Some(*r)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     };
@@ -551,7 +635,7 @@ impl Vm {
                     if let Some(v) = val {
                         self.registers[dest_reg] = v;
                     } else {
-                        self.registers[dest_reg] = self.registers[src_reg].clone();
+                        self.registers[dest_reg] = self.registers[src_reg];
                     }
                 },
                 Ok(Instr::Ret) => {
@@ -578,41 +662,41 @@ impl Vm {
         let res_reg = prog.get_result_reg() as usize + self.window_start;
 
         //convert result
-        value_to_sexpr(&self.registers[res_reg])
+        value_to_sexpr(&self.registers[res_reg], &self.heap)
     }
 
 }
 
-fn value_to_sexpr(value: &Value) -> Option<SExpression> {
+fn value_to_sexpr(value: &Value, heap: &Arena<HeapValue>) -> Option<SExpression> {
     match value {
         Value::Empty => Some(SExpression::List(vec![])),
         Value::Boolean(b) => Some(SExpression::Atom(Atom::Boolean(*b))),
         Value::Integer(i) => Some(SExpression::Atom(Atom::Integer(*i))),
         Value::Float(f) => Some(SExpression::Atom(Atom::Float(*f))),
-        Value::Object(o) => match &**o {
-            HeapValue::String(s) => Some(SExpression::Atom(Atom::String(s.clone()))),
-            HeapValue::Symbol(s) => Some(SExpression::Symbol(s.clone())),
-            HeapValue::Pair(_) => {
+        Value::Object(handle) => match heap.get(*handle) {
+            Some(HeapValue::String(s)) => Some(SExpression::Atom(Atom::String(s.clone()))),
+            Some(HeapValue::Symbol(s)) => Some(SExpression::Symbol(s.clone())),
+            Some(HeapValue::Pair(_pair)) => {
                 let mut expressions = Vec::new();
-                let mut current = Value::Object(o.clone());
+                let mut current = *value;
                 loop {
                     match current {
                         Value::Empty => break,
-                        Value::Object(obj) => match &*obj {
-                            HeapValue::Pair(pair) => {
-                                let car = pair.get_car();
-                                let sexpr = value_to_sexpr(&car);
+                        Value::Object(h) => match heap.get(h) {
+                            Some(HeapValue::Pair(p)) => {
+                                let car = p.car;
+                                let sexpr = value_to_sexpr(&car, heap);
                                 expressions.push(sexpr.unwrap_or(SExpression::Atom(Atom::Integer(0))));
-                                current = pair.get_cdr();
+                                current = p.cdr;
                             },
                             _ => {
-                                let sexpr = value_to_sexpr(&Value::Object(obj.clone()));
+                                let sexpr = value_to_sexpr(&current, heap);
                                 expressions.push(sexpr.unwrap_or(SExpression::Atom(Atom::Integer(0))));
                                 break;
                             }
                         },
                         _ => {
-                             let sexpr = value_to_sexpr(&current);
+                             let sexpr = value_to_sexpr(&current, heap);
                              expressions.push(sexpr.unwrap_or(SExpression::Atom(Atom::Integer(0))));
                              break;
                         }
@@ -620,9 +704,10 @@ fn value_to_sexpr(value: &Value) -> Option<SExpression> {
                 }
                 Some(SExpression::List(expressions))
             },
-            HeapValue::FuncRef(_) => None,
-            HeapValue::Closure(_) => None,
-            HeapValue::Ref(r) => value_to_sexpr(&r.borrow())
+            Some(HeapValue::FuncRef(_)) => None,
+            Some(HeapValue::Closure(_)) => None,
+            Some(HeapValue::Ref(r)) => value_to_sexpr(r, heap),
+            None => None
         }
     }
 }
