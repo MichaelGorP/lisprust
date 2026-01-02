@@ -18,8 +18,10 @@ fn main() {
     let mut use_jit = true;
     let mut profile = false;
     let mut filename = None;
+    let mut repetitions = 1;
 
-    for a in args.iter().skip(1) {
+    let mut args_iter = args.iter().skip(1);
+    while let Some(a) = args_iter.next() {
         if a == "--asm" {
             generate_asm = true;
         } else if a == "--debug" {
@@ -28,6 +30,10 @@ fn main() {
             use_jit = false;
         } else if a == "--profile" {
             profile = true;
+        } else if a == "--repeat" {
+            if let Some(n) = args_iter.next() {
+                repetitions = n.parse().unwrap_or(1);
+            }
         } else {
             filename = Some(a);
         }
@@ -76,7 +82,11 @@ fn main() {
     };
 
     let start = std::time::Instant::now();
-    let res = vm.run(&mut prog);
+    let mut res = None;
+    for _ in 0..repetitions {
+        prog.cursor.set_position(0);
+        res = vm.run(&mut prog);
+    }
     let duration = start.elapsed();
     
     if let Some(mut p) = profiler {
