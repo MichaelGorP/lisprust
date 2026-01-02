@@ -1,19 +1,18 @@
-use super::{compiler::Compiler, vp::Value};
+use super::{compiler::Compiler, vp::Value, vp::VmContext};
 
 pub fn register_functions(compiler: &mut Compiler) {
-    compiler.register_function("error", error);
+    compiler.register_function("error", error, None);
 }
 
-fn error(args: &[Value]) -> Value {
+fn error(_ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     if args.len() < 1 {
-        panic!("error expects at least 1 argument");
+        return Err("error expects at least 1 argument".to_string());
     }
-    // Print error message
-    print!("Error: ");
+    // Construct error message
+    let mut msg = String::from("Error: ");
     for arg in args {
-        print!("{:?} ", arg);
+        msg.push_str(&format!("{:?} ", arg));
     }
-    println!();
     
-    panic!("Runtime Error");
+    Err(msg)
 }

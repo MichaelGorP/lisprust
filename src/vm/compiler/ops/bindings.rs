@@ -287,7 +287,7 @@ fn compile_quoted_expr(compiler: &mut Compiler, expr: &SExpression) -> Result<u8
                 let mut last_reg = compiler.scopes.allocate_reg()?;
                 compiler.bytecode.store_opcode(Instr::LoadNil, last_reg, 0, 0);
 
-                let cons_func = compiler.functions.get_registered_function("cons")
+                let (cons_func, _) = compiler.functions.get_registered_function("cons")
                     .ok_or(CompilationError::from("cons function not found"))?;
                 let cons_id = compiler.functions.get_or_insert_used_function("cons", cons_func);
 

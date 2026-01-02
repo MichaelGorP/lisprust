@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use crate::parser::{SExpression, Atom};
 
-use super::vp::{ClosureData, FunctionData, FunctionHeader, Instr, JumpCondition, Value, HeapValue, VirtualProgram};
+use super::vp::{ClosureData, FunctionData, FunctionHeader, Instr, JumpCondition, Value, HeapValue, VirtualProgram, VmContext};
 use super::jit::Jit;
 
 macro_rules! binary_op {
@@ -103,6 +103,8 @@ pub struct Vm {
     pub tail_call_pending: bool,
     pub next_jit_code: u64,
 }
+
+impl VmContext for Vm {}
 
 impl Vm {
     pub fn new(jit_enabled: bool) -> Vm {
@@ -499,7 +501,11 @@ impl Vm {
                     };
                     let start_reg = opcode[2] as usize;
                     let reg_count = opcode[3] as usize;
-                    self.registers[opcode[1] as usize + self.window_start] = function(&self.registers[self.window_start + start_reg.. self.window_start + start_reg + reg_count]);
+                    let args = self.registers[self.window_start + start_reg.. self.window_start + start_reg + reg_count].to_vec();
+                    match function(self, &args) {
+                        Ok(v) => self.registers[opcode[1] as usize + self.window_start] = v,
+                        Err(e) => panic!("Runtime error: {}", e),
+                    }
                 }
                 Ok(Instr::MakeClosure) => {
                     let dest_reg = opcode[1] as usize + self.window_start;

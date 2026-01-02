@@ -175,14 +175,18 @@ pub unsafe extern "C" fn helper_load_func_ref(vm: *mut Vm, prog: *mut VirtualPro
 }
 
 pub unsafe extern "C" fn helper_call_function(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, start_reg: usize, reg_count: usize, func_id: i64) {
-    let _vm = &mut *vm;
+    let vm = &mut *vm;
     let prog = &mut *prog;
     
     let Some(function) = prog.get_function(func_id) else { return };
     
-    let args = std::slice::from_raw_parts(registers.add(start_reg), reg_count);
-    let result = function(args);
-    *registers.add(dest_reg) = result;
+    let args_slice = std::slice::from_raw_parts(registers.add(start_reg), reg_count);
+    let args = args_slice.to_vec();
+    
+    match function(vm, &args) {
+        Ok(val) => *registers.add(dest_reg) = val,
+        Err(e) => panic!("Runtime error: {}", e),
+    }
 }
 
 pub unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, func_reg: usize, param_start: usize, target_reg: usize) {

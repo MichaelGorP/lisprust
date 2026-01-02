@@ -442,7 +442,9 @@ impl Value {
 }
 
 
-pub type VmCallableFunction = fn(&[Value]) -> Value;
+pub trait VmContext {}
+
+pub type VmCallableFunction = fn(&mut dyn VmContext, &[Value]) -> Result<Value, String>;
 
 #[derive(Clone)]
 pub struct VirtualProgram {

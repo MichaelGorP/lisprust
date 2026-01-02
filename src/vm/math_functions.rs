@@ -1,28 +1,28 @@
-use super::{compiler::Compiler, vp::Value};
+use super::{compiler::Compiler, vp::Value, vp::VmContext};
 
 pub fn register_functions(compiler: &mut Compiler) {
-    compiler.register_function("sin", sin_impl);
-    compiler.register_function("cos", cos_impl);
-    compiler.register_function("tan", tan_impl);
-    compiler.register_function("asin", asin_impl);
-    compiler.register_function("acos", acos_impl);
-    compiler.register_function("atan", atan_impl);
-    compiler.register_function("sqrt", sqrt_impl);
-    compiler.register_function("exp", exp_impl);
-    compiler.register_function("log", log_impl);
-    compiler.register_function("expt", expt_impl);
-    compiler.register_function("abs", abs_impl);
-    compiler.register_function("floor", floor_impl);
-    compiler.register_function("ceiling", ceiling_impl);
-    compiler.register_function("truncate", truncate_impl);
-    compiler.register_function("round", round_impl);
-    compiler.register_function("quotient", quotient_impl);
-    compiler.register_function("remainder", remainder_impl);
-    compiler.register_function("modulo", modulo_impl);
-    compiler.register_function("gcd", gcd_impl);
-    compiler.register_function("lcm", lcm_impl);
-    compiler.register_function("max", max_impl);
-    compiler.register_function("min", min_impl);
+    compiler.register_function("sin", sin_impl, Some(1));
+    compiler.register_function("cos", cos_impl, Some(1));
+    compiler.register_function("tan", tan_impl, Some(1));
+    compiler.register_function("asin", asin_impl, Some(1));
+    compiler.register_function("acos", acos_impl, Some(1));
+    compiler.register_function("atan", atan_impl, Some(1));
+    compiler.register_function("sqrt", sqrt_impl, Some(1));
+    compiler.register_function("exp", exp_impl, Some(1));
+    compiler.register_function("log", log_impl, Some(1));
+    compiler.register_function("expt", expt_impl, Some(2));
+    compiler.register_function("abs", abs_impl, Some(1));
+    compiler.register_function("floor", floor_impl, Some(1));
+    compiler.register_function("ceiling", ceiling_impl, Some(1));
+    compiler.register_function("truncate", truncate_impl, Some(1));
+    compiler.register_function("round", round_impl, Some(1));
+    compiler.register_function("quotient", quotient_impl, Some(2));
+    compiler.register_function("remainder", remainder_impl, Some(2));
+    compiler.register_function("modulo", modulo_impl, Some(2));
+    compiler.register_function("gcd", gcd_impl, None);
+    compiler.register_function("lcm", lcm_impl, None);
+    compiler.register_function("max", max_impl, None);
+    compiler.register_function("min", min_impl, None);
 }
 
 fn get_float(v: &Value) -> Option<f64> {
@@ -33,211 +33,213 @@ fn get_float(v: &Value) -> Option<f64> {
     }
 }
 
-fn sin_impl(input: &[Value]) -> Value {
+fn sin_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 1 {
         if let Some(f) = get_float(&input[0]) {
-            return Value::Float(f.sin())
+            return Ok(Value::Float(f.sin()));
         }
     }
-    Value::Empty
+    Err("sin expects 1 number argument".to_string())
 }
 
-fn cos_impl(input: &[Value]) -> Value {
+fn cos_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 1 {
         if let Some(f) = get_float(&input[0]) {
-            return Value::Float(f.cos())
+            return Ok(Value::Float(f.cos()));
         }
     }
-    Value::Empty
+    Err("cos expects 1 number argument".to_string())
 }
 
-fn tan_impl(input: &[Value]) -> Value {
+fn tan_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 1 {
         if let Some(f) = get_float(&input[0]) {
-            return Value::Float(f.tan())
+            return Ok(Value::Float(f.tan()));
         }
     }
-    Value::Empty
+    Err("tan expects 1 number argument".to_string())
 }
 
-fn asin_impl(input: &[Value]) -> Value {
+fn asin_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 1 {
         if let Some(f) = get_float(&input[0]) {
-            return Value::Float(f.asin())
+            return Ok(Value::Float(f.asin()));
         }
     }
-    Value::Empty
+    Err("asin expects 1 number argument".to_string())
 }
 
-fn acos_impl(input: &[Value]) -> Value {
+fn acos_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 1 {
         if let Some(f) = get_float(&input[0]) {
-            return Value::Float(f.acos())
+            return Ok(Value::Float(f.acos()));
         }
     }
-    Value::Empty
+    Err("acos expects 1 number argument".to_string())
 }
 
-fn atan_impl(input: &[Value]) -> Value {
+fn atan_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 1 {
         if let Some(f) = get_float(&input[0]) {
-            return Value::Float(f.atan())
+            return Ok(Value::Float(f.atan()));
         }
     } else if input.len() == 2 {
         if let (Some(y), Some(x)) = (get_float(&input[0]), get_float(&input[1])) {
-            return Value::Float(y.atan2(x))
+            return Ok(Value::Float(y.atan2(x)));
         }
     }
-    Value::Empty
+    Err("atan expects 1 or 2 number arguments".to_string())
 }
 
-fn sqrt_impl(input: &[Value]) -> Value {
+fn sqrt_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 1 {
         if let Some(f) = get_float(&input[0]) {
-            return Value::Float(f.sqrt())
+            if f < 0.0 { return Err("sqrt expects non-negative argument".to_string()); }
+            return Ok(Value::Float(f.sqrt()));
         }
     }
-    Value::Empty
+    Err("sqrt expects 1 number argument".to_string())
 }
 
-fn exp_impl(input: &[Value]) -> Value {
+fn exp_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 1 {
         if let Some(f) = get_float(&input[0]) {
-            return Value::Float(f.exp())
+            return Ok(Value::Float(f.exp()));
         }
     }
-    Value::Empty
+    Err("exp expects 1 number argument".to_string())
 }
 
-fn log_impl(input: &[Value]) -> Value {
+fn log_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 1 {
         if let Some(f) = get_float(&input[0]) {
-            return Value::Float(f.ln())
+            if f <= 0.0 { return Err("log expects positive argument".to_string()); }
+            return Ok(Value::Float(f.ln()));
         }
     }
-    Value::Empty
+    Err("log expects 1 number argument".to_string())
 }
 
-fn expt_impl(input: &[Value]) -> Value {
+fn expt_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 2 {
         if let (Some(b), Some(e)) = (get_float(&input[0]), get_float(&input[1])) {
-            return Value::Float(b.powf(e))
+            return Ok(Value::Float(b.powf(e)));
         }
     }
-    Value::Empty
+    Err("expt expects 2 number arguments".to_string())
 }
 
-fn abs_impl(input: &[Value]) -> Value {
+fn abs_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 1 {
         match input[0] {
-            Value::Float(f) => Value::Float(f.abs()),
-            Value::Integer(i) => Value::Integer(i.abs()),
-            _ => Value::Empty
+            Value::Float(f) => Ok(Value::Float(f.abs())),
+            Value::Integer(i) => Ok(Value::Integer(i.abs())),
+            _ => Err("abs expects a number".to_string())
         }
     } else {
-        Value::Empty
+        Err("abs expects 1 argument".to_string())
     }
 }
 
-fn floor_impl(input: &[Value]) -> Value {
+fn floor_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 1 {
         match input[0] {
-            Value::Float(f) => Value::Float(f.floor()),
-            Value::Integer(i) => Value::Integer(i),
-            _ => Value::Empty
+            Value::Float(f) => Ok(Value::Float(f.floor())),
+            Value::Integer(i) => Ok(Value::Integer(i)),
+            _ => Err("floor expects a number".to_string())
         }
     } else {
-        Value::Empty
+        Err("floor expects 1 argument".to_string())
     }
 }
 
-fn ceiling_impl(input: &[Value]) -> Value {
+fn ceiling_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 1 {
         match input[0] {
-            Value::Float(f) => Value::Float(f.ceil()),
-            Value::Integer(i) => Value::Integer(i),
-            _ => Value::Empty
+            Value::Float(f) => Ok(Value::Float(f.ceil())),
+            Value::Integer(i) => Ok(Value::Integer(i)),
+            _ => Err("ceiling expects a number".to_string())
         }
     } else {
-        Value::Empty
+        Err("ceiling expects 1 argument".to_string())
     }
 }
 
-fn truncate_impl(input: &[Value]) -> Value {
+fn truncate_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 1 {
         match input[0] {
-            Value::Float(f) => Value::Float(f.trunc()),
-            Value::Integer(i) => Value::Integer(i),
-            _ => Value::Empty
+            Value::Float(f) => Ok(Value::Float(f.trunc())),
+            Value::Integer(i) => Ok(Value::Integer(i)),
+            _ => Err("truncate expects a number".to_string())
         }
     } else {
-        Value::Empty
+        Err("truncate expects 1 argument".to_string())
     }
 }
 
-fn round_impl(input: &[Value]) -> Value {
+fn round_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 1 {
         match input[0] {
-            Value::Float(f) => Value::Float(f.round()),
-            Value::Integer(i) => Value::Integer(i),
-            _ => Value::Empty
+            Value::Float(f) => Ok(Value::Float(f.round())),
+            Value::Integer(i) => Ok(Value::Integer(i)),
+            _ => Err("round expects a number".to_string())
         }
     } else {
-        Value::Empty
+        Err("round expects 1 argument".to_string())
     }
 }
 
-fn quotient_impl(input: &[Value]) -> Value {
+fn quotient_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 2 {
         if let (Value::Integer(n1), Value::Integer(n2)) = (&input[0], &input[1]) {
-            if *n2 == 0 { return Value::Empty; }
-            return Value::Integer(n1 / n2);
+            if *n2 == 0 { return Err("division by zero".to_string()); }
+            return Ok(Value::Integer(n1 / n2));
         }
     }
-    Value::Empty
+    Err("quotient expects 2 integers".to_string())
 }
 
-fn remainder_impl(input: &[Value]) -> Value {
+fn remainder_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 2 {
         if let (Value::Integer(n1), Value::Integer(n2)) = (&input[0], &input[1]) {
-            if *n2 == 0 { return Value::Empty; }
-            return Value::Integer(n1 % n2);
+            if *n2 == 0 { return Err("division by zero".to_string()); }
+            return Ok(Value::Integer(n1 % n2));
         }
     }
-    Value::Empty
+    Err("remainder expects 2 integers".to_string())
 }
 
-fn modulo_impl(input: &[Value]) -> Value {
+fn modulo_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.len() == 2 {
         if let (Value::Integer(n1), Value::Integer(n2)) = (&input[0], &input[1]) {
-            if *n2 == 0 { return Value::Empty; }
+            if *n2 == 0 { return Err("division by zero".to_string()); }
             let rem = n1 % n2;
             if (rem < 0 && *n2 > 0) || (rem > 0 && *n2 < 0) {
-                return Value::Integer(rem + n2);
+                return Ok(Value::Integer(rem + n2));
             }
-            return Value::Integer(rem);
+            return Ok(Value::Integer(rem));
         }
     }
-    Value::Empty
+    Err("modulo expects 2 integers".to_string())
 }
 
-fn gcd_impl(input: &[Value]) -> Value {
+fn gcd_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.is_empty() {
-        return Value::Integer(0);
+        return Ok(Value::Integer(0));
     }
     let mut result = match input[0] {
         Value::Integer(i) => i.abs(),
-        _ => return Value::Empty
+        _ => return Err("gcd expects integers".to_string())
     };
     for i in 1..input.len() {
         match input[i] {
             Value::Integer(val) => {
                 result = gcd(result, val.abs());
             },
-            _ => return Value::Empty
+            _ => return Err("gcd expects integers".to_string())
         }
     }
-    Value::Integer(result)
+    Ok(Value::Integer(result))
 }
 
 fn gcd(mut a: i64, mut b: i64) -> i64 {
@@ -249,13 +251,13 @@ fn gcd(mut a: i64, mut b: i64) -> i64 {
     a
 }
 
-fn lcm_impl(input: &[Value]) -> Value {
+fn lcm_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
     if input.is_empty() {
-        return Value::Integer(1);
+        return Ok(Value::Integer(1));
     }
     let mut result = match input[0] {
         Value::Integer(i) => i.abs(),
-        _ => return Value::Empty
+        _ => return Err("lcm expects integers".to_string())
     };
     for i in 1..input.len() {
         match input[i] {
@@ -267,10 +269,10 @@ fn lcm_impl(input: &[Value]) -> Value {
                     result = (result / gcd(result, val)) * val;
                 }
             },
-            _ => return Value::Empty
+            _ => return Err("lcm expects integers".to_string())
         }
     }
-    Value::Integer(result)
+    Ok(Value::Integer(result))
 }
 
 fn compare(v1: &Value, v2: &Value) -> Option<std::cmp::Ordering> {
@@ -283,8 +285,8 @@ fn compare(v1: &Value, v2: &Value) -> Option<std::cmp::Ordering> {
     }
 }
 
-fn max_impl(input: &[Value]) -> Value {
-    if input.is_empty() { return Value::Empty; }
+fn max_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
+    if input.is_empty() { return Err("max expects at least 1 argument".to_string()); }
     let mut max_val = input[0].clone();
     for i in 1..input.len() {
         if let Some(ord) = compare(&input[i], &max_val) {
@@ -292,14 +294,14 @@ fn max_impl(input: &[Value]) -> Value {
                 max_val = input[i].clone();
             }
         } else {
-            return Value::Empty;
+            return Err("max expects numbers".to_string());
         }
     }
-    max_val
+    Ok(max_val)
 }
 
-fn min_impl(input: &[Value]) -> Value {
-    if input.is_empty() { return Value::Empty; }
+fn min_impl(_ctx: &mut dyn VmContext, input: &[Value]) -> Result<Value, String> {
+    if input.is_empty() { return Err("min expects at least 1 argument".to_string()); }
     let mut min_val = input[0].clone();
     for i in 1..input.len() {
         if let Some(ord) = compare(&input[i], &min_val) {
@@ -307,8 +309,8 @@ fn min_impl(input: &[Value]) -> Value {
                 min_val = input[i].clone();
             }
         } else {
-            return Value::Empty;
+            return Err("min expects numbers".to_string());
         }
     }
-    min_val
+    Ok(min_val)
 }

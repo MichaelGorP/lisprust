@@ -64,8 +64,8 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    pub fn register_function(&mut self, name: &str, func: VmCallableFunction) {
-        self.functions.register_function(name, func);
+    pub fn register_function(&mut self, name: &str, func: VmCallableFunction, arg_count: Option<usize>) {
+        self.functions.register_function(name, func, arg_count);
     }
 
     pub fn compile(&mut self, root: &SExpression, map: &'a SourceMap) -> Result<VirtualProgram, CompilationError> {
@@ -165,8 +165,14 @@ impl<'a> Compiler<'a> {
                     let result_reg = self.scopes.allocate_reg()?;
                     //try registered functions first, not overwritable so far
                     let opt_func = self.functions.get_registered_function(s);
-                    if let Some(func) = opt_func {
+                    if let Some((func, expected_args)) = opt_func {
                         self.pop_map();
+
+                        if let Some(count) = expected_args {
+                            if list.len() - 1 != count {
+                                return Err(CompilationError::from(&format!("Function {} expects {} arguments, got {}", s, count, list.len() - 1)));
+                            }
+                        }
 
                         // evaluate all other expressions as arguments
                         let mut arg_regs = Vec::new();

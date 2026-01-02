@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use crate::vm::vp::VmCallableFunction;
 
 pub struct FunctionRegistry {
-    pub registered_functions: HashMap<String, VmCallableFunction>,
+    pub registered_functions: HashMap<String, (VmCallableFunction, Option<usize>)>,
     pub used_functions: Vec<VmCallableFunction>,
     pub function_lookup: HashMap<String, usize>,
 }
@@ -16,11 +16,11 @@ impl FunctionRegistry {
         }
     }
 
-    pub fn register_function(&mut self, name: &str, func: VmCallableFunction) {
-        self.registered_functions.insert(name.into(), func);
+    pub fn register_function(&mut self, name: &str, func: VmCallableFunction, arg_count: Option<usize>) {
+        self.registered_functions.insert(name.into(), (func, arg_count));
     }
 
-    pub fn get_registered_function(&self, name: &str) -> Option<VmCallableFunction> {
+    pub fn get_registered_function(&self, name: &str) -> Option<(VmCallableFunction, Option<usize>)> {
         self.registered_functions.get(name).copied()
     }
 
