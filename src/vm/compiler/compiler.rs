@@ -195,11 +195,27 @@ impl<'a> Compiler<'a> {
                         }
 
                         let reg_count = arg_regs.len() as u8;
-                        let func_id = self.functions.get_or_insert_used_function(s, func);
+                        
+                        // Check for intrinsics
+                        if s == "car" && reg_count == 1 {
+                            self.bytecode.store_opcode(Instr::Car, result_reg, start_reg, 0);
+                        } else if s == "cdr" && reg_count == 1 {
+                            self.bytecode.store_opcode(Instr::Cdr, result_reg, start_reg, 0);
+                        } else if s == "cons" && reg_count == 2 {
+                            self.bytecode.store_opcode(Instr::Cons, result_reg, start_reg, start_reg + 1);
+                        } else if s == "pair?" && reg_count == 1 {
+                            self.bytecode.store_opcode(Instr::IsPair, result_reg, start_reg, 0);
+                        } else if s == "eq?" && reg_count == 2 {
+                            self.bytecode.store_opcode(Instr::IsEq, result_reg, start_reg, start_reg + 1);
+                        } else if s == "null?" && reg_count == 1 {
+                            self.bytecode.store_opcode(Instr::IsNull, result_reg, start_reg, 0);
+                        } else {
+                            let func_id = self.functions.get_or_insert_used_function(s, func);
 
-                        self.bytecode.store_opcode(Instr::CallFunction, result_reg, start_reg, reg_count);
-                        let id: i64 = func_id as i64;
-                        self.bytecode.store_value(&id.to_le_bytes());
+                            self.bytecode.store_opcode(Instr::CallFunction, result_reg, start_reg, reg_count);
+                            let id: i64 = func_id as i64;
+                            self.bytecode.store_value(&id.to_le_bytes());
+                        }
                     }
                     else {
                         // Check for self-recursion optimization
@@ -256,6 +272,77 @@ impl<'a> Compiler<'a> {
                             self.bytecode.store_value(&dist.to_le_bytes());
                         }
                         else {
+                            // Check for intrinsics
+                            if s == "car" && list.len() == 2 {
+                                self.pop_map();
+                                let sub_map = map_list.get(1).unwrap_or(self.current_map());
+                                self.push_map(sub_map);
+                                let arg_reg = self.compile_expr(&list[1], &[], false)?;
+                                self.pop_map();
+                                let result_reg = self.scopes.allocate_reg()?;
+                                self.bytecode.store_opcode(Instr::Car, result_reg, arg_reg, 0);
+                                self.scopes.reset_reg(result_reg + 1);
+                                return Ok(result_reg);
+                            } else if s == "cdr" && list.len() == 2 {
+                                self.pop_map();
+                                let sub_map = map_list.get(1).unwrap_or(self.current_map());
+                                self.push_map(sub_map);
+                                let arg_reg = self.compile_expr(&list[1], &[], false)?;
+                                self.pop_map();
+                                let result_reg = self.scopes.allocate_reg()?;
+                                self.bytecode.store_opcode(Instr::Cdr, result_reg, arg_reg, 0);
+                                self.scopes.reset_reg(result_reg + 1);
+                                return Ok(result_reg);
+                            } else if s == "cons" && list.len() == 3 {
+                                self.pop_map();
+                                let sub_map1 = map_list.get(1).unwrap_or(self.current_map());
+                                self.push_map(sub_map1);
+                                let arg1_reg = self.compile_expr(&list[1], &[], false)?;
+                                self.pop_map();
+                                let sub_map2 = map_list.get(2).unwrap_or(self.current_map());
+                                self.push_map(sub_map2);
+                                let arg2_reg = self.compile_expr(&list[2], &[], false)?;
+                                self.pop_map();
+                                let result_reg = self.scopes.allocate_reg()?;
+                                self.bytecode.store_opcode(Instr::Cons, result_reg, arg1_reg, arg2_reg);
+                                self.scopes.reset_reg(result_reg + 1);
+                                return Ok(result_reg);
+                            } else if s == "pair?" && list.len() == 2 {
+                                self.pop_map();
+                                let sub_map = map_list.get(1).unwrap_or(self.current_map());
+                                self.push_map(sub_map);
+                                let arg_reg = self.compile_expr(&list[1], &[], false)?;
+                                self.pop_map();
+                                let result_reg = self.scopes.allocate_reg()?;
+                                self.bytecode.store_opcode(Instr::IsPair, result_reg, arg_reg, 0);
+                                self.scopes.reset_reg(result_reg + 1);
+                                return Ok(result_reg);
+                            } else if s == "eq?" && list.len() == 3 {
+                                self.pop_map();
+                                let sub_map1 = map_list.get(1).unwrap_or(self.current_map());
+                                self.push_map(sub_map1);
+                                let arg1_reg = self.compile_expr(&list[1], &[], false)?;
+                                self.pop_map();
+                                let sub_map2 = map_list.get(2).unwrap_or(self.current_map());
+                                self.push_map(sub_map2);
+                                let arg2_reg = self.compile_expr(&list[2], &[], false)?;
+                                self.pop_map();
+                                let result_reg = self.scopes.allocate_reg()?;
+                                self.bytecode.store_opcode(Instr::IsEq, result_reg, arg1_reg, arg2_reg);
+                                self.scopes.reset_reg(result_reg + 1);
+                                return Ok(result_reg);
+                            } else if s == "null?" && list.len() == 2 {
+                                self.pop_map();
+                                let sub_map = map_list.get(1).unwrap_or(self.current_map());
+                                self.push_map(sub_map);
+                                let arg_reg = self.compile_expr(&list[1], &[], false)?;
+                                self.pop_map();
+                                let result_reg = self.scopes.allocate_reg()?;
+                                self.bytecode.store_opcode(Instr::IsNull, result_reg, arg_reg, 0);
+                                self.scopes.reset_reg(result_reg + 1);
+                                return Ok(result_reg);
+                            }
+
                             let sym_reg; //register for symbol
                             if let Some(reg) = self.scopes.find_symbol(s.as_str()) {
                                 sym_reg = reg;

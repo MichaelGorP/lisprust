@@ -41,7 +41,14 @@ pub(super) enum Instr {
     MakeClosure,
     MakeRef,
     SetRef,
-    Deref
+    Deref,
+    // List intrinsics
+    Car,
+    Cdr,
+    Cons,
+    IsPair,
+    IsEq,
+    IsNull
 }
 
 #[repr(u8)]
@@ -88,6 +95,12 @@ impl TryFrom<u8> for Instr {
             x if x == Instr::MakeRef as u8 => Ok(Instr::MakeRef),
             x if x == Instr::SetRef as u8 => Ok(Instr::SetRef),
             x if x == Instr::Deref as u8 => Ok(Instr::Deref),
+            x if x == Instr::Car as u8 => Ok(Instr::Car),
+            x if x == Instr::Cdr as u8 => Ok(Instr::Cdr),
+            x if x == Instr::Cons as u8 => Ok(Instr::Cons),
+            x if x == Instr::IsPair as u8 => Ok(Instr::IsPair),
+            x if x == Instr::IsEq as u8 => Ok(Instr::IsEq),
+            x if x == Instr::IsNull as u8 => Ok(Instr::IsNull),
             _ => Err(())
         }
     }

@@ -61,6 +61,12 @@ impl Jit {
         builder.symbol("helper_call_function", helper_call_function as *const u8);
         builder.symbol("helper_load_string", helper_load_string as *const u8);
         builder.symbol("helper_load_symbol", helper_load_symbol as *const u8);
+        builder.symbol("helper_car", helper_car as *const u8);
+        builder.symbol("helper_cdr", helper_cdr as *const u8);
+        builder.symbol("helper_cons", helper_cons as *const u8);
+        builder.symbol("helper_is_pair", helper_is_pair as *const u8);
+        builder.symbol("helper_is_null", helper_is_null as *const u8);
+        builder.symbol("helper_is_eq", helper_is_eq as *const u8);
 
         let module = JITModule::new(builder);
         
@@ -980,6 +986,54 @@ impl Jit {
         let callee_helper_load_symbol = self.module.declare_function("helper_load_symbol", Linkage::Import, &sig_helper_load_symbol).map_err(|e| e.to_string())?;
         let local_helper_load_symbol = self.module.declare_func_in_func(callee_helper_load_symbol, &mut builder.func);
 
+        let mut sig_helper_car = self.module.make_signature();
+        sig_helper_car.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_car.params.push(AbiParam::new(ptr_type)); // registers
+        sig_helper_car.params.push(AbiParam::new(types::I64)); // dest_reg
+        sig_helper_car.params.push(AbiParam::new(types::I64)); // arg_reg
+        let callee_helper_car = self.module.declare_function("helper_car", Linkage::Import, &sig_helper_car).map_err(|e| e.to_string())?;
+        let local_helper_car = self.module.declare_func_in_func(callee_helper_car, &mut builder.func);
+
+        let mut sig_helper_cdr = self.module.make_signature();
+        sig_helper_cdr.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_cdr.params.push(AbiParam::new(ptr_type)); // registers
+        sig_helper_cdr.params.push(AbiParam::new(types::I64)); // dest_reg
+        sig_helper_cdr.params.push(AbiParam::new(types::I64)); // arg_reg
+        let callee_helper_cdr = self.module.declare_function("helper_cdr", Linkage::Import, &sig_helper_cdr).map_err(|e| e.to_string())?;
+        let local_helper_cdr = self.module.declare_func_in_func(callee_helper_cdr, &mut builder.func);
+
+        let mut sig_helper_cons = self.module.make_signature();
+        sig_helper_cons.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_cons.params.push(AbiParam::new(ptr_type)); // registers
+        sig_helper_cons.params.push(AbiParam::new(types::I64)); // dest_reg
+        sig_helper_cons.params.push(AbiParam::new(types::I64)); // car_reg
+        sig_helper_cons.params.push(AbiParam::new(types::I64)); // cdr_reg
+        let callee_helper_cons = self.module.declare_function("helper_cons", Linkage::Import, &sig_helper_cons).map_err(|e| e.to_string())?;
+        let local_helper_cons = self.module.declare_func_in_func(callee_helper_cons, &mut builder.func);
+
+        let mut sig_helper_is_pair = self.module.make_signature();
+        sig_helper_is_pair.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_is_pair.params.push(AbiParam::new(ptr_type)); // registers
+        sig_helper_is_pair.params.push(AbiParam::new(types::I64)); // dest_reg
+        sig_helper_is_pair.params.push(AbiParam::new(types::I64)); // arg_reg
+        let callee_helper_is_pair = self.module.declare_function("helper_is_pair", Linkage::Import, &sig_helper_is_pair).map_err(|e| e.to_string())?;
+        let local_helper_is_pair = self.module.declare_func_in_func(callee_helper_is_pair, &mut builder.func);
+
+        let mut sig_helper_is_null = self.module.make_signature();
+        sig_helper_is_null.params.push(AbiParam::new(ptr_type)); // registers
+        sig_helper_is_null.params.push(AbiParam::new(types::I64)); // dest_reg
+        sig_helper_is_null.params.push(AbiParam::new(types::I64)); // arg_reg
+        let callee_helper_is_null = self.module.declare_function("helper_is_null", Linkage::Import, &sig_helper_is_null).map_err(|e| e.to_string())?;
+        let local_helper_is_null = self.module.declare_func_in_func(callee_helper_is_null, &mut builder.func);
+
+        let mut sig_helper_is_eq = self.module.make_signature();
+        sig_helper_is_eq.params.push(AbiParam::new(ptr_type)); // registers
+        sig_helper_is_eq.params.push(AbiParam::new(types::I64)); // dest_reg
+        sig_helper_is_eq.params.push(AbiParam::new(types::I64)); // arg1_reg
+        sig_helper_is_eq.params.push(AbiParam::new(types::I64)); // arg2_reg
+        let callee_helper_is_eq = self.module.declare_function("helper_is_eq", Linkage::Import, &sig_helper_is_eq).map_err(|e| e.to_string())?;
+        let local_helper_is_eq = self.module.declare_func_in_func(callee_helper_is_eq, &mut builder.func);
+
         // --- PASS 2: Generate Code ---
         prog.jump_to(start_addr);
         
@@ -1224,6 +1278,75 @@ impl Jit {
                     let func_id_const = builder.ins().iconst(types::I64, func_id);
                     
                     builder.ins().call(local_helper_call_function, &[vm_ptr, prog_ptr, registers_ptr, dest_reg_const, start_reg_const, reg_count_const, func_id_const]);
+                    is_terminated = false;
+                },
+                Instr::Car => {
+                    let dest_reg = opcode[1] as i64;
+                    let arg_reg = opcode[2] as i64;
+                    
+                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    let arg_reg_const = builder.ins().iconst(types::I64, arg_reg);
+                    
+                    builder.ins().call(local_helper_car, &[vm_ptr, registers_ptr, dest_reg_const, arg_reg_const]);
+                    is_terminated = false;
+                },
+                Instr::Cdr => {
+                    let dest_reg = opcode[1] as i64;
+                    let arg_reg = opcode[2] as i64;
+                    
+                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    let arg_reg_const = builder.ins().iconst(types::I64, arg_reg);
+                    
+                    builder.ins().call(local_helper_cdr, &[vm_ptr, registers_ptr, dest_reg_const, arg_reg_const]);
+                    is_terminated = false;
+                },
+                Instr::Cons => {
+                    let dest_reg = opcode[1] as i64;
+                    let car_reg = opcode[2] as i64;
+                    let cdr_reg = opcode[3] as i64;
+                    
+                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    let car_reg_const = builder.ins().iconst(types::I64, car_reg);
+                    let cdr_reg_const = builder.ins().iconst(types::I64, cdr_reg);
+                    
+                    builder.ins().call(local_helper_cons, &[vm_ptr, registers_ptr, dest_reg_const, car_reg_const, cdr_reg_const]);
+                    
+                    // Reload registers_ptr as it might have changed due to GC
+                    let call_inst = builder.ins().call(local_helper_get_registers_ptr, &[vm_ptr]);
+                    registers_ptr = builder.inst_results(call_inst)[0];
+                    
+                    is_terminated = false;
+                },
+                Instr::IsPair => {
+                    let dest_reg = opcode[1] as i64;
+                    let arg_reg = opcode[2] as i64;
+                    
+                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    let arg_reg_const = builder.ins().iconst(types::I64, arg_reg);
+                    
+                    builder.ins().call(local_helper_is_pair, &[vm_ptr, registers_ptr, dest_reg_const, arg_reg_const]);
+                    is_terminated = false;
+                },
+                Instr::IsNull => {
+                    let dest_reg = opcode[1] as i64;
+                    let arg_reg = opcode[2] as i64;
+                    
+                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    let arg_reg_const = builder.ins().iconst(types::I64, arg_reg);
+                    
+                    builder.ins().call(local_helper_is_null, &[registers_ptr, dest_reg_const, arg_reg_const]);
+                    is_terminated = false;
+                },
+                Instr::IsEq => {
+                    let dest_reg = opcode[1] as i64;
+                    let arg1_reg = opcode[2] as i64;
+                    let arg2_reg = opcode[3] as i64;
+                    
+                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    let arg1_reg_const = builder.ins().iconst(types::I64, arg1_reg);
+                    let arg2_reg_const = builder.ins().iconst(types::I64, arg2_reg);
+                    
+                    builder.ins().call(local_helper_is_eq, &[registers_ptr, dest_reg_const, arg1_reg_const, arg2_reg_const]);
                     is_terminated = false;
                 },
                 Instr::TailCallSymbol => {

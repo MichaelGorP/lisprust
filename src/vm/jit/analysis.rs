@@ -96,6 +96,15 @@ pub fn analyze_function(prog: &mut VirtualProgram, start_addr: u64, end_addr: u6
                     used_regs.insert(opcode[1] as usize);
                     defined_regs.insert(opcode[3] as usize);
                 },
+                Instr::Car | Instr::Cdr | Instr::IsPair | Instr::IsNull => {
+                    used_regs.insert(opcode[2] as usize);
+                    defined_regs.insert(opcode[1] as usize);
+                },
+                Instr::Cons | Instr::IsEq => {
+                    used_regs.insert(opcode[2] as usize);
+                    used_regs.insert(opcode[3] as usize);
+                    defined_regs.insert(opcode[1] as usize);
+                },
                 Instr::CallFunction => {
                     return None;
                 },

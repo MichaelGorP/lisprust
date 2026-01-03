@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use crate::vm::vm::{Vm, CallState};
-use crate::vm::vp::{VirtualProgram, Value as LispValue, ValueKind, FunctionHeader, FunctionData, HeapValue, ClosureData, Instr};
+use crate::vm::vp::{VirtualProgram, Value as LispValue, ValueKind, FunctionHeader, FunctionData, HeapValue, ClosureData, Instr, Pair};
 
 pub unsafe extern "C" fn helper_check_self_recursion(vm: *mut Vm, func_reg: usize, start_addr: u64) -> i32 {
     let vm = &mut *vm;
@@ -501,4 +501,70 @@ pub unsafe extern "C" fn helper_load_symbol(vm: *mut Vm, prog: *mut VirtualProgr
         }
     }
 }
+
+pub unsafe extern "C" fn helper_car(vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, arg_reg: usize) {
+    let vm = &mut *vm;
+    let arg = *registers.add(arg_reg);
+    if let ValueKind::Object(handle) = arg.kind() {
+        if let Some(HeapValue::Pair(p)) = vm.heap.get(handle) {
+            *registers.add(dest_reg) = p.car;
+        } else {
+            panic!("Runtime error: car expects a pair");
+        }
+    } else {
+        panic!("Runtime error: car expects a pair");
+    }
+}
+
+pub unsafe extern "C" fn helper_cdr(vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, arg_reg: usize) {
+    let vm = &mut *vm;
+    let arg = *registers.add(arg_reg);
+    if let ValueKind::Object(handle) = arg.kind() {
+        if let Some(HeapValue::Pair(p)) = vm.heap.get(handle) {
+            *registers.add(dest_reg) = p.cdr;
+        } else {
+            panic!("Runtime error: cdr expects a pair");
+        }
+    } else {
+        panic!("Runtime error: cdr expects a pair");
+    }
+}
+
+pub unsafe extern "C" fn helper_cons(vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, car_reg: usize, cdr_reg: usize) {
+    let vm = &mut *vm;
+    let car = *registers.add(car_reg);
+    let cdr = *registers.add(cdr_reg);
+    
+    vm.scratch_buffer.push(car);
+    vm.scratch_buffer.push(cdr);
+    vm.collect_garbage();
+    vm.scratch_buffer.pop();
+    vm.scratch_buffer.pop();
+    
+    let handle = vm.heap.alloc(HeapValue::Pair(Pair { car, cdr }));
+    *registers.add(dest_reg) = LispValue::object(handle);
+}
+
+pub unsafe extern "C" fn helper_is_pair(vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, arg_reg: usize) {
+    let vm = &mut *vm;
+    let arg = *registers.add(arg_reg);
+    let is_pair = if let ValueKind::Object(handle) = arg.kind() {
+        matches!(vm.heap.get(handle), Some(HeapValue::Pair(_)))
+    } else {
+        false
+    };
+    *registers.add(dest_reg) = LispValue::boolean(is_pair);
+}
+
+pub unsafe extern "C" fn helper_is_null(registers: *mut LispValue, dest_reg: usize, arg_reg: usize) {
+    let arg = *registers.add(arg_reg);
+    *registers.add(dest_reg) = LispValue::boolean(arg.is_nil());
+}
+
+pub unsafe extern "C" fn helper_is_eq(registers: *mut LispValue, dest_reg: usize, arg1_reg: usize, arg2_reg: usize) {
+    let arg1 = *registers.add(arg1_reg);
+    let arg2 = *registers.add(arg2_reg);
+    *registers.add(dest_reg) = LispValue::boolean(arg1 == arg2);
+}
+
 

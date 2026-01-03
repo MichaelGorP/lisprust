@@ -4,7 +4,7 @@ use std::collections::{HashSet, HashMap};
 use crate::parser::{SExpression, Atom};
 use crate::vm::gc::{Arena, Handle};
 
-use super::vp::{ClosureData, FunctionData, FunctionHeader, Instr, JumpCondition, Value, ValueKind, HeapValue, VirtualProgram, VmContext};
+use super::vp::{ClosureData, FunctionData, FunctionHeader, Instr, JumpCondition, Value, ValueKind, HeapValue, VirtualProgram, VmContext, Pair};
 use super::jit::Jit;
 
 macro_rules! binary_op {
@@ -571,7 +571,59 @@ impl Vm {
                         Ok(v) => self.registers[opcode[1] as usize + self.window_start] = v,
                         Err(e) => panic!("Runtime error: {}", e),
                     }
-                }
+                },
+                Ok(Instr::Car) => {
+                    let arg = self.registers[opcode[2] as usize + self.window_start];
+                    if let ValueKind::Object(handle) = arg.kind() {
+                        if let Some(HeapValue::Pair(p)) = self.heap.get(handle) {
+                            self.registers[opcode[1] as usize + self.window_start] = p.car;
+                        } else {
+                            panic!("Runtime error: car expects a pair");
+                        }
+                    } else {
+                        panic!("Runtime error: car expects a pair");
+                    }
+                },
+                Ok(Instr::Cdr) => {
+                    let arg = self.registers[opcode[2] as usize + self.window_start];
+                    if let ValueKind::Object(handle) = arg.kind() {
+                        if let Some(HeapValue::Pair(p)) = self.heap.get(handle) {
+                            self.registers[opcode[1] as usize + self.window_start] = p.cdr;
+                        } else {
+                            panic!("Runtime error: cdr expects a pair");
+                        }
+                    } else {
+                        panic!("Runtime error: cdr expects a pair");
+                    }
+                },
+                Ok(Instr::Cons) => {
+                    let car = self.registers[opcode[2] as usize + self.window_start];
+                    let cdr = self.registers[opcode[3] as usize + self.window_start];
+                    self.scratch_buffer.push(car);
+                    self.scratch_buffer.push(cdr);
+                    self.collect_garbage();
+                    self.scratch_buffer.pop();
+                    self.scratch_buffer.pop();
+                    self.registers[opcode[1] as usize + self.window_start] = Value::object(self.heap.alloc(HeapValue::Pair(Pair { car, cdr })));
+                },
+                Ok(Instr::IsPair) => {
+                    let arg = self.registers[opcode[2] as usize + self.window_start];
+                    let is_pair = if let ValueKind::Object(handle) = arg.kind() {
+                        matches!(self.heap.get(handle), Some(HeapValue::Pair(_)))
+                    } else {
+                        false
+                    };
+                    self.registers[opcode[1] as usize + self.window_start] = Value::boolean(is_pair);
+                },
+                Ok(Instr::IsEq) => {
+                    let arg1 = self.registers[opcode[2] as usize + self.window_start];
+                    let arg2 = self.registers[opcode[3] as usize + self.window_start];
+                    self.registers[opcode[1] as usize + self.window_start] = Value::boolean(arg1 == arg2);
+                },
+                Ok(Instr::IsNull) => {
+                    let arg = self.registers[opcode[2] as usize + self.window_start];
+                    self.registers[opcode[1] as usize + self.window_start] = Value::boolean(arg.is_nil());
+                },
                 Ok(Instr::MakeClosure) => {
                     let dest_reg = opcode[1] as usize + self.window_start;
                     let func_reg = opcode[2] as usize + self.window_start;
