@@ -1,17 +1,17 @@
 use std::cell::Cell;
 use crate::vm::vm::{Vm, CallState};
-use crate::vm::vp::{VirtualProgram, Value as LispValue, FunctionHeader, FunctionData, HeapValue, ClosureData, Instr};
+use crate::vm::vp::{VirtualProgram, Value as LispValue, ValueKind, FunctionHeader, FunctionData, HeapValue, ClosureData, Instr};
 
 pub unsafe extern "C" fn helper_check_self_recursion(vm: *mut Vm, func_reg: usize, start_addr: u64) -> i32 {
     let vm = &mut *vm;
     let func = vm.registers[vm.window_start + func_reg];
     
-    let address = if let LispValue::Object(handle) = func {
+    let address = if let ValueKind::Object(handle) = func.kind() {
         match vm.heap.get(handle) {
             Some(HeapValue::FuncRef(f)) => f.address,
             Some(HeapValue::Closure(c)) => c.function.address,
             Some(HeapValue::Ref(inner)) => {
-                if let LispValue::Object(inner_handle) = *inner {
+                if let ValueKind::Object(inner_handle) = inner.kind() {
                     match vm.heap.get(inner_handle) {
                         Some(HeapValue::FuncRef(f)) => f.address,
                         Some(HeapValue::Closure(c)) => c.function.address,
@@ -41,11 +41,11 @@ pub unsafe extern "C" fn helper_op(vm: *mut Vm, prog: *mut VirtualProgram, regis
                  let v2 = resolve_value(vm, registers, opcode[3]);
                  let res_reg = opcode[1] as usize;
                  
-                 match (v1, v2) {
-                    (LispValue::Integer(lhs), LispValue::Integer(rhs)) => *registers.add(res_reg) = LispValue::Integer(lhs $op rhs),
-                    (LispValue::Integer(lhs), LispValue::Float(rhs)) => *registers.add(res_reg) = LispValue::Float(lhs as f64 $op rhs),
-                    (LispValue::Float(lhs), LispValue::Float(rhs)) => *registers.add(res_reg) = LispValue::Float(lhs $op rhs),
-                    (LispValue::Float(lhs), LispValue::Integer(rhs)) => *registers.add(res_reg) = LispValue::Float(lhs $op rhs as f64),
+                 match (v1.kind(), v2.kind()) {
+                    (ValueKind::Integer(lhs), ValueKind::Integer(rhs)) => *registers.add(res_reg) = LispValue::integer(lhs $op rhs),
+                    (ValueKind::Integer(lhs), ValueKind::Float(rhs)) => *registers.add(res_reg) = LispValue::float(lhs as f32 $op rhs),
+                    (ValueKind::Float(lhs), ValueKind::Float(rhs)) => *registers.add(res_reg) = LispValue::float(lhs $op rhs),
+                    (ValueKind::Float(lhs), ValueKind::Integer(rhs)) => *registers.add(res_reg) = LispValue::float(lhs $op rhs as f32),
                     (_v1, _v2) => {
                     } 
                  }
@@ -60,14 +60,14 @@ pub unsafe extern "C" fn helper_op(vm: *mut Vm, prog: *mut VirtualProgram, regis
                  let v2 = resolve_value(vm, registers, opcode[3]);
                  let res_reg = opcode[1] as usize;
                  
-                 let matches = match (v1, v2) {
-                    (LispValue::Integer(lhs), LispValue::Integer(rhs)) => lhs $op rhs,
-                    (LispValue::Integer(lhs), LispValue::Float(rhs)) => (lhs as f64) $op rhs,
-                    (LispValue::Float(lhs), LispValue::Float(rhs)) => lhs $op rhs,
-                    (LispValue::Float(lhs), LispValue::Integer(rhs)) => lhs $op rhs as f64,
+                 let matches = match (v1.kind(), v2.kind()) {
+                    (ValueKind::Integer(lhs), ValueKind::Integer(rhs)) => lhs $op rhs,
+                    (ValueKind::Integer(lhs), ValueKind::Float(rhs)) => (lhs as f32) $op rhs,
+                    (ValueKind::Float(lhs), ValueKind::Float(rhs)) => lhs $op rhs,
+                    (ValueKind::Float(lhs), ValueKind::Integer(rhs)) => lhs $op rhs as f32,
                     _ => false,
                  };
-                 *registers.add(res_reg) = LispValue::Boolean(matches);
+                 *registers.add(res_reg) = LispValue::boolean(matches);
             }
         }
     }
@@ -81,13 +81,13 @@ pub unsafe extern "C" fn helper_op(vm: *mut Vm, prog: *mut VirtualProgram, regis
              let v1 = resolve_value(vm, registers, opcode[2]);
              let v2 = resolve_value(vm, registers, opcode[3]);
              let res_reg = opcode[1] as usize;
-             *registers.add(res_reg) = LispValue::Boolean(v1 == v2);
+             *registers.add(res_reg) = LispValue::boolean(v1 == v2);
         },
         Ok(Instr::Neq) => {
              let v1 = resolve_value(vm, registers, opcode[2]);
              let v2 = resolve_value(vm, registers, opcode[3]);
              let res_reg = opcode[1] as usize;
-             *registers.add(res_reg) = LispValue::Boolean(v1 != v2);
+             *registers.add(res_reg) = LispValue::boolean(v1 != v2);
         },
         Ok(Instr::Lt) => jit_comparison_op!(<),
         Ok(Instr::Gt) => jit_comparison_op!(>),
@@ -96,9 +96,9 @@ pub unsafe extern "C" fn helper_op(vm: *mut Vm, prog: *mut VirtualProgram, regis
         Ok(Instr::Not) => {
              let v = resolve_value(vm, registers, opcode[2]);
              let res_reg = opcode[1] as usize;
-             match v {
-                 LispValue::Boolean(b) => *registers.add(res_reg) = LispValue::Boolean(!b),
-                 _ => *registers.add(res_reg) = LispValue::Boolean(false),
+             match v.kind() {
+                 ValueKind::Boolean(b) => *registers.add(res_reg) = LispValue::boolean(!b),
+                 _ => *registers.add(res_reg) = LispValue::boolean(false),
              }
         },
         Ok(Instr::CopyReg) => {
@@ -112,19 +112,19 @@ pub unsafe extern "C" fn helper_op(vm: *mut Vm, prog: *mut VirtualProgram, regis
              let prog = &mut *prog;
              if let Some(s) = prog.read_string() {
                  let dest_reg = opcode[1] as usize;
-                 *registers.add(dest_reg) = LispValue::Object(vm.heap.alloc(HeapValue::String(s)));
+                 *registers.add(dest_reg) = LispValue::object(vm.heap.alloc(HeapValue::String(s)));
              }
         },
         Ok(Instr::LoadSymbol) => {
              let prog = &mut *prog;
              if let Some(s) = prog.read_string() {
                  let dest_reg = opcode[1] as usize;
-                 *registers.add(dest_reg) = LispValue::Object(vm.heap.alloc(HeapValue::Symbol(s)));
+                 *registers.add(dest_reg) = LispValue::object(vm.heap.alloc(HeapValue::Symbol(s)));
              }
         },
         Ok(Instr::LoadNil) => {
              let dest_reg = opcode[1] as usize;
-             *registers.add(dest_reg) = LispValue::Empty;
+             *registers.add(dest_reg) = LispValue::nil();
         },
         _ => {
         }
@@ -138,7 +138,7 @@ pub unsafe extern "C" fn helper_check_condition(_vm: *mut Vm, registers: *mut Li
 
 unsafe fn resolve_value(vm: &Vm, registers: *mut LispValue, reg_idx: u8) -> LispValue {
     let val = *registers.add(reg_idx as usize);
-    if let LispValue::Object(handle) = val {
+    if let ValueKind::Object(handle) = val.kind() {
         if let Some(HeapValue::Ref(inner)) = vm.heap.get(handle) {
             return *inner;
         }
@@ -153,7 +153,7 @@ pub unsafe extern "C" fn helper_load_global(vm: *mut Vm, registers: *mut LispVal
         let v = &mut vm.global_vars[sym_id as usize];
         *registers.add(dest_reg) = v.clone();
     } else {
-        *registers.add(dest_reg) = LispValue::Empty;
+        *registers.add(dest_reg) = LispValue::nil();
     }
 }
 
@@ -161,7 +161,7 @@ pub unsafe extern "C" fn helper_define(vm: *mut Vm, registers: *mut LispValue, s
     let vm = &mut *vm;
     let val = (*registers.add(src_reg)).clone();
     if sym_id as usize >= vm.global_vars.len() {
-        vm.global_vars.resize(sym_id as usize + 1, LispValue::Empty);
+        vm.global_vars.resize(sym_id as usize + 1, LispValue::nil());
     }
     vm.global_vars[sym_id as usize] = val;
 }
@@ -174,7 +174,7 @@ pub unsafe extern "C" fn helper_load_func_ref(vm: *mut Vm, prog: *mut VirtualPro
     
     let jit_code = vm.jit.cache.get(&(func_addr as u64)).map(|&ptr| ptr as u64).unwrap_or(0);
     vm.collect_garbage();
-    *registers.add(dest_reg) = LispValue::Object(vm.heap.alloc(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(jit_code), fast_jit_code: Cell::new(0)})));
+    *registers.add(dest_reg) = LispValue::object(vm.heap.alloc(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(jit_code), fast_jit_code: Cell::new(0)})));
 }
 
 pub unsafe extern "C" fn helper_call_function(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, start_reg: usize, reg_count: usize, func_id: i64) {
@@ -196,14 +196,16 @@ pub unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgr
     let vm = &mut *vm;
     let prog = &mut *prog;
     
+    // println!("helper_call_symbol func_reg={} param_start={} target_reg={}", func_reg, param_start, target_reg);
+
     let resolved_func = resolve_value(vm, registers, func_reg as u8);
     
-    let (header, address, captures, jit_code_cell, fast_jit_code_cell) = if let LispValue::Object(handle) = resolved_func {
+    let (header, address, captures, jit_code_cell, fast_jit_code_cell) = if let ValueKind::Object(handle) = resolved_func.kind() {
         match vm.heap.get(handle) {
             Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, Some(&f.jit_code), Some(&f.fast_jit_code)),
             Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), Some(&c.function.jit_code), Some(&c.function.fast_jit_code)),
             Some(HeapValue::Ref(inner)) => {
-                 if let LispValue::Object(inner_handle) = *inner {
+                 if let ValueKind::Object(inner_handle) = inner.kind() {
                      match vm.heap.get(inner_handle) {
                         Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, None, None),
                         Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), None, None),
@@ -221,7 +223,7 @@ pub unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgr
 
     let size = param_start + header.register_count as usize + vm.window_start;
     if size >= vm.registers.len() {
-        vm.registers.resize(size, LispValue::Empty);
+        vm.registers.resize(size, LispValue::nil());
     }
     let old_ws = vm.window_start;
     let ret_addr = 0; 
@@ -285,14 +287,17 @@ pub unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut Virtual
     let vm = &mut *vm;
     let prog = &mut *prog;
 
+    // println!("helper_tail_call_symbol func_reg={} param_start={}", func_reg, param_start);
+    // panic!("helper_tail_call_symbol called");
+
     let func = *registers.add(func_reg);
     
-    let (header, address, captures, jit_code_cell) = match func {
-        LispValue::Object(handle) => match vm.heap.get(handle) {
+    let (header, address, captures, jit_code_cell) = match func.kind() {
+        ValueKind::Object(handle) => match vm.heap.get(handle) {
             Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, Some(&f.jit_code)),
             Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), Some(&c.function.jit_code)),
             Some(HeapValue::Ref(inner)) => {
-                 if let LispValue::Object(inner_handle) = *inner {
+                 if let ValueKind::Object(inner_handle) = inner.kind() {
                      match vm.heap.get(inner_handle) {
                         Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, None),
                         Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), None),
@@ -309,7 +314,7 @@ pub unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut Virtual
 
     let size = vm.window_start + header.register_count as usize;
     if size >= vm.registers.len() {
-        vm.registers.resize(size, LispValue::Empty);
+        vm.registers.resize(size, LispValue::nil());
     }
 
     let param_count = header.param_count as usize;
@@ -350,6 +355,7 @@ pub unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut Virtual
          vm.tail_call_pending = true;
          vm.next_jit_code = jit_code;
     } else {
+         println!("Compiling tail call target at {}", address);
          let end_addr = super::analysis::scan_function_end(prog, address);
          if let Ok(func) = vm.jit.compile(&vm.global_vars, &vm.heap, prog, address, end_addr) {
              if let Some(cell) = jit_code_cell {
@@ -385,7 +391,7 @@ pub unsafe extern "C" fn helper_make_closure(vm: *mut Vm, prog: *mut VirtualProg
     
     let func_val = *registers.add(func_reg);
     
-    if let LispValue::Object(handle) = func_val {
+    if let ValueKind::Object(handle) = func_val.kind() {
         if let Some(HeapValue::FuncRef(fd)) = vm.heap.get(handle) {
             let fd_clone = fd.clone();
             for c in &captures {
@@ -395,12 +401,12 @@ pub unsafe extern "C" fn helper_make_closure(vm: *mut Vm, prog: *mut VirtualProg
             for _ in &captures {
                 vm.scratch_buffer.pop();
             }
-            *registers.add(dest_reg) = LispValue::Object(vm.heap.alloc(HeapValue::Closure(ClosureData{function: fd_clone, captures})));
+            *registers.add(dest_reg) = LispValue::object(vm.heap.alloc(HeapValue::Closure(ClosureData{function: fd_clone, captures})));
         } else {
-            *registers.add(dest_reg) = LispValue::Empty;
+            *registers.add(dest_reg) = LispValue::nil();
         }
     } else {
-        *registers.add(dest_reg) = LispValue::Empty;
+        *registers.add(dest_reg) = LispValue::nil();
     }
 }
 
@@ -408,7 +414,7 @@ pub unsafe extern "C" fn helper_make_ref(vm: *mut Vm, registers: *mut LispValue,
     let vm = &mut *vm;
     let val = *registers.add(dest_reg);
     vm.collect_garbage();
-    *registers.add(dest_reg) = LispValue::Object(vm.heap.alloc(HeapValue::Ref(val)));
+    *registers.add(dest_reg) = LispValue::object(vm.heap.alloc(HeapValue::Ref(val)));
 }
 
 pub unsafe extern "C" fn helper_set_ref(vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, src_reg: usize) {
@@ -416,7 +422,7 @@ pub unsafe extern "C" fn helper_set_ref(vm: *mut Vm, registers: *mut LispValue, 
     let dest = *registers.add(dest_reg);
     let src = *registers.add(src_reg);
     
-    if let LispValue::Object(handle) = dest {
+    if let ValueKind::Object(handle) = dest.kind() {
         if let Some(HeapValue::Ref(r)) = vm.heap.get_mut(handle) {
             *r = src;
         }
@@ -427,7 +433,7 @@ pub unsafe extern "C" fn helper_deref(vm: *mut Vm, registers: *mut LispValue, de
     let vm = &mut *vm;
     let src = *registers.add(src_reg);
     
-    let val = if let LispValue::Object(handle) = src {
+    let val = if let ValueKind::Object(handle) = src.kind() {
         if let Some(HeapValue::Ref(r)) = vm.heap.get(handle) {
             Some(*r)
         } else {
@@ -463,7 +469,7 @@ pub unsafe extern "C" fn helper_load_string(vm: *mut Vm, prog: *mut VirtualProgr
             let str_bytes = &bytecode[offset+8..offset+8+len];
             if let Ok(s) = std::str::from_utf8(str_bytes) {
                 vm.collect_garbage();
-                *registers.add(dest_reg) = LispValue::Object(vm.heap.alloc(HeapValue::String(s.to_string())));
+                *registers.add(dest_reg) = LispValue::object(vm.heap.alloc(HeapValue::String(s.to_string())));
             }
         }
     }
@@ -490,7 +496,7 @@ pub unsafe extern "C" fn helper_load_symbol(vm: *mut Vm, prog: *mut VirtualProgr
                     vm.symbol_table.insert(s.to_string(), h);
                     h
                 };
-                *registers.add(dest_reg) = LispValue::Object(handle);
+                *registers.add(dest_reg) = LispValue::object(handle);
             }
         }
     }

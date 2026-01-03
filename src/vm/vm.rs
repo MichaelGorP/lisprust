@@ -4,7 +4,7 @@ use std::collections::{HashSet, HashMap};
 use crate::parser::{SExpression, Atom};
 use crate::vm::gc::{Arena, Handle};
 
-use super::vp::{ClosureData, FunctionData, FunctionHeader, Instr, JumpCondition, Value, HeapValue, VirtualProgram, VmContext};
+use super::vp::{ClosureData, FunctionData, FunctionHeader, Instr, JumpCondition, Value, ValueKind, HeapValue, VirtualProgram, VmContext};
 use super::jit::Jit;
 
 macro_rules! binary_op {
@@ -14,11 +14,11 @@ macro_rules! binary_op {
             let v2 = $self.resolve_value(&$self.registers[$opcode[3] as usize + $self.window_start]);
             
             let res_reg = $opcode[1] as usize + $self.window_start;
-            match (v1, v2) {
-                (Value::Integer(lhs), Value::Integer(rhs)) => $self.registers[res_reg] = Value::Integer(lhs $op rhs),
-                (Value::Integer(lhs), Value::Float(rhs)) => $self.registers[res_reg] = Value::Float(lhs as f64 $op rhs),
-                (Value::Float(lhs), Value::Float(rhs)) => $self.registers[res_reg] = Value::Float(lhs $op rhs),
-                (Value::Float(lhs), Value::Integer(rhs)) => $self.registers[res_reg] = Value::Float(lhs $op rhs as f64),
+            match (v1.kind(), v2.kind()) {
+                (ValueKind::Integer(lhs), ValueKind::Integer(rhs)) => $self.registers[res_reg] = Value::integer(lhs $op rhs),
+                (ValueKind::Integer(lhs), ValueKind::Float(rhs)) => $self.registers[res_reg] = Value::float(lhs as f32 $op rhs),
+                (ValueKind::Float(lhs), ValueKind::Float(rhs)) => $self.registers[res_reg] = Value::float(lhs $op rhs),
+                (ValueKind::Float(lhs), ValueKind::Integer(rhs)) => $self.registers[res_reg] = Value::float(lhs $op rhs as f32),
                 (v1, v2) => {
                     eprintln!("Binary op failed: {:?} {:?}", v1, v2);
                     break;
@@ -35,15 +35,15 @@ macro_rules! comparison_op {
             let v2 = $self.resolve_value(&$self.registers[$opcode[3] as usize + $self.window_start]);
 
             let res_reg = $opcode[1] as usize + $self.window_start;
-            let matches = match (v1, v2) {
-                (Value::Integer(lhs), Value::Integer(rhs)) => lhs $op rhs,
-                (Value::Integer(lhs), Value::Float(rhs)) => (lhs as f64) $op rhs,
-                (Value::Float(lhs), Value::Float(rhs)) => lhs $op rhs,
-                (Value::Float(lhs), Value::Integer(rhs)) => lhs $op rhs as f64,
+            let matches = match (v1.kind(), v2.kind()) {
+                (ValueKind::Integer(lhs), ValueKind::Integer(rhs)) => lhs $op rhs,
+                (ValueKind::Integer(lhs), ValueKind::Float(rhs)) => (lhs as f32) $op rhs,
+                (ValueKind::Float(lhs), ValueKind::Float(rhs)) => lhs $op rhs,
+                (ValueKind::Float(lhs), ValueKind::Integer(rhs)) => lhs $op rhs as f32,
                 _ => break,
             };
             
-            $self.registers[res_reg] = Value::Boolean(matches);
+            $self.registers[res_reg] = Value::boolean(matches);
 
             if $debugger.is_none() {
                 //try if the next instruction is a jump
@@ -76,7 +76,7 @@ macro_rules! comparison_op {
 }
 
 const fn empty_value() -> Value {
-    Value::Empty
+    Value::nil()
 }
 
 #[derive(Debug, Clone)]
@@ -139,14 +139,14 @@ impl Vm {
         self.roots_buffer.clear();
         
         for v in &self.registers {
-            if let Value::Object(h) = v {
-                self.roots_buffer.push(*h);
+            if let ValueKind::Object(h) = v.kind() {
+                self.roots_buffer.push(h);
             }
         }
         
         for v in &self.global_vars {
-            if let Value::Object(h) = v {
-                self.roots_buffer.push(*h);
+            if let ValueKind::Object(h) = v.kind() {
+                self.roots_buffer.push(h);
             }
         }
         
@@ -155,8 +155,8 @@ impl Vm {
         }
         
         for v in &self.scratch_buffer {
-            if let Value::Object(h) = v {
-                self.roots_buffer.push(*h);
+            if let ValueKind::Object(h) = v.kind() {
+                self.roots_buffer.push(h);
             }
         }
         
@@ -199,8 +199,8 @@ impl Vm {
     }
 
     fn resolve_value(&self, val: &Value) -> Value {
-        if let Value::Object(handle) = val {
-            if let Some(HeapValue::Ref(r)) = self.heap.get(*handle) {
+        if let ValueKind::Object(handle) = val.kind() {
+            if let Some(HeapValue::Ref(r)) = self.heap.get(handle) {
                 return *r;
             }
         }
@@ -284,23 +284,23 @@ impl Vm {
                     let Some(val) = prog.read_int() else {
                         return None;
                     };
-                    self.registers[opcode[1] as usize + self.window_start] = Value::Integer(val);
+                    self.registers[opcode[1] as usize + self.window_start] = Value::integer(val);
                 },
                 Ok(Instr::LoadFloat) => {
                     let Some(val) = prog.read_float() else {
                         return None;
                     };
-                    self.registers[opcode[1] as usize + self.window_start] = Value::Float(val);
+                    self.registers[opcode[1] as usize + self.window_start] = Value::float(val as f32);
                 },
                 Ok(Instr::LoadBool) => {
-                    self.registers[opcode[1] as usize + self.window_start] = Value::Boolean(opcode[2] != 0);
+                    self.registers[opcode[1] as usize + self.window_start] = Value::boolean(opcode[2] != 0);
                 },
                 Ok(Instr::LoadString) => {
                     let Some(val) = prog.read_string() else {
                         return None;
                     };
                     self.collect_garbage();
-                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(self.heap.alloc(HeapValue::String(val)));
+                    self.registers[opcode[1] as usize + self.window_start] = Value::object(self.heap.alloc(HeapValue::String(val)));
                 },
                 Ok(Instr::LoadSymbol) => {
                     let Some(val) = prog.read_string() else {
@@ -314,10 +314,10 @@ impl Vm {
                         self.symbol_table.insert(val, h);
                         h
                     };
-                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(handle);
+                    self.registers[opcode[1] as usize + self.window_start] = Value::object(handle);
                 },
                 Ok(Instr::LoadNil) => {
-                    self.registers[opcode[1] as usize + self.window_start] = Value::Empty;
+                    self.registers[opcode[1] as usize + self.window_start] = Value::nil();
                 },
                 Ok(Instr::CopyReg) => {
                     self.registers[opcode[1] as usize + self.window_start] = self.registers[opcode[2] as usize + self.window_start];
@@ -339,7 +339,7 @@ impl Vm {
                     let res_reg = opcode[1] as usize + self.window_start;
                     
                     let matches = v1 == v2;
-                    self.registers[res_reg] = Value::Boolean(matches);
+                    self.registers[res_reg] = Value::boolean(matches);
 
                     if debugger.is_none() {
                         if let Some(opcode) = prog.read_opcode() {
@@ -372,9 +372,9 @@ impl Vm {
                 Ok(Instr::Geq) => comparison_op!(self, opcode, prog, debugger, >=),
                 Ok(Instr::Not) => {
                     let value = &self.registers[opcode[2] as usize + self.window_start];
-                    match value {
-                        Value::Boolean(b) => self.registers[opcode[1] as usize + self.window_start] = Value::Boolean(!*b),
-                        _ => self.registers[opcode[1] as usize] = Value::Boolean(false)
+                    match value.kind() {
+                        ValueKind::Boolean(b) => self.registers[opcode[1] as usize + self.window_start] = Value::boolean(!b),
+                        _ => self.registers[opcode[1] as usize] = Value::boolean(false)
                     };
 
                     //try if the next instruction is a jump
@@ -418,7 +418,7 @@ impl Vm {
                         break;
                     };
                     if sym_id as usize >= self.global_vars.len() {
-                        self.global_vars.resize(sym_id as usize + 1, Value::Empty);
+                        self.global_vars.resize(sym_id as usize + 1, Value::nil());
                     }
                     self.global_vars[sym_id as usize] = self.registers[opcode[1] as usize + self.window_start].clone();
                 },
@@ -445,13 +445,13 @@ impl Vm {
                     };
                     let func_addr = header_addr as usize + std::mem::size_of::<FunctionHeader>();
                     self.collect_garbage();
-                    self.registers[opcode[1] as usize + self.window_start] = Value::Object(self.heap.alloc(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(0), fast_jit_code: Cell::new(0)})));
+                    self.registers[opcode[1] as usize + self.window_start] = Value::object(self.heap.alloc(HeapValue::FuncRef(FunctionData{header, address: func_addr as u64, jit_code: Cell::new(0), fast_jit_code: Cell::new(0)})));
                 },
                 Ok(Instr::CallSymbol) => {
                     let func_reg = opcode[1] as usize + self.window_start;
                     let resolved_func = self.resolve_value(&self.registers[func_reg]);
 
-                    let (header, address, captures) = if let Value::Object(handle) = resolved_func {
+                    let (header, address, captures) = if let ValueKind::Object(handle) = resolved_func.kind() {
                         match self.heap.get(handle) {
                             Some(HeapValue::FuncRef(f)) => (f.header, f.address, None),
                             Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone())),
@@ -498,7 +498,7 @@ impl Vm {
                     // For tail-calls, clone the function value instead of swapping it out.
                     let resolved_func = self.resolve_value(&self.registers[opcode[1] as usize + self.window_start]);
 
-                    let (header, address, captures) = if let Value::Object(handle) = resolved_func {
+                    let (header, address, captures) = if let ValueKind::Object(handle) = resolved_func.kind() {
                         match self.heap.get(handle) {
                             Some(HeapValue::FuncRef(f)) => (f.header, f.address, None),
                             Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone())),
@@ -586,7 +586,7 @@ impl Vm {
                     
                     let func_val = self.registers[func_reg];
 
-                    if let Value::Object(handle) = func_val {
+                    if let ValueKind::Object(handle) = func_val.kind() {
                         if let Some(HeapValue::FuncRef(fd)) = self.heap.get(handle) {
                              let fd_clone = fd.clone();
                              for c in &captures {
@@ -596,24 +596,24 @@ impl Vm {
                              for _ in &captures {
                                  self.scratch_buffer.pop();
                              }
-                             self.registers[dest_reg] = Value::Object(self.heap.alloc(HeapValue::Closure(ClosureData{function: fd_clone, captures})));
+                             self.registers[dest_reg] = Value::object(self.heap.alloc(HeapValue::Closure(ClosureData{function: fd_clone, captures})));
                         } else {
-                             self.registers[dest_reg] = Value::Empty;
+                             self.registers[dest_reg] = Value::nil();
                         }
                     } else {
-                        self.registers[dest_reg] = Value::Empty; 
+                        self.registers[dest_reg] = Value::nil(); 
                     }
                 },
                 Ok(Instr::MakeRef) => {
                     let reg = opcode[1] as usize + self.window_start;
                     let val = self.registers[reg];
                     self.collect_garbage();
-                    self.registers[reg] = Value::Object(self.heap.alloc(HeapValue::Ref(val)));
+                    self.registers[reg] = Value::object(self.heap.alloc(HeapValue::Ref(val)));
                 },
                 Ok(Instr::SetRef) => {
                     let dest_reg = opcode[1] as usize + self.window_start;
                     let src_reg = opcode[2] as usize + self.window_start;
-                    if let Value::Object(handle) = self.registers[dest_reg] {
+                    if let ValueKind::Object(handle) = self.registers[dest_reg].kind() {
                         if let Some(HeapValue::Ref(r)) = self.heap.get_mut(handle) {
                             *r = self.registers[src_reg];
                         }
@@ -622,7 +622,7 @@ impl Vm {
                 Ok(Instr::Deref) => {
                     let dest_reg = opcode[1] as usize + self.window_start;
                     let src_reg = opcode[2] as usize + self.window_start;
-                    let val = if let Value::Object(handle) = self.registers[src_reg] {
+                    let val = if let ValueKind::Object(handle) = self.registers[src_reg].kind() {
                         if let Some(HeapValue::Ref(r)) = self.heap.get(handle) {
                             Some(*r)
                         } else {
@@ -668,21 +668,21 @@ impl Vm {
 }
 
 fn value_to_sexpr(value: &Value, heap: &Arena<HeapValue>) -> Option<SExpression> {
-    match value {
-        Value::Empty => Some(SExpression::List(vec![])),
-        Value::Boolean(b) => Some(SExpression::Atom(Atom::Boolean(*b))),
-        Value::Integer(i) => Some(SExpression::Atom(Atom::Integer(*i))),
-        Value::Float(f) => Some(SExpression::Atom(Atom::Float(*f))),
-        Value::Object(handle) => match heap.get(*handle) {
+    match value.kind() {
+        ValueKind::Nil => Some(SExpression::List(vec![])),
+        ValueKind::Boolean(b) => Some(SExpression::Atom(Atom::Boolean(b))),
+        ValueKind::Integer(i) => Some(SExpression::Atom(Atom::Integer(i))),
+        ValueKind::Float(f) => Some(SExpression::Atom(Atom::Float(f as f64))),
+        ValueKind::Object(handle) => match heap.get(handle) {
             Some(HeapValue::String(s)) => Some(SExpression::Atom(Atom::String(s.clone()))),
             Some(HeapValue::Symbol(s)) => Some(SExpression::Symbol(s.clone())),
             Some(HeapValue::Pair(_pair)) => {
                 let mut expressions = Vec::new();
                 let mut current = *value;
                 loop {
-                    match current {
-                        Value::Empty => break,
-                        Value::Object(h) => match heap.get(h) {
+                    match current.kind() {
+                        ValueKind::Nil => break,
+                        ValueKind::Object(h) => match heap.get(h) {
                             Some(HeapValue::Pair(p)) => {
                                 let car = p.car;
                                 let sexpr = value_to_sexpr(&car, heap);
@@ -708,6 +708,7 @@ fn value_to_sexpr(value: &Value, heap: &Arena<HeapValue>) -> Option<SExpression>
             Some(HeapValue::Closure(_)) => None,
             Some(HeapValue::Ref(r)) => value_to_sexpr(r, heap),
             None => None
-        }
+        },
+        _ => None
     }
 }

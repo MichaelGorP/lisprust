@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{json, from_value};
 
 use crate::vm::vm::{Vm, Debugger};
-use crate::vm::vp::{VirtualProgram, Value};
+use crate::vm::vp::{VirtualProgram, ValueKind};
 use crate::vm::compiler::Compiler;
 use crate::parser::Parser;
 use crate::lexer;
@@ -679,7 +679,7 @@ impl VmDebugger {
                 break;
             }
             let val = &vm.registers()[reg_idx];
-            if let Value::Empty = val {
+            if let ValueKind::Nil = val.kind() {
                 continue;
             }
             

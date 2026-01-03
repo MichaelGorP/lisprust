@@ -7,13 +7,13 @@ pub struct Handle(u32);
 impl Handle {
     /// Returns the raw index of the handle.
     #[inline(always)]
-    pub fn index(&self) -> usize {
+    pub const fn index(&self) -> usize {
         self.0 as usize
     }
     
     /// Creates a handle from a raw index.
     /// Unsafe because it doesn't check if the index is valid.
-    pub unsafe fn from_raw(idx: u32) -> Self {
+    pub const unsafe fn from_raw(idx: u32) -> Self {
         Handle(idx)
     }
 }
@@ -26,13 +26,14 @@ enum Slot<T> {
     Occupied { value: T, marked: bool },
 }
 
-/// A simple mark-and-sweep arena allocator.
+const CHUNK_SIZE: usize = 1024;
+
+/// A simple mark-and-sweep arena allocator with multiple memory chunks.
 /// 
-/// This allocator stores objects in a contiguous `Vec`, which improves cache locality
-/// compared to individual `Box` allocations. It also avoids the overhead of `malloc`
-/// for every object.
+/// This allocator stores objects in multiple `Vec` chunks to avoid reallocating
+/// a single massive vector and to support better memory usage patterns.
 pub struct Arena<T> {
-    slots: Vec<Slot<T>>,
+    chunks: Vec<Vec<Slot<T>>>,
     free_head: Option<u32>,
     gray_stack: Vec<u32>,
     // Statistics
@@ -43,7 +44,7 @@ pub struct Arena<T> {
 impl<T> Arena<T> {
     pub fn new() -> Self {
         Self {
-            slots: Vec::with_capacity(4096),
+            chunks: Vec::new(),
             free_head: None,
             gray_stack: Vec::with_capacity(256),
             allocated_objects: 0,
@@ -51,51 +52,79 @@ impl<T> Arena<T> {
         }
     }
 
+    fn expand(&mut self) {
+        let chunk_idx = self.chunks.len();
+        let base = (chunk_idx * CHUNK_SIZE) as u32;
+        let mut new_chunk = Vec::with_capacity(CHUNK_SIZE);
+        for i in 0..CHUNK_SIZE {
+            let next = if i < CHUNK_SIZE - 1 { Some(base + i as u32 + 1) } else { self.free_head };
+            new_chunk.push(Slot::Free { next_free: next });
+        }
+        self.chunks.push(new_chunk);
+        self.free_head = Some(base);
+    }
+
     /// Allocates a new object in the arena and returns a handle to it.
     pub fn alloc(&mut self, value: T) -> Handle {
+        if self.free_head.is_none() {
+            self.expand();
+        }
+
         self.allocated_objects += 1;
         
-        if let Some(idx) = self.free_head {
-            // Reuse a free slot
-            let next = match &self.slots[idx as usize] {
-                Slot::Free { next_free } => *next_free,
-                _ => unreachable!("Corrupt free list"),
-            };
-            self.free_head = next;
-            self.slots[idx as usize] = Slot::Occupied { value, marked: false };
-            Handle(idx)
-        } else {
-            // Append a new slot
-            let idx = self.slots.len() as u32;
-            self.slots.push(Slot::Occupied { value, marked: false });
-            Handle(idx)
-        }
+        let idx = self.free_head.unwrap();
+        let chunk_idx = (idx as usize) / CHUNK_SIZE;
+        let slot_idx = (idx as usize) % CHUNK_SIZE;
+
+        let next = match &self.chunks[chunk_idx][slot_idx] {
+            Slot::Free { next_free } => *next_free,
+            _ => unreachable!("Corrupt free list"),
+        };
+        self.free_head = next;
+        self.chunks[chunk_idx][slot_idx] = Slot::Occupied { value, marked: false };
+        Handle(idx)
     }
 
     /// Gets a reference to an object.
     /// Returns None if the handle is invalid or points to a free slot.
     #[inline(always)]
     pub fn get(&self, handle: Handle) -> Option<&T> {
-        match self.slots.get(handle.index()) {
-            Some(Slot::Occupied { value, .. }) => Some(value),
-            _ => None,
+        let idx = handle.index();
+        let chunk_idx = idx / CHUNK_SIZE;
+        let slot_idx = idx % CHUNK_SIZE;
+        
+        if let Some(chunk) = self.chunks.get(chunk_idx) {
+            if let Some(Slot::Occupied { value, .. }) = chunk.get(slot_idx) {
+                return Some(value);
+            }
         }
+        None
     }
 
     /// Gets a mutable reference to an object.
     #[inline(always)]
     pub fn get_mut(&mut self, handle: Handle) -> Option<&mut T> {
-        match self.slots.get_mut(handle.index()) {
-            Some(Slot::Occupied { value, .. }) => Some(value),
-            _ => None,
+        let idx = handle.index();
+        let chunk_idx = idx / CHUNK_SIZE;
+        let slot_idx = idx % CHUNK_SIZE;
+        
+        if let Some(chunk) = self.chunks.get_mut(chunk_idx) {
+            if let Some(Slot::Occupied { value, .. }) = chunk.get_mut(slot_idx) {
+                return Some(value);
+            }
         }
+        None
     }
     
     /// Unsafe access for performance (skips checks).
     /// Use only when you are sure the handle is valid.
     #[inline(always)]
     pub unsafe fn get_unchecked(&self, handle: Handle) -> &T {
-        match self.slots.get_unchecked(handle.index()) {
+        let idx = handle.index();
+        let chunk_idx = idx / CHUNK_SIZE;
+        let slot_idx = idx % CHUNK_SIZE;
+        
+        match self.chunks.get_unchecked(chunk_idx).get_unchecked(slot_idx) {
             Slot::Occupied { value, .. } => value,
             _ => std::hint::unreachable_unchecked(),
         }
@@ -103,7 +132,11 @@ impl<T> Arena<T> {
 
     #[inline(always)]
     pub unsafe fn get_unchecked_mut(&mut self, handle: Handle) -> &mut T {
-        match self.slots.get_unchecked_mut(handle.index()) {
+        let idx = handle.index();
+        let chunk_idx = idx / CHUNK_SIZE;
+        let slot_idx = idx % CHUNK_SIZE;
+        
+        match self.chunks.get_unchecked_mut(chunk_idx).get_unchecked_mut(slot_idx) {
             Slot::Occupied { value, .. } => value,
             _ => std::hint::unreachable_unchecked(),
         }
@@ -122,10 +155,15 @@ where T: Trace<T>
     /// This should be called by `Trace` implementations for their children.
     pub fn mark(&mut self, handle: Handle) {
         let idx = handle.index();
-        if let Some(Slot::Occupied { marked, .. }) = self.slots.get_mut(idx) {
-            if !*marked {
-                *marked = true;
-                self.gray_stack.push(idx as u32);
+        let chunk_idx = idx / CHUNK_SIZE;
+        let slot_idx = idx % CHUNK_SIZE;
+        
+        if let Some(chunk) = self.chunks.get_mut(chunk_idx) {
+            if let Some(Slot::Occupied { marked, .. }) = chunk.get_mut(slot_idx) {
+                if !*marked {
+                    *marked = true;
+                    self.gray_stack.push(idx as u32);
+                }
             }
         }
     }
@@ -141,13 +179,12 @@ where T: Trace<T>
 
         // 2. Trace (Mark phase)
         while let Some(idx) = self.gray_stack.pop() {
-            // We need to temporarily extract the value to trace it to avoid borrowing issues.
-            // Or we can use unsafe to get a reference while holding the mutable borrow of the arena.
-            // Since we are single-threaded, this is safe if we are careful.
+            let chunk_idx = (idx as usize) / CHUNK_SIZE;
+            let slot_idx = (idx as usize) % CHUNK_SIZE;
             
             // SAFETY: We are iterating indices. We won't invalidate the vector storage here.
             // We just need to read the value at `idx`.
-            let value_ptr = match &self.slots[idx as usize] {
+            let value_ptr = match &self.chunks[chunk_idx][slot_idx] {
                 Slot::Occupied { value, .. } => value as *const T,
                 _ => continue,
             };
@@ -159,27 +196,33 @@ where T: Trace<T>
 
         // 3. Sweep phase
         let mut free_count = 0;
-        for (i, slot) in self.slots.iter_mut().enumerate() {
-            match slot {
-                Slot::Occupied { marked, .. } => {
-                    if *marked {
-                        // Reset mark for next cycle
-                        *marked = false;
-                    } else {
-                        // Reclaim
-                        *slot = Slot::Free { next_free: self.free_head };
-                        self.free_head = Some(i as u32);
+        let mut total_slots = 0;
+        
+        for (c_idx, chunk) in self.chunks.iter_mut().enumerate() {
+            for (s_idx, slot) in chunk.iter_mut().enumerate() {
+                total_slots += 1;
+                match slot {
+                    Slot::Occupied { marked, .. } => {
+                        if *marked {
+                            // Reset mark for next cycle
+                            *marked = false;
+                        } else {
+                            // Reclaim
+                            let idx = (c_idx * CHUNK_SIZE + s_idx) as u32;
+                            *slot = Slot::Free { next_free: self.free_head };
+                            self.free_head = Some(idx);
+                            free_count += 1;
+                        }
+                    },
+                    Slot::Free { .. } => {
+                        // Already free
                         free_count += 1;
                     }
-                },
-                Slot::Free { .. } => {
-                    // Already free
-                    free_count += 1;
                 }
             }
         }
         
-        self.allocated_objects = self.slots.len() - free_count;
+        self.allocated_objects = total_slots - free_count;
         
         // Adjust threshold
         self.next_gc_threshold = (self.allocated_objects * 2).max(1024 * 1024);

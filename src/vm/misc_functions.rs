@@ -1,4 +1,4 @@
-use super::{compiler::Compiler, vp::{Value, VmContext, HeapValue}, gc::Arena};
+use super::{compiler::Compiler, vp::{Value, ValueKind, VmContext, HeapValue}, gc::Arena};
 
 pub fn register_functions(compiler: &mut Compiler) {
     compiler.register_function("error", error, None);
@@ -19,9 +19,9 @@ fn error(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
 }
 
 fn value_to_string(val: &Value, heap: &Arena<HeapValue>) -> String {
-    match val {
-        Value::Object(handle) => {
-            match heap.get(*handle) {
+    match val.kind() {
+        ValueKind::Object(handle) => {
+            match heap.get(handle) {
                 Some(HeapValue::String(s)) => format!("{:?}", s),
                 Some(HeapValue::Symbol(s)) => s.clone(),
                 Some(HeapValue::Pair(_)) => "(...)".to_string(),

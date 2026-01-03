@@ -1,4 +1,4 @@
-use super::{compiler::Compiler, vp::Value, vp::Pair, vp::HeapValue, vp::VmContext};
+use super::{compiler::Compiler, vp::Value, vp::ValueKind, vp::Pair, vp::HeapValue, vp::VmContext};
 
 pub fn register_functions(compiler: &mut Compiler) {
     compiler.register_function("car", car, Some(1));
@@ -36,15 +36,15 @@ fn cons(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
         car: args[0],
         cdr: args[1],
     };
-    Ok(Value::Object(ctx.heap().alloc(HeapValue::Pair(pair))))
+    Ok(Value::object(ctx.heap().alloc(HeapValue::Pair(pair))))
 }
 
 fn car(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("car expects 1 argument".to_string());
     }
-    match args[0] {
-        Value::Object(handle) => match ctx.heap().get(handle) {
+    match args[0].kind() {
+        ValueKind::Object(handle) => match ctx.heap().get(handle) {
             Some(HeapValue::Pair(p)) => Ok(p.car),
             _ => Err("car expects a pair".to_string()),
         },
@@ -56,8 +56,8 @@ fn cdr(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("cdr expects 1 argument".to_string());
     }
-    match args[0] {
-        Value::Object(handle) => match ctx.heap().get(handle) {
+    match args[0].kind() {
+        ValueKind::Object(handle) => match ctx.heap().get(handle) {
             Some(HeapValue::Pair(p)) => Ok(p.cdr),
             _ => Err("cdr expects a pair".to_string()),
         },
@@ -69,12 +69,12 @@ fn is_pair(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("pair? expects 1 argument".to_string());
     }
-    match args[0] {
-        Value::Object(handle) => match ctx.heap().get(handle) {
-            Some(HeapValue::Pair(_)) => Ok(Value::Boolean(true)),
-            _ => Ok(Value::Boolean(false)),
+    match args[0].kind() {
+        ValueKind::Object(handle) => match ctx.heap().get(handle) {
+            Some(HeapValue::Pair(_)) => Ok(Value::boolean(true)),
+            _ => Ok(Value::boolean(false)),
         },
-        _ => Ok(Value::Boolean(false)),
+        _ => Ok(Value::boolean(false)),
     }
 }
 
@@ -82,14 +82,14 @@ fn is_null(_ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("null? expects 1 argument".to_string());
     }
-    match &args[0] {
-        Value::Empty => Ok(Value::Boolean(true)),
-        _ => Ok(Value::Boolean(false)),
+    match args[0].kind() {
+        ValueKind::Nil => Ok(Value::boolean(true)),
+        _ => Ok(Value::boolean(false)),
     }
 }
 
 fn list(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
-    let mut result = Value::Empty;
+    let mut result = Value::nil();
     ctx.push_scratch(result);
     for val in args.iter().rev() {
         ctx.pop_scratch();
@@ -100,7 +100,7 @@ fn list(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
             car: *val,
             cdr: result,
         };
-        result = Value::Object(ctx.heap().alloc(HeapValue::Pair(pair)));
+        result = Value::object(ctx.heap().alloc(HeapValue::Pair(pair)));
     }
     ctx.pop_scratch();
     Ok(result)
@@ -113,9 +113,9 @@ fn length(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     let mut count = 0;
     let mut current = args[0].clone();
     loop {
-        match current {
-            Value::Empty => break,
-            Value::Object(o) => match ctx.heap().get(o) {
+        match current.kind() {
+            ValueKind::Nil => break,
+            ValueKind::Object(o) => match ctx.heap().get(o) {
                 Some(HeapValue::Pair(p)) => {
                     count += 1;
                     current = p.cdr;
@@ -125,12 +125,12 @@ fn length(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
             _ => return Err("length expects a proper list".to_string()),
         }
     }
-    Ok(Value::Integer(count))
+    Ok(Value::integer(count))
 }
 
 fn append(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     if args.is_empty() {
-        return Ok(Value::Empty);
+        return Ok(Value::nil());
     }
     
     let mut result = args[args.len() - 1].clone();
@@ -142,9 +142,9 @@ fn append(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
         
         // Collect elements of the current list
         loop {
-            match list {
-                Value::Empty => break,
-                Value::Object(o) => match ctx.heap().get(o) {
+            match list.kind() {
+                ValueKind::Nil => break,
+                ValueKind::Object(o) => match ctx.heap().get(o) {
                     Some(HeapValue::Pair(p)) => {
                         elements.push(p.car);
                         list = p.cdr;
@@ -165,7 +165,7 @@ fn append(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
                 car: *val,
                 cdr: result,
             };
-            result = Value::Object(ctx.heap().alloc(HeapValue::Pair(pair)));
+            result = Value::object(ctx.heap().alloc(HeapValue::Pair(pair)));
         }
     }
     ctx.pop_scratch();
@@ -176,12 +176,12 @@ fn reverse(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("reverse expects 1 argument".to_string());
     }
-    let mut result = Value::Empty;
+    let mut result = Value::nil();
     let mut current = args[0].clone();
     loop {
-        match current {
-            Value::Empty => break,
-            Value::Object(handle) => {
+        match current.kind() {
+            ValueKind::Nil => break,
+            ValueKind::Object(handle) => {
                 let (car, cdr) = match ctx.heap().get(handle) {
                     Some(HeapValue::Pair(p)) => (p.car, p.cdr),
                     _ => return Err("reverse expects a proper list".to_string()),
@@ -190,7 +190,7 @@ fn reverse(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
                     car,
                     cdr: result,
                 };
-                result = Value::Object(ctx.heap().alloc(HeapValue::Pair(pair)));
+                result = Value::object(ctx.heap().alloc(HeapValue::Pair(pair)));
                 current = cdr;
             },
             _ => return Err("reverse expects a proper list".to_string()),
@@ -204,8 +204,8 @@ fn list_ref(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
         return Err("list-ref expects 2 arguments".to_string());
     }
     let mut list = args[0].clone();
-    let index = match args[1] {
-        Value::Integer(i) => i,
+    let index = match args[1].kind() {
+        ValueKind::Integer(i) => i,
         _ => return Err("list-ref index must be an integer".to_string()),
     };
     
@@ -215,9 +215,9 @@ fn list_ref(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     
     let mut current_index = 0;
     loop {
-        match list {
-            Value::Empty => return Err("list-ref index out of bounds".to_string()),
-            Value::Object(o) => match ctx.heap().get(o) {
+        match list.kind() {
+            ValueKind::Nil => return Err("list-ref index out of bounds".to_string()),
+            ValueKind::Object(o) => match ctx.heap().get(o) {
                 Some(HeapValue::Pair(p)) => {
                     if current_index == index {
                         return Ok(p.car);
@@ -237,8 +237,8 @@ fn list_tail(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
         return Err("list-tail expects 2 arguments".to_string());
     }
     let mut list = args[0].clone();
-    let index = match args[1] {
-        Value::Integer(i) => i,
+    let index = match args[1].kind() {
+        ValueKind::Integer(i) => i,
         _ => return Err("list-tail index must be an integer".to_string()),
     };
     
@@ -251,9 +251,9 @@ fn list_tail(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
         if current_index == index {
             return Ok(list);
         }
-        match list {
-            Value::Empty => return Err("list-tail index out of bounds".to_string()),
-            Value::Object(o) => match ctx.heap().get(o) {
+        match list.kind() {
+            ValueKind::Nil => return Err("list-tail index out of bounds".to_string()),
+            ValueKind::Object(o) => match ctx.heap().get(o) {
                 Some(HeapValue::Pair(p)) => {
                     list = p.cdr;
                     current_index += 1;
@@ -269,12 +269,12 @@ fn cadr(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 { return Err("cadr expects 1 argument".to_string()); }
     let l = args[0].clone();
     // (car (cdr l))
-    match l {
-        Value::Object(o) => match ctx.heap().get(o) {
+    match l.kind() {
+        ValueKind::Object(o) => match ctx.heap().get(o) {
             Some(HeapValue::Pair(p)) => {
                 let cdr = p.cdr;
-                match cdr {
-                    Value::Object(o2) => match ctx.heap().get(o2) {
+                match cdr.kind() {
+                    ValueKind::Object(o2) => match ctx.heap().get(o2) {
                         Some(HeapValue::Pair(p2)) => Ok(p2.car),
                         _ => Err("cadr expects a list of at least length 2".to_string()),
                     },
@@ -291,16 +291,16 @@ fn caddr(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 { return Err("caddr expects 1 argument".to_string()); }
     // (car (cdr (cdr l)))
     let l = args[0].clone();
-    match l {
-        Value::Object(o) => match ctx.heap().get(o) {
+    match l.kind() {
+        ValueKind::Object(o) => match ctx.heap().get(o) {
             Some(HeapValue::Pair(p)) => {
                 let cdr = p.cdr;
-                match cdr {
-                    Value::Object(o2) => match ctx.heap().get(o2) {
+                match cdr.kind() {
+                    ValueKind::Object(o2) => match ctx.heap().get(o2) {
                         Some(HeapValue::Pair(p2)) => {
                             let cddr = p2.cdr;
-                            match cddr {
-                                Value::Object(o3) => match ctx.heap().get(o3) {
+                            match cddr.kind() {
+                                ValueKind::Object(o3) => match ctx.heap().get(o3) {
                                     Some(HeapValue::Pair(p3)) => Ok(p3.car),
                                     _ => Err("caddr expects a list of at least length 3".to_string()),
                                 },
@@ -322,12 +322,12 @@ fn cddr(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 { return Err("cddr expects 1 argument".to_string()); }
     // (cdr (cdr l))
     let l = args[0].clone();
-    match l {
-        Value::Object(o) => match ctx.heap().get(o) {
+    match l.kind() {
+        ValueKind::Object(o) => match ctx.heap().get(o) {
             Some(HeapValue::Pair(p)) => {
                 let cdr = p.cdr;
-                match cdr {
-                    Value::Object(o2) => match ctx.heap().get(o2) {
+                match cdr.kind() {
+                    ValueKind::Object(o2) => match ctx.heap().get(o2) {
                         Some(HeapValue::Pair(p2)) => Ok(p2.cdr),
                         _ => Err("cddr expects a list of at least length 2".to_string()),
                     },
@@ -342,11 +342,11 @@ fn cddr(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
 
 fn set_car(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 { return Err("set-car! expects 2 arguments".to_string()); }
-    match args[0] {
-        Value::Object(handle) => match ctx.heap().get_mut(handle) {
+    match args[0].kind() {
+        ValueKind::Object(handle) => match ctx.heap().get_mut(handle) {
             Some(HeapValue::Pair(p)) => {
                 p.car = args[1];
-                Ok(Value::Empty)
+                Ok(Value::nil())
             },
             _ => Err("set-car! expects a pair".to_string()),
         },
@@ -356,11 +356,11 @@ fn set_car(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
 
 fn set_cdr(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 { return Err("set-cdr! expects 2 arguments".to_string()); }
-    match args[0] {
-        Value::Object(handle) => match ctx.heap().get_mut(handle) {
+    match args[0].kind() {
+        ValueKind::Object(handle) => match ctx.heap().get_mut(handle) {
             Some(HeapValue::Pair(p)) => {
                 p.cdr = args[1];
-                Ok(Value::Empty)
+                Ok(Value::nil())
             },
             _ => Err("set-cdr! expects a pair".to_string()),
         },
@@ -374,9 +374,9 @@ fn memq(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     let mut list = args[1].clone();
     
     loop {
-        let next_val = match &list {
-            Value::Empty => return Ok(Value::Boolean(false)),
-            Value::Object(o) => match ctx.heap().get(*o) {
+        let next_val = match list.kind() {
+            ValueKind::Nil => return Ok(Value::boolean(false)),
+            ValueKind::Object(o) => match ctx.heap().get(o) {
                 Some(HeapValue::Pair(p)) => {
                     let car = p.car;
                     if car == *obj {
@@ -402,17 +402,17 @@ fn assq(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     let mut list = args[1].clone();
     
     loop {
-        let (entry, cdr) = match &list {
-            Value::Empty => return Ok(Value::Boolean(false)),
-            Value::Object(o) => match ctx.heap().get(*o) {
+        let (entry, cdr) = match list.kind() {
+            ValueKind::Nil => return Ok(Value::boolean(false)),
+            ValueKind::Object(o) => match ctx.heap().get(o) {
                 Some(HeapValue::Pair(p)) => (p.car, p.cdr),
                 _ => return Err("assq expects a proper list".to_string()),
             },
             _ => return Err("assq expects a proper list".to_string()),
         };
 
-        match &entry {
-            Value::Object(oe) => match ctx.heap().get(*oe) {
+        match entry.kind() {
+            ValueKind::Object(oe) => match ctx.heap().get(oe) {
                 Some(HeapValue::Pair(pe)) => {
                     let key = pe.car;
                     if key == *obj {

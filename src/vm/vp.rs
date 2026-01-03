@@ -230,48 +230,176 @@ impl Trace<HeapValue> for HeapValue {
     }
 }
 
-#[derive(PartialEq, Clone, Copy)]
-#[repr(C, u8)]
-pub enum Value {
-    Empty,
-    Boolean(bool),
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct Value(u64);
+
+impl Value {
+    // --- Tags (3 bits) ---
+    const TAG_HANDLE: u64    = 0b000;
+    const TAG_INT: u64       = 0b001;
+    const TAG_FLOAT: u64     = 0b010;
+    const TAG_IMMEDIATE: u64 = 0b011;
+    
+    const TAG_MASK: u64      = 0b111;
+
+    // --- Immediate Constants ---
+    const IMM_NIL: u64       = (0 << 4) | Self::TAG_IMMEDIATE;
+    const IMM_FALSE: u64     = (1 << 4) | Self::TAG_IMMEDIATE;
+    const IMM_TRUE: u64      = (2 << 4) | Self::TAG_IMMEDIATE;
+    const IMM_UNDEFINED: u64 = (3 << 4) | Self::TAG_IMMEDIATE;
+
+    // --- Constructors ---
+
+    #[inline(always)]
+    pub const fn integer(val: i64) -> Self {
+        let shifted = (val as u64) << 3;
+        Value(shifted | Self::TAG_INT)
+    }
+
+    #[inline(always)]
+    pub const fn float(val: f32) -> Self {
+        // val.to_bits() is const stable since 1.37
+        let bits = unsafe { std::mem::transmute::<f32, u32>(val) } as u64;
+        let shifted = bits << 32; 
+        Value(shifted | Self::TAG_FLOAT)
+    }
+
+    #[inline(always)]
+    pub const fn object(handle: Handle) -> Self {
+        let shifted = (handle.index() as u64) << 3;
+        Value(shifted | Self::TAG_HANDLE)
+    }
+
+    #[inline(always)]
+    pub const fn boolean(b: bool) -> Self {
+        if b { Value(Self::IMM_TRUE) } else { Value(Self::IMM_FALSE) }
+    }
+
+    #[inline(always)]
+    pub const fn nil() -> Self {
+        Value(Self::IMM_NIL)
+    }
+
+    #[inline(always)]
+    pub const fn undefined() -> Self {
+        Value(Self::IMM_UNDEFINED)
+    }
+
+    // --- Type Checkers ---
+
+    #[inline(always)]
+    pub fn is_int(&self) -> bool {
+        (self.0 & Self::TAG_MASK) == Self::TAG_INT
+    }
+
+    #[inline(always)]
+    pub fn is_float(&self) -> bool {
+        (self.0 & Self::TAG_MASK) == Self::TAG_FLOAT
+    }
+
+    #[inline(always)]
+    pub fn is_object(&self) -> bool {
+        (self.0 & Self::TAG_MASK) == Self::TAG_HANDLE
+    }
+
+    #[inline(always)]
+    pub fn is_bool(&self) -> bool {
+        self.0 == Self::IMM_TRUE || self.0 == Self::IMM_FALSE
+    }
+
+    #[inline(always)]
+    pub fn is_nil(&self) -> bool {
+        self.0 == Self::IMM_NIL
+    }
+
+    // --- Accessors ---
+
+    #[inline(always)]
+    pub fn as_int(&self) -> i64 {
+        (self.0 as i64) >> 3
+    }
+
+    #[inline(always)]
+    pub fn as_float(&self) -> f32 {
+        let bits = (self.0 >> 32) as u32;
+        f32::from_bits(bits)
+    }
+
+    #[inline(always)]
+    pub fn as_handle(&self) -> Handle {
+        unsafe { Handle::from_raw((self.0 >> 3) as u32) }
+    }
+
+    #[inline(always)]
+    pub fn as_bool(&self) -> bool {
+        self.0 == Self::IMM_TRUE
+    }
+
+    pub fn is_true(&self) -> bool {
+        !self.is_bool() || self.as_bool()
+    }
+
+    pub fn kind(&self) -> ValueKind {
+        if self.is_int() { ValueKind::Integer(self.as_int()) }
+        else if self.is_float() { ValueKind::Float(self.as_float()) }
+        else if self.is_object() { ValueKind::Object(self.as_handle()) }
+        else if self.is_bool() { ValueKind::Boolean(self.as_bool()) }
+        else if self.is_nil() { ValueKind::Nil }
+        else { ValueKind::Undefined }
+    }
+}
+
+#[derive(Debug)]
+pub enum ValueKind {
     Integer(i64),
-    Float(f64),
-    Object(Handle)
+    Float(f32),
+    Object(Handle),
+    Boolean(bool),
+    Nil,
+    Undefined
 }
 
 impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self)
+        if self.is_int() {
+            write!(f, "Int({})", self.as_int())
+        } else if self.is_float() {
+            write!(f, "Float({})", self.as_float())
+        } else if self.is_object() {
+            write!(f, "Obj({:?})", self.as_handle())
+        } else if self.is_nil() {
+            write!(f, "nil")
+        } else if self.is_bool() {
+            write!(f, "Bool({})", self.as_bool())
+        } else {
+            write!(f, "Unknown({:#x})", self.0)
+        }
     }
 }
 
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Value::Empty => write!(f, "()"),
-            Value::Boolean(b) => write!(f, "{}", if *b { "#t" } else { "#f" }),
-            Value::Integer(i) => write!(f, "{}", i),
-            Value::Float(fl) => write!(f, "{}", fl),
-            Value::Object(_) => write!(f, "#<object>"),
+        if self.is_int() {
+            write!(f, "{}", self.as_int())
+        } else if self.is_float() {
+            write!(f, "{}", self.as_float())
+        } else if self.is_object() {
+            write!(f, "#<object>")
+        } else if self.is_nil() {
+            write!(f, "()")
+        } else if self.is_bool() {
+            write!(f, "{}", if self.as_bool() { "#t" } else { "#f" })
+        } else {
+            write!(f, "#<unknown>")
         }
     }
 }
 
 impl Trace<HeapValue> for Value {
     fn trace(&self, arena: &mut Arena<HeapValue>) {
-        match self {
-            Value::Object(handle) => arena.mark(*handle),
-            _ => {}
-        }
-    }
-}
-
-impl Value {
-    pub fn is_true(&self) -> bool {
-        match self {
-            Self::Boolean(b) if !b => false,
-            _ => true
+        if self.is_object() {
+            arena.mark(self.as_handle());
         }
     }
 }

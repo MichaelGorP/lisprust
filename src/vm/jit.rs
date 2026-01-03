@@ -5,7 +5,7 @@ use cranelift::prelude::*;
 use cranelift::codegen::ir::BlockArg;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, Linkage, Module};
-use crate::vm::vp::{Value as LispValue, Instr, JumpCondition, VirtualProgram, FunctionHeader, HeapValue};
+use crate::vm::vp::{Value as LispValue, ValueKind, Instr, JumpCondition, VirtualProgram, FunctionHeader, HeapValue};
 use crate::vm::vm::Vm;
 use crate::vm::gc::Arena;
 
@@ -13,7 +13,7 @@ pub mod jit_types;
 pub mod analysis;
 pub mod vm_helpers;
 
-use self::jit_types::{JitType, TAG_OFFSET, DATA_OFFSET};
+use self::jit_types::JitType;
 use self::analysis::{analyze_function, scan_function_end};
 use self::vm_helpers::*;
 
@@ -82,7 +82,7 @@ impl Jit {
         let param_count = param_types.len();
         let cranelift_type = match main_type {
             JitType::Int => types::I64,
-            JitType::Float => types::F64,
+            JitType::Float => types::F32,
         };
         
         let original_pos = prog.cursor.position();
@@ -108,10 +108,12 @@ impl Jit {
         
         let mut args = Vec::new();
         for i in 0..param_count {
-             let offset = (i as i32) * 16 + 8;
+             let offset = (i as i32) * 8;
              let val = builder.ins().load(types::I64, MemFlags::trusted(), regs_ptr, offset);
              let arg = if *main_type == JitType::Float {
-                 builder.ins().bitcast(types::F64, MemFlags::new(), val)
+                 let shifted = builder.ins().ushr_imm(val, 32);
+                 let truncated = builder.ins().ireduce(types::I32, shifted);
+                 builder.ins().bitcast(types::F32, MemFlags::new(), truncated)
              } else {
                  val
              };
@@ -134,23 +136,18 @@ impl Jit {
         let res = builder.inst_results(call)[0];
         
         let res_reg = header.result_reg as i32;
-        let offset_tag = res_reg * 16;
-        let offset_data = res_reg * 16 + 8;
-        
-        let tag = if *main_type == JitType::Float {
-            builder.ins().iconst(types::I8, 3) // Float tag
-        } else {
-            builder.ins().iconst(types::I8, 2) // Integer tag
-        };
+        let offset = res_reg * 8;
         
         let res_store = if *main_type == JitType::Float {
-            builder.ins().bitcast(types::I64, MemFlags::new(), res)
+            let bits = builder.ins().bitcast(types::I32, MemFlags::new(), res);
+            let extended = builder.ins().uextend(types::I64, bits);
+            let shifted = builder.ins().ishl_imm(extended, 32);
+            builder.ins().bor_imm(shifted, 2) // TAG_FLOAT
         } else {
             res
         };
         
-        builder.ins().store(MemFlags::trusted(), tag, regs_ptr, offset_tag);
-        builder.ins().store(MemFlags::trusted(), res_store, regs_ptr, offset_data);
+        builder.ins().store(MemFlags::trusted(), res_store, regs_ptr, offset);
         
         builder.ins().return_(&[]);
         builder.seal_all_blocks();
@@ -223,7 +220,7 @@ impl Jit {
 
         let cranelift_type = match main_type {
             JitType::Int => types::I64,
-            JitType::Float => types::F64,
+            JitType::Float => types::F32,
         };
 
         let mut ctx = codegen::Context::new();
@@ -357,7 +354,11 @@ impl Jit {
                 let res = if $main_type == JitType::Float {
                     $builder.ins().$float_func(v1, v2)
                 } else {
-                    $builder.ins().$int_func(v1, v2)
+                    let i1 = $builder.ins().sshr_imm(v1, 3);
+                    let i2 = $builder.ins().sshr_imm(v2, 3);
+                    let r = $builder.ins().$int_func(i1, i2);
+                    let s = $builder.ins().ishl_imm(r, 3);
+                    $builder.ins().bor_imm(s, 1)
                 };
                 $builder.def_var($vars[$opcode[1] as usize], res);
                 $const_funcs.remove(&($opcode[1] as usize));
@@ -371,13 +372,17 @@ impl Jit {
                 let res = if $main_type == JitType::Float {
                     $builder.ins().fcmp($float_cc, v1, v2)
                 } else {
-                    $builder.ins().icmp($int_cc, v1, v2)
+                    let i1 = $builder.ins().sshr_imm(v1, 3);
+                    let i2 = $builder.ins().sshr_imm(v2, 3);
+                    $builder.ins().icmp($int_cc, i1, i2)
                 };
                 let val = if $main_type == JitType::Float {
                     let b_int = $builder.ins().uextend(types::I64, res);
-                    $builder.ins().fcvt_from_uint(types::F64, b_int)
+                    $builder.ins().fcvt_from_uint(types::F32, b_int)
                 } else {
-                    $builder.ins().uextend(types::I64, res)
+                    let t = $builder.ins().iconst(types::I64, 35);
+                    let f = $builder.ins().iconst(types::I64, 19);
+                    $builder.ins().select(res, t, f)
                 };
                 $builder.def_var($vars[$opcode[1] as usize], val);
                 $const_funcs.remove(&($opcode[1] as usize));
@@ -463,9 +468,11 @@ impl Jit {
                     Instr::LoadInt => {
                         let val = prog.read_int().unwrap();
                         let v = if main_type == JitType::Float {
-                            builder.ins().f64const(val as f64)
+                            builder.ins().f32const(val as f32)
                         } else {
-                            builder.ins().iconst(types::I64, val)
+                            let c = builder.ins().iconst(types::I64, val);
+                            let s = builder.ins().ishl_imm(c, 3);
+                            builder.ins().bor_imm(s, 1)
                         };
                         builder.def_var(vars[opcode[1] as usize], v);
                         const_funcs.remove(&(opcode[1] as usize));
@@ -473,7 +480,7 @@ impl Jit {
                     Instr::LoadFloat => {
                         let val = prog.read_float().unwrap();
                         let v = if main_type == JitType::Float {
-                            builder.ins().f64const(val)
+                            builder.ins().f32const(val as f32)
                         } else {
                             builder.ins().iconst(types::I64, val as i64)
                         };
@@ -484,9 +491,9 @@ impl Jit {
                         let dest = opcode[1] as usize;
                         let val = opcode[2] != 0;
                         let v = if main_type == JitType::Float {
-                            builder.ins().f64const(if val { 1.0 } else { 0.0 })
+                            builder.ins().f32const(if val { 1.0 } else { 0.0 })
                         } else {
-                            builder.ins().iconst(types::I64, if val { 1 } else { 0 })
+                            builder.ins().iconst(types::I64, if val { 35 } else { 19 }) // IMM_TRUE / IMM_FALSE
                         };
                         builder.def_var(vars[dest], v);
                         const_funcs.remove(&dest);
@@ -510,8 +517,8 @@ impl Jit {
                     Instr::LoadGlobal => {
                         let sym_id = prog.read_int().unwrap();
                         if let Some(val) = global_vars.get(sym_id as usize) {
-                            let addr = match val {
-                                LispValue::Object(handle) => match heap.get(*handle) {
+                            let addr = match val.kind() {
+                                ValueKind::Object(handle) => match heap.get(handle) {
                                     Some(HeapValue::FuncRef(f)) => Some(f.address),
                                     _ => None
                                 },
@@ -597,10 +604,10 @@ impl Jit {
                                 
                                 let cond_val = builder.use_var(vars[opcode[2] as usize]);
                                 let cond_bool = if main_type == JitType::Float {
-                                    let zero = builder.ins().f64const(0.0);
+                                    let zero = builder.ins().f32const(0.0);
                                     builder.ins().fcmp(FloatCC::NotEqual, cond_val, zero)
                                 } else {
-                                    builder.ins().icmp_imm(IntCC::NotEqual, cond_val, 0)
+                                    builder.ins().icmp_imm(IntCC::NotEqual, cond_val, 19) // IMM_FALSE
                                 };
                                 let not_cond = builder.ins().bnot(cond_bool);
                                 
@@ -620,16 +627,18 @@ impl Jit {
                             prog.cursor.set_position(pos);
                             let v = builder.use_var(vars[opcode[2] as usize]);
                             let b = if main_type == JitType::Float {
-                                let zero = builder.ins().f64const(0.0);
+                                let zero = builder.ins().f32const(0.0);
                                 builder.ins().fcmp(FloatCC::Equal, v, zero)
                             } else {
-                                builder.ins().icmp_imm(IntCC::Equal, v, 0)
+                                builder.ins().icmp_imm(IntCC::Equal, v, 19) // IMM_FALSE
                             };
                             let res = if main_type == JitType::Float {
                                 let b_int = builder.ins().uextend(types::I64, b);
-                                builder.ins().fcvt_from_uint(types::F64, b_int)
+                                builder.ins().fcvt_from_uint(types::F32, b_int)
                             } else {
-                                builder.ins().uextend(types::I64, b)
+                                let t = builder.ins().iconst(types::I64, 35);
+                                let f = builder.ins().iconst(types::I64, 19);
+                                builder.ins().select(b, t, f)
                             };
                             builder.def_var(vars[opcode[1] as usize], res);
                             const_funcs.remove(&(opcode[1] as usize));
@@ -645,10 +654,10 @@ impl Jit {
                         } else {
                             let v = builder.use_var(vars[opcode[1] as usize]);
                             let cond = if main_type == JitType::Float {
-                                let zero = builder.ins().f64const(0.0);
+                                let zero = builder.ins().f32const(0.0);
                                 builder.ins().fcmp(FloatCC::NotEqual, v, zero)
                             } else {
-                                builder.ins().icmp_imm(IntCC::NotEqual, v, 0)
+                                builder.ins().icmp_imm(IntCC::NotEqual, v, 19) // IMM_FALSE
                             };
                             let fallthrough = prog.cursor.position();
                             let fallthrough_block = blocks[&fallthrough];
@@ -1040,35 +1049,23 @@ impl Jit {
                     
                     let target_block = *blocks.get(&target).ok_or(format!("Jump target block not found: {}", target))?;
                     
-
-
                     if cond_byte == JumpCondition::Jump as u8 {
                         builder.ins().jump(target_block, &[BlockArg::from(registers_ptr)]);
                     } else {
                         // Conditional Jump
                         let reg_idx = opcode[1] as i64;
-                        let val_size = std::mem::size_of::<LispValue>() as i64;
+                        let val_size = 8;
                         let reg_ptr = builder.ins().iadd_imm(registers_ptr, reg_idx * val_size);
                         
-                        let tag = builder.ins().load(types::I8, MemFlags::trusted(), reg_ptr, TAG_OFFSET);
-                        let val = builder.ins().load(types::I8, MemFlags::trusted(), reg_ptr, DATA_OFFSET);
+                        let val = builder.ins().load(types::I64, MemFlags::trusted(), reg_ptr, 0);
                         
-                        // is_false = (tag == 1) && (val == 0)
-                        // Tag 1 is Boolean. Val 0 is false.
-                        let tag_is_bool = builder.ins().icmp_imm(IntCC::Equal, tag, 1);
-                        let val_is_false = builder.ins().icmp_imm(IntCC::Equal, val, 0);
-                        let is_false = builder.ins().band(tag_is_bool, val_is_false);
+                        // IMM_FALSE = 19
+                        let is_false = builder.ins().icmp_imm(IntCC::Equal, val, 19);
                         
                         let fallthrough_block = *blocks.get(&after_read_pos).ok_or("Fallthrough block not found")?;
 
                         if cond_byte == JumpCondition::JumpTrue as u8 {
                             // Jump if !is_false (i.e. is_true)
-                            // If is_false is true (1), we fallthrough.
-                            // If is_false is false (0), we jump.
-                            // Wait. brif(c, then, else).
-                            // If is_false (it is false), we want to jump (it is true).
-                            // So if is_false is 0, we jump.
-                            // brif(is_false, fallthrough, target)
                             builder.ins().brif(is_false, fallthrough_block, &[BlockArg::from(registers_ptr)], target_block, &[BlockArg::from(registers_ptr)]);
                         } else {
                             // JumpFalse
@@ -1082,14 +1079,14 @@ impl Jit {
                     let dest_reg = opcode[1] as i64;
                     let val = prog.read_int().unwrap();
                     
-                    let val_size = std::mem::size_of::<LispValue>() as i64;
+                    let val_size = 8;
                     let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
                     
-                    let const_tag = builder.ins().iconst(types::I8, 2); // Value::Integer
                     let val_const = builder.ins().iconst(types::I64, val);
+                    let val_shifted = builder.ins().ishl_imm(val_const, 3);
+                    let raw = builder.ins().bor_imm(val_shifted, 1);
                     
-                    builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                    builder.ins().store(MemFlags::trusted(), val_const, dest_ptr, DATA_OFFSET);
+                    builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                     
                     is_terminated = false;
                 },
@@ -1097,15 +1094,17 @@ impl Jit {
                     let dest_reg = opcode[1] as i64;
                     let val_bits = prog.read_int().unwrap();
                     let val = f64::from_bits(val_bits as u64);
+                    let val_f32 = val as f32;
+                    let bits = val_f32.to_bits() as i64;
                     
-                    let val_size = std::mem::size_of::<LispValue>() as i64;
+                    let val_size = 8;
                     let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
                     
-                    let const_tag = builder.ins().iconst(types::I8, 3); // Value::Float
-                    let val_const = builder.ins().f64const(val);
+                    let bits_const = builder.ins().iconst(types::I64, bits);
+                    let bits_shifted = builder.ins().ishl_imm(bits_const, 32);
+                    let raw = builder.ins().bor_imm(bits_shifted, 2);
                     
-                    builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                    builder.ins().store(MemFlags::trusted(), val_const, dest_ptr, DATA_OFFSET);
+                    builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                     
                     is_terminated = false;
                 },
@@ -1113,14 +1112,13 @@ impl Jit {
                     let dest_reg = opcode[1] as i64;
                     let val = opcode[2] != 0;
                     
-                    let val_size = std::mem::size_of::<LispValue>() as i64;
+                    let val_size = 8;
                     let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
                     
-                    let const_tag = builder.ins().iconst(types::I8, 1); // Value::Boolean
-                    let val_const = builder.ins().iconst(types::I64, if val { 1 } else { 0 });
+                    let raw_val = if val { 35 } else { 19 };
+                    let raw = builder.ins().iconst(types::I64, raw_val);
                     
-                    builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                    builder.ins().store(MemFlags::trusted(), val_const, dest_ptr, DATA_OFFSET);
+                    builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                     
                     is_terminated = false;
                 },
@@ -1225,9 +1223,6 @@ impl Jit {
                     let reg_count_const = builder.ins().iconst(types::I64, reg_count);
                     let func_id_const = builder.ins().iconst(types::I64, func_id);
                     
-                    // I need to update helper_call_function signature to take func_id
-                    // and NOT read from prog.
-                    
                     builder.ins().call(local_helper_call_function, &[vm_ptr, prog_ptr, registers_ptr, dest_reg_const, start_reg_const, reg_count_const, func_id_const]);
                     is_terminated = false;
                 },
@@ -1297,124 +1292,108 @@ impl Jit {
                     }
                     }
                     
-                    let val_size = std::mem::size_of::<LispValue>() as i64;
+                    let val_size = 8;
                     
                     let src1_ptr = builder.ins().iadd_imm(registers_ptr, src1_reg * val_size);
                     let src2_ptr = builder.ins().iadd_imm(registers_ptr, src2_reg * val_size);
                     let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
                     
-                    let tag1 = builder.ins().load(types::I8, MemFlags::trusted(), src1_ptr, TAG_OFFSET);
-                    let tag2 = builder.ins().load(types::I8, MemFlags::trusted(), src2_ptr, TAG_OFFSET);
+                    let val1_raw = builder.ins().load(types::I64, MemFlags::trusted(), src1_ptr, 0);
+                    let val2_raw = builder.ins().load(types::I64, MemFlags::trusted(), src2_ptr, 0);
 
-                    // Fast path for integers
-                    let t1_x = builder.ins().bxor_imm(tag1, 2);
-                    let t2_x = builder.ins().bxor_imm(tag2, 2);
-                    let any_non_int = builder.ins().bor(t1_x, t2_x);
-                    builder.ins().brif(any_non_int, block_dispatch, &[], block_int, &[]);
+                    // Check tags (low 3 bits)
+                    let tag1 = builder.ins().band_imm(val1_raw, 7);
+                    let tag2 = builder.ins().band_imm(val2_raw, 7);
+                    
+                    // TAG_INT = 1
+                    let t1_is_int = builder.ins().icmp_imm(IntCC::Equal, tag1, 1);
+                    let t2_is_int = builder.ins().icmp_imm(IntCC::Equal, tag2, 1);
+                    let both_int = builder.ins().band(t1_is_int, t2_is_int);
+                    
+                    builder.ins().brif(both_int, block_int, &[], block_slow, &[]);
 
                     builder.switch_to_block(block_dispatch);
-                    let tag1_32 = builder.ins().uextend(types::I32, tag1);
-                    let tag2_32 = builder.ins().uextend(types::I32, tag2);
-                    let tag1_shifted = builder.ins().ishl_imm(tag1_32, 4);
-                    let combined = builder.ins().bor(tag1_shifted, tag2_32);
-                    let index = builder.ins().iadd_imm(combined, -34); // 0x22 = 34
-
-                    let mut table = Vec::new();
-                    for i in 0..18 {
-                        if i == 0 {
-                            table.push(builder.func.dfg.block_call(block_int, &[]));
-                        } else if i == 17 {
-                            table.push(builder.func.dfg.block_call(block_float_exec, &[]));
-                        } else {
-                            table.push(builder.func.dfg.block_call(block_slow, &[]));
-                        }
-                    }
-                    let default_call = builder.func.dfg.block_call(block_slow, &[]);
-                    let jt_data = JumpTableData::new(default_call, &table);
-                    let jt = builder.create_jump_table(jt_data);
-                    builder.ins().br_table(index, jt);
+                    builder.ins().jump(block_slow, &[]); // Skip dispatch for now
                     
                     // --- Integer Path ---
                     builder.switch_to_block(block_int);
-                    let val1 = builder.ins().load(types::I64, MemFlags::trusted(), src1_ptr, DATA_OFFSET);
-                    let val2 = builder.ins().load(types::I64, MemFlags::trusted(), src2_ptr, DATA_OFFSET);
+                    let val1 = builder.ins().sshr_imm(val1_raw, 3);
+                    let val2 = builder.ins().sshr_imm(val2_raw, 3);
                     
                     let mut comparison_result = None;
 
                     match instr {
                         Instr::Add => {
                             let res = builder.ins().iadd(val1, val2);
-                            let const_tag = builder.ins().iconst(types::I8, 2);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, DATA_OFFSET);
+                            let res_shifted = builder.ins().ishl_imm(res, 3);
+                            let res_raw = builder.ins().bor_imm(res_shifted, 1);
+                            builder.ins().store(MemFlags::trusted(), res_raw, dest_ptr, 0);
                         },
                         Instr::Sub => {
                             let res = builder.ins().isub(val1, val2);
-                            let const_tag = builder.ins().iconst(types::I8, 2);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, DATA_OFFSET);
+                            let res_shifted = builder.ins().ishl_imm(res, 3);
+                            let res_raw = builder.ins().bor_imm(res_shifted, 1);
+                            builder.ins().store(MemFlags::trusted(), res_raw, dest_ptr, 0);
                         },
                         Instr::Mul => {
                             let res = builder.ins().imul(val1, val2);
-                            let const_tag = builder.ins().iconst(types::I8, 2);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, DATA_OFFSET);
+                            let res_shifted = builder.ins().ishl_imm(res, 3);
+                            let res_raw = builder.ins().bor_imm(res_shifted, 1);
+                            builder.ins().store(MemFlags::trusted(), res_raw, dest_ptr, 0);
                         },
                         Instr::Div => {
-                            // Integer division in Lisp might need to handle 0 or return float? 
-                            // For now assuming standard integer div
                             let res = builder.ins().sdiv(val1, val2);
-                            let const_tag = builder.ins().iconst(types::I8, 2);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, DATA_OFFSET);
+                            let res_shifted = builder.ins().ishl_imm(res, 3);
+                            let res_raw = builder.ins().bor_imm(res_shifted, 1);
+                            builder.ins().store(MemFlags::trusted(), res_raw, dest_ptr, 0);
                         },
                         Instr::Eq => {
                             let res = builder.ins().icmp(IntCC::Equal, val1, val2);
                             comparison_result = Some(res);
-                            let res_ext = builder.ins().uextend(types::I64, res);
-                            let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
+                            let true_const = builder.ins().iconst(types::I64, 35);
+                            let false_const = builder.ins().iconst(types::I64, 19);
+                            let raw = builder.ins().select(res, true_const, false_const);
+                            builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                         },
                         Instr::Neq => {
                             let res = builder.ins().icmp(IntCC::NotEqual, val1, val2);
                             comparison_result = Some(res);
-                            let res_ext = builder.ins().uextend(types::I64, res);
-                            let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
+                            let true_const = builder.ins().iconst(types::I64, 35);
+                            let false_const = builder.ins().iconst(types::I64, 19);
+                            let raw = builder.ins().select(res, true_const, false_const);
+                            builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                         },
                         Instr::Lt => {
                             let res = builder.ins().icmp(IntCC::SignedLessThan, val1, val2);
                             comparison_result = Some(res);
-                            let res_ext = builder.ins().uextend(types::I64, res);
-                            let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
+                            let true_const = builder.ins().iconst(types::I64, 35);
+                            let false_const = builder.ins().iconst(types::I64, 19);
+                            let raw = builder.ins().select(res, true_const, false_const);
+                            builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                         },
                         Instr::Gt => {
                             let res = builder.ins().icmp(IntCC::SignedGreaterThan, val1, val2);
                             comparison_result = Some(res);
-                            let res_ext = builder.ins().uextend(types::I64, res);
-                            let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
+                            let true_const = builder.ins().iconst(types::I64, 35);
+                            let false_const = builder.ins().iconst(types::I64, 19);
+                            let raw = builder.ins().select(res, true_const, false_const);
+                            builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                         },
                         Instr::Leq => {
                             let res = builder.ins().icmp(IntCC::SignedLessThanOrEqual, val1, val2);
                             comparison_result = Some(res);
-                            let res_ext = builder.ins().uextend(types::I64, res);
-                            let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
+                            let true_const = builder.ins().iconst(types::I64, 35);
+                            let false_const = builder.ins().iconst(types::I64, 19);
+                            let raw = builder.ins().select(res, true_const, false_const);
+                            builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                         },
                         Instr::Geq => {
                             let res = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, val1, val2);
                             comparison_result = Some(res);
-                            let res_ext = builder.ins().uextend(types::I64, res);
-                            let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
+                            let true_const = builder.ins().iconst(types::I64, 35);
+                            let false_const = builder.ins().iconst(types::I64, 19);
+                            let raw = builder.ins().select(res, true_const, false_const);
+                            builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                         },
                         _ => {}
                     }
@@ -1435,83 +1414,101 @@ impl Jit {
 
                     // --- Float Path ---
                     builder.switch_to_block(block_float_exec);
-                    let val1 = builder.ins().load(types::F64, MemFlags::trusted(), src1_ptr, DATA_OFFSET);
-                    let val2 = builder.ins().load(types::F64, MemFlags::trusted(), src2_ptr, DATA_OFFSET);
+                    
+                    let val1_raw = builder.ins().load(types::I64, MemFlags::trusted(), src1_ptr, 0);
+                    let val2_raw = builder.ins().load(types::I64, MemFlags::trusted(), src2_ptr, 0);
+                    
+                    let bits1 = builder.ins().ushr_imm(val1_raw, 32);
+                    let bits2 = builder.ins().ushr_imm(val2_raw, 32);
+                    
+                    let trunc1 = builder.ins().ireduce(types::I32, bits1);
+                    let trunc2 = builder.ins().ireduce(types::I32, bits2);
+                    
+                    let val1 = builder.ins().bitcast(types::F32, MemFlags::new(), trunc1);
+                    let val2 = builder.ins().bitcast(types::F32, MemFlags::new(), trunc2);
                     
                     comparison_result = None;
 
                     match instr {
                         Instr::Add => {
                             let res = builder.ins().fadd(val1, val2);
-                            let const_tag = builder.ins().iconst(types::I8, 3);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, DATA_OFFSET);
+                            let bits = builder.ins().bitcast(types::I32, MemFlags::new(), res);
+                            let ext = builder.ins().uextend(types::I64, bits);
+                            let shifted = builder.ins().ishl_imm(ext, 32);
+                            let raw = builder.ins().bor_imm(shifted, 2);
+                            builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                         },
                         Instr::Sub => {
                             let res = builder.ins().fsub(val1, val2);
-                            let const_tag = builder.ins().iconst(types::I8, 3);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, DATA_OFFSET);
+                            let bits = builder.ins().bitcast(types::I32, MemFlags::new(), res);
+                            let ext = builder.ins().uextend(types::I64, bits);
+                            let shifted = builder.ins().ishl_imm(ext, 32);
+                            let raw = builder.ins().bor_imm(shifted, 2);
+                            builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                         },
                         Instr::Mul => {
                             let res = builder.ins().fmul(val1, val2);
-                            let const_tag = builder.ins().iconst(types::I8, 3);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, DATA_OFFSET);
+                            let bits = builder.ins().bitcast(types::I32, MemFlags::new(), res);
+                            let ext = builder.ins().uextend(types::I64, bits);
+                            let shifted = builder.ins().ishl_imm(ext, 32);
+                            let raw = builder.ins().bor_imm(shifted, 2);
+                            builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                         },
                         Instr::Div => {
                             let res = builder.ins().fdiv(val1, val2);
-                            let const_tag = builder.ins().iconst(types::I8, 3);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res, dest_ptr, DATA_OFFSET);
+                            let bits = builder.ins().bitcast(types::I32, MemFlags::new(), res);
+                            let ext = builder.ins().uextend(types::I64, bits);
+                            let shifted = builder.ins().ishl_imm(ext, 32);
+                            let raw = builder.ins().bor_imm(shifted, 2);
+                            builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                         },
                         Instr::Eq => {
                             let res = builder.ins().fcmp(FloatCC::Equal, val1, val2);
                             comparison_result = Some(res);
-                            let res_ext = builder.ins().uextend(types::I64, res);
-                            let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
+                            let t = builder.ins().iconst(types::I64, 35);
+                            let f = builder.ins().iconst(types::I64, 19);
+                            let raw = builder.ins().select(res, t, f);
+                            builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                         },
                         Instr::Neq => {
                             let res = builder.ins().fcmp(FloatCC::NotEqual, val1, val2);
                             comparison_result = Some(res);
-                            let res_ext = builder.ins().uextend(types::I64, res);
-                            let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
+                            let t = builder.ins().iconst(types::I64, 35);
+                            let f = builder.ins().iconst(types::I64, 19);
+                            let raw = builder.ins().select(res, t, f);
+                            builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                         },
                         Instr::Lt => {
                             let res = builder.ins().fcmp(FloatCC::LessThan, val1, val2);
                             comparison_result = Some(res);
-                            let res_ext = builder.ins().uextend(types::I64, res);
-                            let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
+                            let t = builder.ins().iconst(types::I64, 35);
+                            let f = builder.ins().iconst(types::I64, 19);
+                            let raw = builder.ins().select(res, t, f);
+                            builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                         },
                         Instr::Gt => {
                             let res = builder.ins().fcmp(FloatCC::GreaterThan, val1, val2);
                             comparison_result = Some(res);
-                            let res_ext = builder.ins().uextend(types::I64, res);
-                            let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
+                            let t = builder.ins().iconst(types::I64, 35);
+                            let f = builder.ins().iconst(types::I64, 19);
+                            let raw = builder.ins().select(res, t, f);
+                            builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                         },
                         Instr::Leq => {
                             let res = builder.ins().fcmp(FloatCC::LessThanOrEqual, val1, val2);
                             comparison_result = Some(res);
-                            let res_ext = builder.ins().uextend(types::I64, res);
-                            let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
+                            let t = builder.ins().iconst(types::I64, 35);
+                            let f = builder.ins().iconst(types::I64, 19);
+                            let raw = builder.ins().select(res, t, f);
+                            builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                         },
                         Instr::Geq => {
                             let res = builder.ins().fcmp(FloatCC::GreaterThanOrEqual, val1, val2);
                             comparison_result = Some(res);
-                            let res_ext = builder.ins().uextend(types::I64, res);
-                            let const_tag = builder.ins().iconst(types::I8, 1);
-                            builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                            builder.ins().store(MemFlags::trusted(), res_ext, dest_ptr, DATA_OFFSET);
+                            let t = builder.ins().iconst(types::I64, 35);
+                            let f = builder.ins().iconst(types::I64, 19);
+                            let raw = builder.ins().select(res, t, f);
+                            builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
                         },
                         _ => {}
                     }
@@ -1537,12 +1534,8 @@ impl Jit {
                     builder.ins().call(local_helper_op, &[vm_ptr, prog_ptr, registers_ptr, op_const]);
                     
                     if fused_jump {
-                         let tag = builder.ins().load(types::I8, MemFlags::trusted(), dest_ptr, TAG_OFFSET);
-                         let val = builder.ins().load(types::I8, MemFlags::trusted(), dest_ptr, DATA_OFFSET);
-                         
-                         let tag_is_bool = builder.ins().icmp_imm(IntCC::Equal, tag, 1);
-                         let val_is_false = builder.ins().icmp_imm(IntCC::Equal, val, 0);
-                         let is_false = builder.ins().band(tag_is_bool, val_is_false);
+                         let val = builder.ins().load(types::I64, MemFlags::trusted(), dest_ptr, 0);
+                         let is_false = builder.ins().icmp_imm(IntCC::Equal, val, 19);
                          
                          match jump_condition {
                              JumpCondition::JumpTrue => {
@@ -1606,37 +1599,32 @@ impl Jit {
                         }
                     }
 
-                    let val_size = std::mem::size_of::<LispValue>() as i64;
+                    let val_size = 8;
                     
                     let src_ptr = builder.ins().iadd_imm(registers_ptr, src_reg * val_size);
                     let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
                     
-                    let tag = builder.ins().load(types::I8, MemFlags::trusted(), src_ptr, TAG_OFFSET);
-                    let val = builder.ins().load(types::I8, MemFlags::trusted(), src_ptr, DATA_OFFSET);
+                    let val = builder.ins().load(types::I64, MemFlags::trusted(), src_ptr, 0);
                     
-                    let tag_is_bool = builder.ins().icmp_imm(IntCC::Equal, tag, 1);
-                    let not_val = builder.ins().bxor_imm(val, 1);
+                    // IMM_FALSE = 19
+                    let is_false = builder.ins().icmp_imm(IntCC::Equal, val, 19);
                     
-                    // If tag is bool, result is not_val. Else result is false (0).
-                    let zero = builder.ins().iconst(types::I8, 0);
-                    let res_val = builder.ins().select(tag_is_bool, not_val, zero);
+                    let t = builder.ins().iconst(types::I64, 35);
+                    let f = builder.ins().iconst(types::I64, 19);
+                    let res = builder.ins().select(is_false, t, f);
                     
-                    let res_val_ext = builder.ins().uextend(types::I64, res_val);
-                    let const_tag = builder.ins().iconst(types::I8, 1);
-                    
-                    builder.ins().store(MemFlags::trusted(), const_tag, dest_ptr, TAG_OFFSET);
-                    builder.ins().store(MemFlags::trusted(), res_val_ext, dest_ptr, DATA_OFFSET);
+                    builder.ins().store(MemFlags::trusted(), res, dest_ptr, 0);
                     
                     if fused_jump {
-                        // res_val is the boolean result of Not.
-                        // If JumpTrue, we jump if res_val != 0.
-                        // If JumpFalse, we jump if res_val == 0.
+                        // is_false is true if val was false.
+                        // So res is true.
+                        // If JumpTrue, we jump if res is true (i.e. is_false is true).
                         match jump_condition {
                              JumpCondition::JumpTrue => {
-                                 builder.ins().brif(res_val, jump_target_block, &[BlockArg::from(registers_ptr)], jump_fallthrough_block, &[BlockArg::from(registers_ptr)]);
+                                 builder.ins().brif(is_false, jump_target_block, &[BlockArg::from(registers_ptr)], jump_fallthrough_block, &[BlockArg::from(registers_ptr)]);
                              },
                              JumpCondition::JumpFalse => {
-                                 builder.ins().brif(res_val, jump_fallthrough_block, &[BlockArg::from(registers_ptr)], jump_target_block, &[BlockArg::from(registers_ptr)]);
+                                 builder.ins().brif(is_false, jump_fallthrough_block, &[BlockArg::from(registers_ptr)], jump_target_block, &[BlockArg::from(registers_ptr)]);
                              },
                              _ => {
                                  builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
@@ -1654,46 +1642,15 @@ impl Jit {
                 Instr::CopyReg => {
                     let dest_reg = opcode[1] as i64;
                     let src_reg = opcode[2] as i64;
-                    let val_size = std::mem::size_of::<LispValue>() as i64;
+                    let val_size = 8;
                     
                     let src_ptr = builder.ins().iadd_imm(registers_ptr, src_reg * val_size);
                     let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
                     
-                    let tag = builder.ins().load(types::I8, MemFlags::trusted(), src_ptr, TAG_OFFSET);
+                    let val = builder.ins().load(types::I64, MemFlags::trusted(), src_ptr, 0);
+                    builder.ins().store(MemFlags::trusted(), val, dest_ptr, 0);
                     
-                    // Check if POD (tag <= 3 or tag == 6)
-                    let is_pod_basic = builder.ins().icmp_imm(IntCC::UnsignedLessThanOrEqual, tag, 3);
-                    let is_funcref = builder.ins().icmp_imm(IntCC::Equal, tag, 6);
-                    let is_pod = builder.ins().bor(is_pod_basic, is_funcref);
-                    
-                    let block_copy = builder.create_block();
-                    let block_slow = builder.create_block();
-                    let block_done = builder.create_block();
-                    builder.append_block_param(block_done, ptr_type);
-                    
-                    builder.ins().brif(is_pod, block_copy, &[], block_slow, &[]);
-                    
-                    builder.switch_to_block(block_copy);
-                    // Copy full Value size. Assumes size is multiple of 8.
-                    let val_size_usize = std::mem::size_of::<LispValue>();
-                    assert!(val_size_usize % 8 == 0, "LispValue size must be multiple of 8");
-                    let num_words = val_size_usize / 8;
-                    
-                    for i in 0..num_words {
-                        let offset = (i * 8) as i32;
-                        let val = builder.ins().load(types::I64, MemFlags::trusted(), src_ptr, offset);
-                        builder.ins().store(MemFlags::trusted(), val, dest_ptr, offset);
-                    }
-                    builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
-                    
-                    builder.switch_to_block(block_slow);
-                    let op_val = u32::from_le_bytes(opcode);
-                    let op_const = builder.ins().iconst(types::I32, op_val as i64);
-                    builder.ins().call(local_helper_op, &[vm_ptr, prog_ptr, registers_ptr, op_const]);
-                    builder.ins().jump(block_done, &[BlockArg::from(registers_ptr)]);
-                    
-                    builder.switch_to_block(block_done);
-                    registers_ptr = builder.block_params(block_done)[0];
+                    is_terminated = false;
                 },
                 Instr::MakeClosure => {
                     let dest_reg = opcode[1] as i64;
