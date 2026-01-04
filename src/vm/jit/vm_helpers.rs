@@ -246,22 +246,39 @@ pub unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgr
          vm.next_jit_code = jit_code;
     } else {
          let end_addr = super::analysis::scan_function_end(prog, address);
-         if let Ok(func) = vm.jit.compile(&vm.global_vars, &vm.heap, prog, address, end_addr) {
-             if let Some(cell) = jit_code_cell {
-                 if let Some(&code) = vm.jit.cache.get(&address) {
-                     cell.set(code as u64);
+         match vm.jit.compile(&vm.global_vars, &vm.heap, prog, address, end_addr) {
+             Ok(func) => {
+                 if let Some(cell) = jit_code_cell {
+                     if let Some(&code) = vm.jit.cache.get(&address) {
+                         cell.set(code as u64);
+                     }
                  }
-             }
-             if let Some(cell) = fast_jit_code_cell {
-                 if let Some(&code) = vm.jit.fast_cache.get(&address) {
-                     cell.set(code as u64);
+                 if let Some(cell) = fast_jit_code_cell {
+                     if let Some(&code) = vm.jit.fast_cache.get(&address) {
+                         cell.set(code as u64);
+                     }
                  }
+                 
+                 vm.tail_call_pending = true;
+                 vm.next_jit_code = func as usize as u64;
+             },
+             Err(e) => {
+                 println!("JIT compilation failed in call: {}", e);
+                 
+                 let eof = prog.get_bytecode().len() as u64;
+                 if let Some(last) = vm.call_states.last_mut() {
+                     last.return_addr = eof;
+                 }
+                 
+                 prog.jump_to(address);
+                 vm.run_debug(prog, None);
+                 
+                 let res_val = resolve_value(vm, registers, target_reg as u8);
+                 println!("helper_call_symbol fallback done: target_reg={} val={:?}", target_reg, res_val);
+
+                 vm.tail_call_pending = false;
+                 return;
              }
-             
-             vm.tail_call_pending = true;
-             vm.next_jit_code = func as usize as u64;
-         } else {
-             println!("JIT compilation failed in call");
          }
     }
 
@@ -565,6 +582,109 @@ pub unsafe extern "C" fn helper_is_eq(registers: *mut LispValue, dest_reg: usize
     let arg1 = *registers.add(arg1_reg);
     let arg2 = *registers.add(arg2_reg);
     *registers.add(dest_reg) = LispValue::boolean(arg1 == arg2);
+}
+
+pub unsafe extern "C" fn helper_prepare_map(vm: *mut Vm, prog: *mut VirtualProgram, _registers: *mut LispValue, func_reg: usize, list_reg: usize, temp_reg: usize) -> u64 {
+    let vm = &mut *vm;
+    let prog = &mut *prog;
+    
+    let list_idx = vm.window_start + list_reg;
+    if list_idx >= vm.registers.len() {
+        return 0;
+    }
+    let list_val = vm.registers[list_idx];
+    
+    if list_val.is_nil() {
+        return 0;
+    }
+    
+    if let ValueKind::Object(handle) = list_val.kind() {
+        if let Some(HeapValue::Pair(p)) = vm.heap.get(handle) {
+            let car = p.car;
+            let cdr = p.cdr;
+            
+            // Update list register with CDR
+            vm.registers[list_idx] = cdr;
+            
+            let regs_ptr = vm.registers.as_mut_ptr().add(vm.window_start);
+            let resolved_func = resolve_value(vm, regs_ptr, func_reg as u8);
+            
+            let (header, address, captures, jit_code_cell, fast_jit_code_cell) = if let ValueKind::Object(handle) = resolved_func.kind() {
+                match vm.heap.get(handle) {
+                    Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, Some(&f.jit_code), Some(&f.fast_jit_code)),
+                    Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), Some(&c.function.jit_code), Some(&c.function.fast_jit_code)),
+                     Some(HeapValue::Ref(inner)) => {
+                         if let ValueKind::Object(inner_handle) = inner.kind() {
+                             match vm.heap.get(inner_handle) {
+                                Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, None, None),
+                                Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), None, None),
+                                _ => return 0
+                             }
+                         } else {
+                             return 0
+                         }
+                     },
+                    _ => return 0
+                }
+            } else {
+                return 0
+            };
+            
+            let param_start = temp_reg;
+            let size = param_start + header.register_count as usize + vm.window_start;
+            if size >= vm.registers.len() {
+                vm.registers.resize(size, LispValue::nil());
+            }
+            let old_ws = vm.window_start;
+            let ret_addr = 0;
+            
+            let state = CallState{window_start: old_ws, result_reg: header.result_reg, target_reg: temp_reg as u8, return_addr: ret_addr};
+            vm.call_states.push(state);
+            
+            vm.window_start += param_start;
+            
+            if let Some(caps) = captures {
+                let start_reg = header.param_count as usize;
+                for (i, val) in caps.into_iter().enumerate() {
+                    vm.registers[vm.window_start + start_reg + i] = val;
+                }
+            }
+            
+            vm.registers[vm.window_start] = car;
+            
+            let jit_code = jit_code_cell.map(|c| c.get()).unwrap_or(0);
+            if jit_code != 0 {
+                 return jit_code;
+            } else {
+                let end_addr = super::analysis::scan_function_end(prog, address);
+                if let Ok(func) = vm.jit.compile(&vm.global_vars, &vm.heap, prog, address, end_addr) {
+                     if let Some(cell) = jit_code_cell {
+                         if let Some(&code) = vm.jit.cache.get(&address) {
+                             cell.set(code as u64);
+                         }
+                     }
+                     if let Some(cell) = fast_jit_code_cell {
+                         if let Some(&code) = vm.jit.fast_cache.get(&address) {
+                             cell.set(code as u64);
+                         }
+                     }
+                     return func as usize as u64;
+                }
+                return 0;
+            }
+        }
+    }
+    0
+}
+
+pub unsafe extern "C" fn helper_ret(vm: *mut Vm) {
+    let vm = &mut *vm;
+    if let Some(state) = vm.call_states.pop() {
+        let source_reg = vm.window_start + state.result_reg as usize;
+        let target_reg = state.window_start + state.target_reg as usize;
+        vm.registers.swap(source_reg, target_reg);
+        vm.window_start = state.window_start;
+    }
 }
 
 

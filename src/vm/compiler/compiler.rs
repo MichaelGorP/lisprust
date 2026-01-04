@@ -163,6 +163,96 @@ impl<'a> Compiler<'a> {
                 },
                 SExpression::Symbol(s) => {
                     let result_reg = self.scopes.allocate_reg()?;
+
+                    if (s == "map" || s == "for-each" || s == "filter") && list.len() == 3 {
+                        self.pop_map();
+                        
+                        self.push_map(&map_list[1]);
+                        let func_reg = self.compile_expr(&list[1], &[], false)?;
+                        self.pop_map();
+
+                        self.push_map(&map_list[2]);
+                        let list_reg = self.compile_expr(&list[2], &[], false)?;
+                        self.pop_map();
+
+                        let temp_reg = self.scopes.allocate_reg()?;
+
+                        if s == "map" {
+                            self.bytecode.store_opcode(Instr::LoadNil, result_reg, 0, 0);
+                        } else if s == "filter" {
+                            self.bytecode.store_opcode(Instr::LoadNil, result_reg, 0, 0);
+                        }
+
+                        let start_pos = self.bytecode.cursor.position();
+
+                        if s == "map" {
+                            self.bytecode.store_opcode(Instr::Map, func_reg, list_reg, result_reg);
+                            self.bytecode.store_value(&[temp_reg]);
+                            
+                            // Loop body: Cons res, temp, res
+                            self.bytecode.store_opcode(Instr::Cons, result_reg, temp_reg, result_reg);
+                            
+                            // Jump back to Map
+                            let end_pos = self.bytecode.cursor.position();
+                            let jump_dist = (start_pos as i64) - (end_pos as i64) - 12;
+                            self.bytecode.store_opcode(Instr::Jump, 0, JumpCondition::Jump as u8, 0);
+                            self.bytecode.store_value(&jump_dist.to_le_bytes());
+                        } else if s == "for-each" {
+                            self.bytecode.store_opcode(Instr::ForEach, func_reg, list_reg, 0);
+                            self.bytecode.store_value(&[temp_reg]);
+                            
+                            let end_pos = self.bytecode.cursor.position();
+                            let jump_dist = (start_pos as i64) - (end_pos as i64) - 12;
+                            self.bytecode.store_opcode(Instr::Jump, 0, JumpCondition::Jump as u8, 0);
+                            self.bytecode.store_value(&jump_dist.to_le_bytes());
+                            
+                            self.bytecode.store_opcode(Instr::LoadNil, result_reg, 0, 0);
+                        } else if s == "filter" {
+                            let val_reg = self.scopes.allocate_reg()?;
+                            self.bytecode.store_opcode(Instr::Filter, func_reg, list_reg, result_reg);
+                            self.bytecode.store_value(&[temp_reg]);
+                            self.bytecode.store_value(&[val_reg]);
+                            
+                            self.bytecode.store_opcode(Instr::FilterStep, list_reg, result_reg, temp_reg);
+                            self.bytecode.store_value(&[val_reg]);
+                            
+                            let end_pos = self.bytecode.cursor.position();
+                            let jump_dist = (start_pos as i64) - (end_pos as i64) - 12;
+                            self.bytecode.store_opcode(Instr::Jump, 0, JumpCondition::Jump as u8, 0);
+                            self.bytecode.store_value(&jump_dist.to_le_bytes());
+                        }
+                        return Ok(result_reg);
+                    } else if s == "fold" && list.len() == 4 {
+                        self.pop_map();
+                        
+                        self.push_map(&map_list[1]);
+                        let func_reg = self.compile_expr(&list[1], &[], false)?;
+                        self.pop_map();
+
+                        self.push_map(&map_list[2]);
+                        let acc_reg = self.compile_expr(&list[2], &[], false)?;
+                        self.pop_map();
+
+                        self.push_map(&map_list[3]);
+                        let list_reg = self.compile_expr(&list[3], &[], false)?;
+                        self.pop_map();
+
+                        let temp_reg = self.scopes.allocate_reg()?;
+                        
+                        self.bytecode.store_opcode(Instr::CopyReg, result_reg, acc_reg, 0);
+                        
+                        let start_pos = self.bytecode.cursor.position();
+                        self.bytecode.store_opcode(Instr::Fold, func_reg, result_reg, list_reg);
+                        self.bytecode.store_value(&[temp_reg]);
+                        
+                        let end_pos = self.bytecode.cursor.position();
+                        let jump_dist = (start_pos as i64) - (end_pos as i64) - 12;
+                        self.bytecode.store_opcode(Instr::Jump, 0, JumpCondition::Jump as u8, 0);
+                        self.bytecode.store_value(&jump_dist.to_le_bytes());
+                        
+                        return Ok(result_reg);
+                    }
+
                     //try registered functions first, not overwritable so far
                     let opt_func = self.functions.get_registered_function(s);
                     if let Some((func, expected_args)) = opt_func {

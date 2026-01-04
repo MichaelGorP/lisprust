@@ -163,7 +163,7 @@ impl Vm {
         self.heap.collect(&self.roots_buffer);
     }
 
-    pub fn run_jit_function(&mut self, prog: *mut VirtualProgram, start_addr: u64, end_addr: u64) {
+    pub fn run_jit_function(&mut self, prog: *mut VirtualProgram, start_addr: u64, end_addr: u64) -> bool {
         match self.jit.compile(&self.global_vars, &self.heap, unsafe { &mut *prog }, start_addr, end_addr) {
             Ok(func) => {
                 unsafe {
@@ -182,9 +182,11 @@ impl Vm {
                         }
                     }
                 }
+                true
             },
             Err(e) => {
                 println!("JIT compilation failed: {}", e);
+                false
             }
         }
     }
@@ -248,6 +250,28 @@ impl Vm {
                     },
                     Ok(Instr::LoadInt) | Ok(Instr::LoadFloat) | Ok(Instr::Define) | Ok(Instr::LoadGlobal) | Ok(Instr::LoadFuncRef) | Ok(Instr::CallFunction) => { let _ = prog.read_int(); },
                     Ok(Instr::LoadString) => { let _ = prog.read_string(); },
+                    Ok(Instr::Map) => { 
+                        let _ = prog.read_byte();
+                        let target = prog.current_address() + 16;
+                        if !visited.contains(&target) { queue.push(target); }
+                    },
+                    Ok(Instr::ForEach) => { 
+                        let _ = prog.read_byte();
+                        let target = prog.current_address() + 12;
+                        if !visited.contains(&target) { queue.push(target); }
+                    },
+                    Ok(Instr::Fold) => { 
+                        let _ = prog.read_byte();
+                        let target = prog.current_address() + 12;
+                        if !visited.contains(&target) { queue.push(target); }
+                    },
+                    Ok(Instr::Filter) => { 
+                        let _ = prog.read_byte(); 
+                        let _ = prog.read_byte();
+                        let target = prog.current_address() + 17;
+                        if !visited.contains(&target) { queue.push(target); }
+                    },
+                    Ok(Instr::FilterStep) => { let _ = prog.read_byte(); },
                     Ok(Instr::MakeClosure) => {
                         let count = opcode[3];
                         for _ in 0..count {
@@ -263,6 +287,23 @@ impl Vm {
         
         prog.jump_to(old_pos);
         max_addr
+    }
+
+    fn reverse_list(&mut self, mut list: Value) -> Value {
+        let mut result = Value::nil();
+        while let ValueKind::Object(handle) = list.kind() {
+            if let Some(HeapValue::Pair(p)) = self.heap.get(handle) {
+                let car = p.car;
+                let cdr = p.cdr;
+                let new_pair = HeapValue::Pair(Pair { car, cdr: result });
+                let new_handle = self.heap.alloc(new_pair);
+                result = Value::object(new_handle);
+                list = cdr;
+            } else {
+                break;
+            }
+        }
+        result
     }
 
     pub fn run(&mut self, prog: &mut VirtualProgram) -> Option<SExpression> {
@@ -317,7 +358,11 @@ impl Vm {
                     self.registers[opcode[1] as usize + self.window_start] = Value::object(handle);
                 },
                 Ok(Instr::LoadNil) => {
-                    self.registers[opcode[1] as usize + self.window_start] = Value::nil();
+                    let idx = opcode[1] as usize + self.window_start;
+                    if idx >= self.registers.len() {
+                        println!("LoadNil panic: idx={}, ws={}, reg={}, len={}", idx, self.window_start, opcode[1], self.registers.len());
+                    }
+                    self.registers[idx] = Value::nil();
                 },
                 Ok(Instr::CopyReg) => {
                     self.registers[opcode[1] as usize + self.window_start] = self.registers[opcode[2] as usize + self.window_start];
@@ -482,14 +527,16 @@ impl Vm {
                     
                     if self.jit_enabled {
                         let end_addr = self.scan_function_end(prog, address);
-                        self.run_jit_function(prog as *mut VirtualProgram, address, end_addr);
-                        
-                        let state = self.call_states.pop().unwrap();
-                        let source_reg = self.window_start + state.result_reg as usize;
-                        let target_reg = state.window_start + state.target_reg as usize;
-                        self.registers.swap(source_reg, target_reg);
+                        if self.run_jit_function(prog as *mut VirtualProgram, address, end_addr) {
+                            let state = self.call_states.pop().unwrap();
+                            let source_reg = self.window_start + state.result_reg as usize;
+                            let target_reg = state.window_start + state.target_reg as usize;
+                            self.registers.swap(source_reg, target_reg);
 
-                        self.window_start = old_ws;
+                            self.window_start = old_ws;
+                        } else {
+                            prog.jump_to(address);
+                        }
                     } else {
                         prog.jump_to(address);
                     }
@@ -559,9 +606,11 @@ impl Vm {
                 },
                 Ok(Instr::CallFunction) => {
                     let Some(func_id) = prog.read_int() else {
+                        println!("CallFunction failed to read func_id");
                         break;
                     };
                     let Some(function) = prog.get_function(func_id) else {
+                        println!("CallFunction failed to get function {}", func_id);
                         break;
                     };
                     let start_reg = opcode[2] as usize;
@@ -623,6 +672,328 @@ impl Vm {
                 Ok(Instr::IsNull) => {
                     let arg = self.registers[opcode[2] as usize + self.window_start];
                     self.registers[opcode[1] as usize + self.window_start] = Value::boolean(arg.is_nil());
+                },
+                Ok(Instr::Map) => {
+                    let func_reg = opcode[1] as usize + self.window_start;
+                    let list_reg = opcode[2] as usize + self.window_start;
+                    let res_reg = opcode[3] as usize + self.window_start;
+                    let temp_reg = prog.read_byte().unwrap() as usize + self.window_start;
+
+                    let list_val = self.registers[list_reg];
+                    if list_val.is_nil() {
+                        prog.jump(16); // Skip Cons (4) + Jump (12)
+                        let res = self.registers[res_reg];
+                        self.registers[res_reg] = self.reverse_list(res);
+                    } else {
+                        // Initialize result register if it's the first iteration (check if it's nil or garbage?)
+                        // Actually, we can't easily check if it's the first iteration here.
+                        // But wait, Map builds the list in reverse.
+                        // The initial value of res_reg should be nil.
+                        // But res_reg is updated in the loop (Cons).
+                        // If we set it to nil every time, we lose the list!
+                        // So initialization must happen BEFORE the loop.
+                        // But Map opcode IS the loop header (conceptually).
+                        // The compiler emits: Map ... -> Cons ... -> Jump back to Map.
+                        // So Map is executed every iteration.
+                        // We cannot initialize res_reg inside Map opcode!
+                        
+                        // So I MUST emit initialization in the compiler!
+                        // I missed that.
+                        
+                        if let ValueKind::Object(handle) = list_val.kind() {
+                            if let Some(HeapValue::Pair(p)) = self.heap.get(handle) {
+                                let car = p.car;
+                                let cdr = p.cdr;
+                                self.registers[list_reg] = cdr;
+
+                                let resolved_func = self.resolve_value(&self.registers[func_reg]);
+                                let (header, address, captures) = if let ValueKind::Object(handle) = resolved_func.kind() {
+                                    match self.heap.get(handle) {
+                                        Some(HeapValue::FuncRef(f)) => (f.header, f.address, None),
+                                        Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone())),
+                                        _ => panic!("Map expects a function")
+                                    }
+                                } else {
+                                    panic!("Map expects a function");
+                                };
+
+                                let param_start = temp_reg - self.window_start;
+                                let size = temp_reg + header.register_count as usize;
+                                println!("Map: ws={}, temp={}, size={}, len={}, reg_count={}", self.window_start, temp_reg, size, self.registers.len(), header.register_count);
+                                if size >= self.registers.len() {
+                                    self.registers.resize(size, empty_value());
+                                }
+                                let old_ws = self.window_start;
+                                let ret_addr = prog.current_address();
+                                let state = CallState{window_start: old_ws, result_reg: header.result_reg, target_reg: param_start as u8, return_addr: ret_addr};
+                                self.call_states.push(state);
+                                self.window_start += param_start;
+                                
+                                if let Some(caps) = captures {
+                                    let start_reg = header.param_count as usize;
+                                    for (i, val) in caps.into_iter().enumerate() {
+                                        self.registers[self.window_start + start_reg + i] = val;
+                                    }
+                                }
+
+                                self.registers[self.window_start] = car;
+
+                                if self.jit_enabled {
+                                    let end_addr = self.scan_function_end(prog, address);
+                                    if self.run_jit_function(prog as *mut VirtualProgram, address, end_addr) {
+                                        let state = self.call_states.pop().unwrap();
+                                        let source_reg = self.window_start + state.result_reg as usize;
+                                        let target_reg = state.window_start + state.target_reg as usize;
+                                        self.registers.swap(source_reg, target_reg);
+                                        self.window_start = old_ws;
+                                    } else {
+                                        prog.jump_to(address);
+                                    }
+                                } else {
+                                    prog.jump_to(address);
+                                }
+                            } else {
+                                panic!("Map expects a list");
+                            }
+                        } else {
+                            panic!("Map expects a list");
+                        }
+                    }
+                },
+                Ok(Instr::ForEach) => {
+                    let func_reg = opcode[1] as usize + self.window_start;
+                    let list_reg = opcode[2] as usize + self.window_start;
+                    let temp_reg = prog.read_byte().unwrap() as usize + self.window_start;
+
+                    let list_val = self.registers[list_reg];
+                    if list_val.is_nil() {
+                        prog.jump(12); // Skip Jump (12)
+                    } else {
+                        if let ValueKind::Object(handle) = list_val.kind() {
+                            if let Some(HeapValue::Pair(p)) = self.heap.get(handle) {
+                                let car = p.car;
+                                let cdr = p.cdr;
+                                self.registers[list_reg] = cdr;
+
+                                let resolved_func = self.resolve_value(&self.registers[func_reg]);
+                                let (header, address, captures) = if let ValueKind::Object(handle) = resolved_func.kind() {
+                                    match self.heap.get(handle) {
+                                        Some(HeapValue::FuncRef(f)) => (f.header, f.address, None),
+                                        Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone())),
+                                        _ => panic!("ForEach expects a function")
+                                    }
+                                } else {
+                                    panic!("ForEach expects a function");
+                                };
+
+                                let param_start = temp_reg - self.window_start;
+                                let size = temp_reg + header.register_count as usize;
+                                if size >= self.registers.len() {
+                                    self.registers.resize(size, empty_value());
+                                }
+                                let old_ws = self.window_start;
+                                let ret_addr = prog.current_address() - 5; // Return to ForEach (5 bytes back: Opcode(4) + Byte(1))
+                                let state = CallState{window_start: old_ws, result_reg: header.result_reg, target_reg: param_start as u8, return_addr: ret_addr};
+                                self.call_states.push(state);
+                                self.window_start += param_start;
+                                
+                                if let Some(caps) = captures {
+                                    let start_reg = header.param_count as usize;
+                                    for (i, val) in caps.into_iter().enumerate() {
+                                        self.registers[self.window_start + start_reg + i] = val;
+                                    }
+                                }
+
+                                self.registers[self.window_start] = car;
+
+                                if self.jit_enabled {
+                                    let end_addr = self.scan_function_end(prog, address);
+                                    if self.run_jit_function(prog as *mut VirtualProgram, address, end_addr) {
+                                        let state = self.call_states.pop().unwrap();
+                                        let source_reg = self.window_start + state.result_reg as usize;
+                                        let target_reg = state.window_start + state.target_reg as usize;
+                                        self.registers.swap(source_reg, target_reg);
+                                        self.window_start = old_ws;
+                                    } else {
+                                        prog.jump_to(address);
+                                    }
+                                } else {
+                                    prog.jump_to(address);
+                                }
+                            } else {
+                                panic!("ForEach expects a list");
+                            }
+                        } else {
+                            panic!("ForEach expects a list");
+                        }
+                    }
+                },
+                Ok(Instr::Filter) => {
+                    let func_reg = opcode[1] as usize + self.window_start;
+                    let list_reg = opcode[2] as usize + self.window_start;
+                    let res_reg = opcode[3] as usize + self.window_start;
+                    let temp_reg = prog.read_byte().unwrap() as usize + self.window_start;
+                    let val_reg = prog.read_byte().unwrap() as usize + self.window_start;
+
+                    let list_val = self.registers[list_reg];
+                    if list_val.is_nil() {
+                        prog.jump(17); // Skip FilterStep (5) + Jump (12)
+                        let res = self.registers[res_reg];
+                        self.registers[res_reg] = self.reverse_list(res);
+                    } else {
+                        if let ValueKind::Object(handle) = list_val.kind() {
+                            if let Some(HeapValue::Pair(p)) = self.heap.get(handle) {
+                                let car = p.car;
+                                // Don't advance list yet, FilterStep does it
+                                
+                                self.registers[val_reg] = car; // Save car
+
+                                let resolved_func = self.resolve_value(&self.registers[func_reg]);
+                                let (header, address, captures) = if let ValueKind::Object(handle) = resolved_func.kind() {
+                                    match self.heap.get(handle) {
+                                        Some(HeapValue::FuncRef(f)) => (f.header, f.address, None),
+                                        Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone())),
+                                        _ => panic!("Filter expects a function")
+                                    }
+                                } else {
+                                    panic!("Filter expects a function");
+                                };
+
+                                let param_start = temp_reg - self.window_start;
+                                let size = temp_reg + header.register_count as usize;
+                                if size >= self.registers.len() {
+                                    self.registers.resize(size, empty_value());
+                                }
+                                let old_ws = self.window_start;
+                                let ret_addr = prog.current_address(); // Return to FilterStep
+                                let state = CallState{window_start: old_ws, result_reg: header.result_reg, target_reg: param_start as u8, return_addr: ret_addr};
+                                self.call_states.push(state);
+                                self.window_start += param_start;
+                                
+                                if let Some(caps) = captures {
+                                    let start_reg = header.param_count as usize;
+                                    for (i, val) in caps.into_iter().enumerate() {
+                                        self.registers[self.window_start + start_reg + i] = val;
+                                    }
+                                }
+
+                                self.registers[self.window_start] = car;
+
+                                if self.jit_enabled {
+                                    let end_addr = self.scan_function_end(prog, address);
+                                    if self.run_jit_function(prog as *mut VirtualProgram, address, end_addr) {
+                                        let state = self.call_states.pop().unwrap();
+                                        let source_reg = self.window_start + state.result_reg as usize;
+                                        let target_reg = state.window_start + state.target_reg as usize;
+                                        self.registers.swap(source_reg, target_reg);
+                                        self.window_start = old_ws;
+                                    } else {
+                                        prog.jump_to(address);
+                                    }
+                                } else {
+                                    prog.jump_to(address);
+                                }
+                            } else {
+                                panic!("Filter expects a list");
+                            }
+                        } else {
+                            panic!("Filter expects a list");
+                        }
+                    }
+                },
+                Ok(Instr::Fold) => {
+                    let func_reg = opcode[1] as usize + self.window_start;
+                    let acc_reg = opcode[2] as usize + self.window_start;
+                    let list_reg = opcode[3] as usize + self.window_start;
+                    let temp_reg = prog.read_byte().unwrap() as usize + self.window_start;
+
+                    let list_val = self.registers[list_reg];
+                    if list_val.is_nil() {
+                        prog.jump(12); // Skip Jump (12)
+                    } else {
+                        if let ValueKind::Object(handle) = list_val.kind() {
+                            if let Some(HeapValue::Pair(p)) = self.heap.get(handle) {
+                                let car = p.car;
+                                let cdr = p.cdr;
+                                self.registers[list_reg] = cdr;
+
+                                let resolved_func = self.resolve_value(&self.registers[func_reg]);
+                                let (header, address, captures) = if let ValueKind::Object(handle) = resolved_func.kind() {
+                                    match self.heap.get(handle) {
+                                        Some(HeapValue::FuncRef(f)) => (f.header, f.address, None),
+                                        Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone())),
+                                        _ => panic!("Fold expects a function")
+                                    }
+                                } else {
+                                    panic!("Fold expects a function");
+                                };
+
+                                let param_start = temp_reg - self.window_start;
+                                let size = temp_reg + header.register_count as usize;
+                                if size >= self.registers.len() {
+                                    self.registers.resize(size, empty_value());
+                                }
+                                let old_ws = self.window_start;
+                                let ret_addr = prog.current_address() - 5; // Return to Fold (5 bytes back: Opcode(4) + Byte(1))
+                                let state = CallState{window_start: old_ws, result_reg: header.result_reg, target_reg: (acc_reg - self.window_start) as u8, return_addr: ret_addr};
+                                self.call_states.push(state);
+                                self.window_start += param_start;
+                                
+                                if let Some(caps) = captures {
+                                    let start_reg = header.param_count as usize;
+                                    for (i, val) in caps.into_iter().enumerate() {
+                                        self.registers[self.window_start + start_reg + i] = val;
+                                    }
+                                }
+
+                                // Fold expects 2 args: acc, val
+                                self.registers[self.window_start] = self.registers[acc_reg];
+                                self.registers[self.window_start + 1] = car;
+
+                                if self.jit_enabled {
+                                    let end_addr = self.scan_function_end(prog, address);
+                                    if self.run_jit_function(prog as *mut VirtualProgram, address, end_addr) {
+                                        let state = self.call_states.pop().unwrap();
+                                        let source_reg = self.window_start + state.result_reg as usize;
+                                        let target_reg = state.window_start + state.target_reg as usize;
+                                        self.registers.swap(source_reg, target_reg);
+                                        self.window_start = old_ws;
+                                    } else {
+                                        prog.jump_to(address);
+                                    }
+                                } else {
+                                    prog.jump_to(address);
+                                }
+                            } else {
+                                panic!("Fold expects a list");
+                            }
+                        } else {
+                            panic!("Fold expects a list");
+                        }
+                    }
+                },
+                Ok(Instr::FilterStep) => {
+                    let list_reg = opcode[1] as usize + self.window_start;
+                    let res_reg = opcode[2] as usize + self.window_start;
+                    let temp_reg = opcode[3] as usize + self.window_start;
+                    let val_reg = prog.read_byte().unwrap() as usize + self.window_start;
+
+                    let keep = self.registers[temp_reg].is_true();
+                    if keep {
+                        let val = self.registers[val_reg];
+                        let res = self.registers[res_reg];
+                        let new_pair = HeapValue::Pair(Pair { car: val, cdr: res });
+                        let new_handle = self.heap.alloc(new_pair);
+                        self.registers[res_reg] = Value::object(new_handle);
+                    }
+                    
+                    // Advance list
+                    let list_val = self.registers[list_reg];
+                    if let ValueKind::Object(handle) = list_val.kind() {
+                        if let Some(HeapValue::Pair(p)) = self.heap.get(handle) {
+                            self.registers[list_reg] = p.cdr;
+                        }
+                    }
                 },
                 Ok(Instr::MakeClosure) => {
                     let dest_reg = opcode[1] as usize + self.window_start;
@@ -708,7 +1079,17 @@ impl Vm {
         }
 
         //cleanup
-        self.registers.truncate(256);
+        /*
+        if self.registers.len() > 256 {
+            // Only truncate if we are sure we don't need the registers?
+            // Actually, if we finished execution, we might want to keep registers for inspection?
+            // But for now, let's just ensure we don't panic.
+            let res_reg = prog.get_result_reg() as usize + self.window_start;
+            if res_reg < 256 {
+                self.registers.truncate(256);
+            }
+        }
+        */
         self.registers.shrink_to_fit();
 
         let res_reg = prog.get_result_reg() as usize + self.window_start;

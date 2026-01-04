@@ -67,6 +67,8 @@ impl Jit {
         builder.symbol("helper_is_pair", helper_is_pair as *const u8);
         builder.symbol("helper_is_null", helper_is_null as *const u8);
         builder.symbol("helper_is_eq", helper_is_eq as *const u8);
+        builder.symbol("helper_prepare_map", helper_prepare_map as *const u8);
+        builder.symbol("helper_ret", helper_ret as *const u8);
 
         let module = JITModule::new(builder);
         
@@ -337,6 +339,14 @@ impl Jit {
                             Instr::TailCallSymbol => {
                                 prog.read_int(); // param_start
                                 prog.read_int(); // target_reg
+                            },
+                            Instr::Map | Instr::ForEach | Instr::Fold | Instr::FilterStep => { prog.read_byte(); },
+                            Instr::Filter => { prog.read_byte(); prog.read_byte(); },
+                            Instr::MakeClosure => {
+                                let count = opcode[3];
+                                for _ in 0..count {
+                                    prog.read_byte();
+                                }
                             },
                             _ => {}
                         }
@@ -810,6 +820,26 @@ impl Jit {
                             let _ = prog.read_byte();
                         }
                     },
+                    Instr::Map | Instr::FilterStep => {
+                        let _ = prog.read_byte();
+                        let target = prog.current_address() + 16;
+                        if !block_starts.contains(&target) {
+                            block_starts.insert(target);
+                            queue.push(target);
+                        }
+                    },
+                    Instr::ForEach | Instr::Fold => {
+                        let _ = prog.read_byte();
+                        let target = prog.current_address() + 12;
+                        if !block_starts.contains(&target) {
+                            block_starts.insert(target);
+                            queue.push(target);
+                        }
+                    },
+                    Instr::Filter => {
+                        let _ = prog.read_byte();
+                        let _ = prog.read_byte();
+                    },
                     _ => {}
                 }
             }
@@ -1034,6 +1064,22 @@ impl Jit {
         let callee_helper_is_eq = self.module.declare_function("helper_is_eq", Linkage::Import, &sig_helper_is_eq).map_err(|e| e.to_string())?;
         let local_helper_is_eq = self.module.declare_func_in_func(callee_helper_is_eq, &mut builder.func);
 
+        let mut sig_helper_prepare_map = self.module.make_signature();
+        sig_helper_prepare_map.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_prepare_map.params.push(AbiParam::new(ptr_type)); // prog
+        sig_helper_prepare_map.params.push(AbiParam::new(ptr_type)); // registers
+        sig_helper_prepare_map.params.push(AbiParam::new(types::I64)); // func_reg
+        sig_helper_prepare_map.params.push(AbiParam::new(types::I64)); // list_reg
+        sig_helper_prepare_map.params.push(AbiParam::new(types::I64)); // temp_reg
+        sig_helper_prepare_map.returns.push(AbiParam::new(types::I64)); // jit_code_addr
+        let callee_helper_prepare_map = self.module.declare_function("helper_prepare_map", Linkage::Import, &sig_helper_prepare_map).map_err(|e| e.to_string())?;
+        let local_helper_prepare_map = self.module.declare_func_in_func(callee_helper_prepare_map, &mut builder.func);
+
+        let mut sig_helper_ret = self.module.make_signature();
+        sig_helper_ret.params.push(AbiParam::new(ptr_type)); // vm
+        let callee_helper_ret = self.module.declare_function("helper_ret", Linkage::Import, &sig_helper_ret).map_err(|e| e.to_string())?;
+        let local_helper_ret = self.module.declare_func_in_func(callee_helper_ret, &mut builder.func);
+
         // --- PASS 2: Generate Code ---
         prog.jump_to(start_addr);
         
@@ -1088,6 +1134,13 @@ impl Jit {
                         for _ in 0..count {
                             prog.read_byte().unwrap();
                         }
+                    },
+                    Instr::Map | Instr::ForEach | Instr::Fold | Instr::FilterStep => {
+                        prog.read_byte().unwrap();
+                    },
+                    Instr::Filter => {
+                        prog.read_byte().unwrap();
+                        prog.read_byte().unwrap();
                     },
                     _ => {}
                  }
@@ -1359,6 +1412,65 @@ impl Jit {
                     builder.ins().call(local_helper_tail_call_symbol, &[vm_ptr, prog_ptr, registers_ptr, func_reg_const, param_start_const]);
                     builder.ins().return_(&[]);
                     is_terminated = true;
+                },
+                Instr::Map => {
+                    let func_reg = opcode[1] as i64;
+                    let list_reg = opcode[2] as i64;
+                    let temp_reg = prog.read_byte().unwrap() as i64;
+                    
+                    let func_reg_const = builder.ins().iconst(types::I64, func_reg);
+                    let list_reg_const = builder.ins().iconst(types::I64, list_reg);
+                    let temp_reg_const = builder.ins().iconst(types::I64, temp_reg);
+                    
+                    let call_inst = builder.ins().call(local_helper_prepare_map, &[vm_ptr, prog_ptr, registers_ptr, func_reg_const, list_reg_const, temp_reg_const]);
+                    let jit_code_addr = builder.inst_results(call_inst)[0];
+                    
+                    // Reload registers_ptr
+                    let call_inst = builder.ins().call(local_helper_get_registers_ptr, &[vm_ptr]);
+                    let registers_ptr_after_prep = builder.inst_results(call_inst)[0];
+                    
+                    let target_addr = prog.current_address() + 16;
+                    let fallthrough_block = builder.create_block();
+                    let call_block = builder.create_block();
+                    builder.append_block_param(fallthrough_block, ptr_type);
+                    builder.append_block_param(call_block, ptr_type);
+
+                    let addr_is_zero = builder.ins().icmp_imm(IntCC::Equal, jit_code_addr, 0);
+
+                    if let Some(&target_block) = blocks.get(&target_addr) {
+                         builder.ins().brif(addr_is_zero, target_block, &[BlockArg::from(registers_ptr_after_prep)], call_block, &[BlockArg::from(registers_ptr_after_prep)]);
+                    } else {
+                         builder.ins().brif(addr_is_zero, fallthrough_block, &[BlockArg::from(registers_ptr_after_prep)], call_block, &[BlockArg::from(registers_ptr_after_prep)]);
+                    }
+                    
+                    builder.switch_to_block(call_block);
+                    let current_registers_ptr = builder.block_params(call_block)[0];
+                    
+                    // Call the JIT code
+                    let mut sig_jit = self.module.make_signature();
+                    sig_jit.params.push(AbiParam::new(ptr_type)); // vm
+                    sig_jit.params.push(AbiParam::new(ptr_type)); // prog
+                    sig_jit.params.push(AbiParam::new(ptr_type)); // registers
+                    let sig_jit_ref = builder.import_signature(sig_jit);
+                    
+                    builder.ins().call_indirect(sig_jit_ref, jit_code_addr, &[vm_ptr, prog_ptr, current_registers_ptr]);
+                    
+                    // Call helper_ret
+                    builder.ins().call(local_helper_ret, &[vm_ptr]);
+                    
+                    // Reload registers_ptr
+                    let call_inst = builder.ins().call(local_helper_get_registers_ptr, &[vm_ptr]);
+                    let new_registers_ptr = builder.inst_results(call_inst)[0];
+                    
+                    builder.ins().jump(fallthrough_block, &[BlockArg::from(new_registers_ptr)]);
+                    
+                    builder.switch_to_block(fallthrough_block);
+                    registers_ptr = builder.block_params(fallthrough_block)[0];
+                    
+                    is_terminated = false;
+                },
+                Instr::ForEach | Instr::Filter | Instr::Fold | Instr::FilterStep => {
+                    return Err(format!("Unsupported opcode in JIT: {}", instr));
                 },
                 Instr::Add | Instr::Sub | Instr::Mul | Instr::Div | 
                 Instr::Eq | Instr::Neq | Instr::Lt | Instr::Gt | Instr::Leq | Instr::Geq => {

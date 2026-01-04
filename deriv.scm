@@ -1,8 +1,3 @@
-(define (map f l)
-  (if (null? l)
-      '()
-      (cons (f (car l)) (map f (cdr l)))))
-
 (define (deriv a)
   (cond ((not (pair? a))
          (if (eq? a 'x) 1 0))

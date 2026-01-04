@@ -96,6 +96,9 @@ pub fn analyze_function(prog: &mut VirtualProgram, start_addr: u64, end_addr: u6
                     used_regs.insert(opcode[1] as usize);
                     defined_regs.insert(opcode[3] as usize);
                 },
+                Instr::Map | Instr::ForEach | Instr::Filter | Instr::Fold | Instr::FilterStep => {
+                    return None;
+                },
                 Instr::Car | Instr::Cdr | Instr::IsPair | Instr::IsNull => {
                     used_regs.insert(opcode[2] as usize);
                     defined_regs.insert(opcode[1] as usize);
@@ -198,6 +201,24 @@ pub fn scan_function_end(prog: &mut VirtualProgram, start_addr: u64) -> u64 {
                     match instr {
                         Instr::LoadInt | Instr::LoadFloat | Instr::LoadGlobal | Instr::Define | Instr::LoadFuncRef | Instr::CallFunction => { let _ = prog.read_int(); },
                         Instr::LoadString | Instr::LoadSymbol => { let _ = prog.read_string(); },
+                        Instr::Map => { 
+                            let _ = prog.read_byte();
+                            worklist.push(prog.cursor.position() as u64 + 16);
+                        },
+                        Instr::ForEach => { 
+                            let _ = prog.read_byte();
+                            worklist.push(prog.cursor.position() as u64 + 12);
+                        },
+                        Instr::Fold => { 
+                            let _ = prog.read_byte();
+                            worklist.push(prog.cursor.position() as u64 + 12);
+                        },
+                        Instr::Filter => { 
+                            let _ = prog.read_byte(); 
+                            let _ = prog.read_byte();
+                            worklist.push(prog.cursor.position() as u64 + 17);
+                        },
+                        Instr::FilterStep => { let _ = prog.read_byte(); },
                         _ => {}
                     }
                 }

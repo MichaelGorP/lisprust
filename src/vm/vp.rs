@@ -48,7 +48,13 @@ pub(super) enum Instr {
     Cons,
     IsPair,
     IsEq,
-    IsNull
+    IsNull,
+    // Higher order functions
+    Map,
+    ForEach,
+    Filter,
+    Fold,
+    FilterStep
 }
 
 #[repr(u8)]
@@ -101,6 +107,11 @@ impl TryFrom<u8> for Instr {
             x if x == Instr::IsPair as u8 => Ok(Instr::IsPair),
             x if x == Instr::IsEq as u8 => Ok(Instr::IsEq),
             x if x == Instr::IsNull as u8 => Ok(Instr::IsNull),
+            x if x == Instr::Map as u8 => Ok(Instr::Map),
+            x if x == Instr::ForEach as u8 => Ok(Instr::ForEach),
+            x if x == Instr::Filter as u8 => Ok(Instr::Filter),
+            x if x == Instr::Fold as u8 => Ok(Instr::Fold),
+            x if x == Instr::FilterStep as u8 => Ok(Instr::FilterStep),
             _ => Err(())
         }
     }
