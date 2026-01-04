@@ -1,6 +1,11 @@
 use super::{compiler::Compiler, vp::Value, vp::ValueKind, vp::Pair, vp::HeapValue, vp::VmContext};
 
 pub fn register_functions(compiler: &mut Compiler) {
+    compiler.register_function("car", car, Some(1));
+    compiler.register_function("cdr", cdr, Some(1));
+    compiler.register_function("cons", cons, Some(2));
+    compiler.register_function("pair?", is_pair, Some(1));
+    compiler.register_function("null?", is_null, Some(1));
     compiler.register_function("list", list, None);
     // compiler.register_function("map", map, None); // Requires VM callback
     compiler.register_function("append", append, None);
@@ -22,6 +27,66 @@ pub fn register_functions(compiler: &mut Compiler) {
     // compiler.register_function("fold", fold, None); // Requires VM callback
 }
 
+fn cons(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 2 {
+        return Err("cons expects 2 arguments".to_string());
+    }
+    ctx.collect();
+    let pair = Pair {
+        car: args[0],
+        cdr: args[1],
+    };
+    Ok(Value::object(ctx.heap().alloc(HeapValue::Pair(pair))))
+}
+
+fn car(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("car expects 1 argument".to_string());
+    }
+    match args[0].kind() {
+        ValueKind::Object(handle) => match ctx.heap().get(handle) {
+            Some(HeapValue::Pair(p)) => Ok(p.car),
+            _ => Err("car expects a pair".to_string()),
+        },
+        _ => Err("car expects a pair".to_string()),
+    }
+}
+
+fn cdr(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("cdr expects 1 argument".to_string());
+    }
+    match args[0].kind() {
+        ValueKind::Object(handle) => match ctx.heap().get(handle) {
+            Some(HeapValue::Pair(p)) => Ok(p.cdr),
+            _ => Err("cdr expects a pair".to_string()),
+        },
+        _ => Err("cdr expects a pair".to_string()),
+    }
+}
+
+fn is_pair(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("pair? expects 1 argument".to_string());
+    }
+    match args[0].kind() {
+        ValueKind::Object(handle) => match ctx.heap().get(handle) {
+            Some(HeapValue::Pair(_)) => Ok(Value::boolean(true)),
+            _ => Ok(Value::boolean(false)),
+        },
+        _ => Ok(Value::boolean(false)),
+    }
+}
+
+fn is_null(_ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("null? expects 1 argument".to_string());
+    }
+    match args[0].kind() {
+        ValueKind::Nil => Ok(Value::boolean(true)),
+        _ => Ok(Value::boolean(false)),
+    }
+}
 
 fn list(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
     let mut result = Value::nil();
