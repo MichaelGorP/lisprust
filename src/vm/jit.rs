@@ -713,6 +713,10 @@ impl Jit {
         Some(fast_func_id)
     }
 
+    pub fn is_compiled(&self, start_addr: u64) -> bool {
+        self.cache.contains_key(&start_addr)
+    }
+
     pub fn compile(&mut self, global_vars: &Vec<LispValue>, heap: &Arena<HeapValue>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Result<fn(*mut Vm, *mut VirtualProgram, *mut LispValue), String> {
         self.module.clear_context(&mut self.ctx);
         

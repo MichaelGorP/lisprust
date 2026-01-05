@@ -94,7 +94,11 @@ fn main() {
     }
 
     if let Some(res) = res {
-        println!("VM result: {}", res)
+        if let Some(sexpr) = lisp::vm::vm::value_to_sexpr(&res, &vm.heap) {
+            println!("VM result: {}", sexpr);
+        } else {
+            println!("VM result: <internal value>");
+        }
     } else {
         println!("VM result: None");
     }

@@ -245,7 +245,7 @@ pub unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgr
          vm.tail_call_pending = true;
          vm.next_jit_code = jit_code;
     } else {
-         let end_addr = super::analysis::scan_function_end(prog, address);
+         let end_addr = if vm.jit.is_compiled(address) { 0 } else { super::analysis::scan_function_end(prog, address) };
          match vm.jit.compile(&vm.global_vars, &vm.heap, prog, address, end_addr) {
              Ok(func) => {
                  if let Some(cell) = jit_code_cell {
@@ -372,8 +372,8 @@ pub unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut Virtual
          vm.tail_call_pending = true;
          vm.next_jit_code = jit_code;
     } else {
-         println!("Compiling tail call target at {}", address);
-         let end_addr = super::analysis::scan_function_end(prog, address);
+         // println!("Compiling tail call target at {}", address);
+         let end_addr = if vm.jit.is_compiled(address) { 0 } else { super::analysis::scan_function_end(prog, address) };
          if let Ok(func) = vm.jit.compile(&vm.global_vars, &vm.heap, prog, address, end_addr) {
              if let Some(cell) = jit_code_cell {
                  if let Some(&code) = vm.jit.cache.get(&address) {

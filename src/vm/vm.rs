@@ -306,11 +306,11 @@ impl Vm {
         result
     }
 
-    pub fn run(&mut self, prog: &mut VirtualProgram) -> Option<SExpression> {
+    pub fn run(&mut self, prog: &mut VirtualProgram) -> Option<Value> {
         self.run_debug(prog, None)
     }
 
-    pub fn run_debug(&mut self, prog: &mut VirtualProgram, mut debugger: Option<&mut dyn Debugger>) -> Option<SExpression> {
+    pub fn run_debug(&mut self, prog: &mut VirtualProgram, mut debugger: Option<&mut dyn Debugger>) -> Option<Value> {
         loop {
             if let Some(dbg) = &mut debugger {
                 dbg.on_step(self, prog);
@@ -526,7 +526,11 @@ impl Vm {
                     }
                     
                     if self.jit_enabled {
-                        let end_addr = self.scan_function_end(prog, address);
+                        let end_addr = if self.jit.is_compiled(address) {
+                            0
+                        } else {
+                            self.scan_function_end(prog, address)
+                        };
                         if self.run_jit_function(prog as *mut VirtualProgram, address, end_addr) {
                             let state = self.call_states.pop().unwrap();
                             let source_reg = self.window_start + state.result_reg as usize;
@@ -586,7 +590,11 @@ impl Vm {
                     }
 
                     if self.jit_enabled {
-                        let end_addr = self.scan_function_end(prog, address);
+                        let end_addr = if self.jit.is_compiled(address) {
+                            0
+                        } else {
+                            self.scan_function_end(prog, address)
+                        };
                         self.run_jit_function(prog as *mut VirtualProgram, address, end_addr);
                         
                         // Simulate Ret
@@ -1095,12 +1103,12 @@ impl Vm {
         let res_reg = prog.get_result_reg() as usize + self.window_start;
 
         //convert result
-        value_to_sexpr(&self.registers[res_reg], &self.heap)
+        Some(self.registers[res_reg].clone())
     }
 
 }
 
-fn value_to_sexpr(value: &Value, heap: &Arena<HeapValue>) -> Option<SExpression> {
+pub fn value_to_sexpr(value: &Value, heap: &Arena<HeapValue>) -> Option<SExpression> {
     match value.kind() {
         ValueKind::Nil => Some(SExpression::List(vec![])),
         ValueKind::Boolean(b) => Some(SExpression::Atom(Atom::Boolean(b))),

@@ -20,7 +20,8 @@ pub fn parse_and_exec_opt(prog: &str) -> Option<SExpression> {
     list_functions::register_functions(&mut compiler);
     let mut prog = compiler.compile(&expr, &map).unwrap();
     let mut vm = Vm::new(false);
-    vm.run(&mut prog)
+    let res = vm.run(&mut prog);
+    res.and_then(|v| lisp::vm::vm::value_to_sexpr(&v, &vm.heap))
 }
 
 pub fn parse_compile_and_exec(prog: &str, use_jit: bool) -> SExpression {
@@ -34,18 +35,20 @@ pub fn parse_compile_and_exec(prog: &str, use_jit: bool) -> SExpression {
     let mut prog = compiler.compile(&expr, &map).unwrap();
     let mut prog_copy = prog.clone();
     let mut vm = Vm::new(false);
-    let res = match vm.run(&mut prog) {
+    let val = match vm.run(&mut prog) {
         Some(r) => r,
         None => panic!("VM failed to execute")
     };
+    let res = lisp::vm::vm::value_to_sexpr(&val, &vm.heap).unwrap();
 
     if use_jit {
         let mut vm_jit = Vm::new(true);
-        let res_jit = match vm_jit.run(&mut prog_copy) {
+        let val_jit = match vm_jit.run(&mut prog_copy) {
             Some(r) => r,
             None => panic!("VM failed to execute")
         };
-        assert!(res == res_jit);
+        let res_jit = lisp::vm::vm::value_to_sexpr(&val_jit, &vm_jit.heap).unwrap();
+        assert_eq!(res, res_jit);
     }
     
     res
