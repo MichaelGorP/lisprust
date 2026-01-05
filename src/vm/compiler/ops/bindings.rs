@@ -271,6 +271,15 @@ fn compile_quoted_expr(compiler: &mut Compiler, expr: &SExpression) -> Result<u8
                 Instruction::Leq => "<=",
                 Instruction::Geq => ">=",
                 Instruction::Quote => "quote",
+                Instruction::Map => "map",
+                Instruction::ForEach => "for-each",
+                Instruction::Filter => "filter",
+                Instruction::Fold => "fold",
+                Instruction::Car => "car",
+                Instruction::Cdr => "cdr",
+                Instruction::Cons => "cons",
+                Instruction::IsPair => "pair?",
+                Instruction::IsNull => "null?",
             };
             let reg = compiler.scopes.allocate_reg()?;
             compiler.bytecode.store_opcode(Instr::LoadSymbol, reg, 0, 0);
@@ -287,23 +296,11 @@ fn compile_quoted_expr(compiler: &mut Compiler, expr: &SExpression) -> Result<u8
                 let mut last_reg = compiler.scopes.allocate_reg()?;
                 compiler.bytecode.store_opcode(Instr::LoadNil, last_reg, 0, 0);
 
-                let (cons_func, _) = compiler.functions.get_registered_function("cons")
-                    .ok_or(CompilationError::from("cons function not found"))?;
-                let cons_id = compiler.functions.get_or_insert_used_function("cons", cons_func);
-
                 for item in list.iter().rev() {
                     let item_reg = compile_quoted_expr(compiler, item)?;
                     
-                    let start_reg = compiler.scopes.allocate_reg()?;
-                    let _ = compiler.scopes.allocate_reg()?;
-                    
-                    compiler.bytecode.store_opcode(Instr::CopyReg, start_reg, item_reg, 0);
-                    compiler.bytecode.store_opcode(Instr::CopyReg, start_reg + 1, last_reg, 0);
-                    
                     let result_reg = compiler.scopes.allocate_reg()?;
-                    compiler.bytecode.store_opcode(Instr::CallFunction, result_reg, start_reg, 2);
-                    let id: i64 = cons_id as i64;
-                    compiler.bytecode.store_value(&id.to_le_bytes());
+                    compiler.bytecode.store_opcode(Instr::Cons, result_reg, item_reg, last_reg);
                     
                     last_reg = result_reg;
                 }

@@ -120,6 +120,15 @@ impl Parser {
         parser.instructions.insert("<=", instructions::Instruction::Leq);
         parser.instructions.insert(">=", instructions::Instruction::Geq);
         parser.instructions.insert("quote", instructions::Instruction::Quote);
+        parser.instructions.insert("map", instructions::Instruction::Map);
+        parser.instructions.insert("for-each", instructions::Instruction::ForEach);
+        parser.instructions.insert("filter", instructions::Instruction::Filter);
+        parser.instructions.insert("fold", instructions::Instruction::Fold);
+        parser.instructions.insert("car", instructions::Instruction::Car);
+        parser.instructions.insert("cdr", instructions::Instruction::Cdr);
+        parser.instructions.insert("cons", instructions::Instruction::Cons);
+        parser.instructions.insert("pair?", instructions::Instruction::IsPair);
+        parser.instructions.insert("null?", instructions::Instruction::IsNull);
         parser
     }
 

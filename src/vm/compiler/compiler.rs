@@ -147,11 +147,12 @@ impl<'a> Compiler<'a> {
 
     fn compile_list(&mut self, list: &[SExpression], is_tail: bool) -> Result<u8, CompilationError> {
         let map = self.current_map();
-        let map_list = if let SourceMap::List(_, l) = map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
+        let map_list: &[SourceMap] = if let SourceMap::List(_, l) = map { l } else { &[] };
+        let dummy_map = self.current_map();
 
         if !list.is_empty() {
             let expr = &list[0];
-            let expr_map = &map_list[0];
+            let expr_map = map_list.get(0).unwrap_or(dummy_map);
             
             self.push_map(expr_map);
 
@@ -164,100 +165,7 @@ impl<'a> Compiler<'a> {
                 SExpression::Symbol(s) => {
                     let result_reg = self.scopes.allocate_reg()?;
 
-                    if (s == "map" || s == "for-each" || s == "filter") && list.len() == 3 {
-                        self.pop_map();
-                        
-                        self.push_map(&map_list[1]);
-                        let func_reg = self.compile_expr(&list[1], &[], false)?;
-                        self.pop_map();
 
-                        self.push_map(&map_list[2]);
-                        let list_reg = self.compile_expr(&list[2], &[], false)?;
-                        self.pop_map();
-
-                        let val_reg = if s == "filter" {
-                            Some(self.scopes.allocate_reg()?)
-                        } else {
-                            None
-                        };
-
-                        let temp_reg = self.scopes.allocate_reg()?;
-
-                        if s == "map" {
-                            self.bytecode.store_opcode(Instr::LoadNil, result_reg, 0, 0);
-                        } else if s == "filter" {
-                            self.bytecode.store_opcode(Instr::LoadNil, result_reg, 0, 0);
-                        }
-
-                        let start_pos = self.bytecode.cursor.position();
-
-                        if s == "map" {
-                            self.bytecode.store_opcode(Instr::Map, func_reg, list_reg, result_reg);
-                            self.bytecode.store_value(&[temp_reg]);
-                            
-                            // Loop body: Cons res, temp, res
-                            self.bytecode.store_opcode(Instr::Cons, result_reg, temp_reg, result_reg);
-                            
-                            // Jump back to Map
-                            let end_pos = self.bytecode.cursor.position();
-                            let jump_dist = (start_pos as i64) - (end_pos as i64) - 12;
-                            self.bytecode.store_opcode(Instr::Jump, 0, JumpCondition::Jump as u8, 0);
-                            self.bytecode.store_value(&jump_dist.to_le_bytes());
-                        } else if s == "for-each" {
-                            self.bytecode.store_opcode(Instr::ForEach, func_reg, list_reg, 0);
-                            self.bytecode.store_value(&[temp_reg]);
-                            
-                            let end_pos = self.bytecode.cursor.position();
-                            let jump_dist = (start_pos as i64) - (end_pos as i64) - 12;
-                            self.bytecode.store_opcode(Instr::Jump, 0, JumpCondition::Jump as u8, 0);
-                            self.bytecode.store_value(&jump_dist.to_le_bytes());
-                            
-                            self.bytecode.store_opcode(Instr::LoadNil, result_reg, 0, 0);
-                        } else if s == "filter" {
-                            let val_reg = val_reg.unwrap();
-                            self.bytecode.store_opcode(Instr::Filter, func_reg, list_reg, result_reg);
-                            self.bytecode.store_value(&[temp_reg]);
-                            self.bytecode.store_value(&[val_reg]);
-                            
-                            self.bytecode.store_opcode(Instr::FilterStep, list_reg, result_reg, temp_reg);
-                            self.bytecode.store_value(&[val_reg]);
-                            
-                            let end_pos = self.bytecode.cursor.position();
-                            let jump_dist = (start_pos as i64) - (end_pos as i64) - 12;
-                            self.bytecode.store_opcode(Instr::Jump, 0, JumpCondition::Jump as u8, 0);
-                            self.bytecode.store_value(&jump_dist.to_le_bytes());
-                        }
-                        return Ok(result_reg);
-                    } else if s == "fold" && list.len() == 4 {
-                        self.pop_map();
-                        
-                        self.push_map(&map_list[1]);
-                        let func_reg = self.compile_expr(&list[1], &[], false)?;
-                        self.pop_map();
-
-                        self.push_map(&map_list[2]);
-                        let acc_reg = self.compile_expr(&list[2], &[], false)?;
-                        self.pop_map();
-
-                        self.push_map(&map_list[3]);
-                        let list_reg = self.compile_expr(&list[3], &[], false)?;
-                        self.pop_map();
-
-                        let temp_reg = self.scopes.allocate_reg()?;
-                        
-                        self.bytecode.store_opcode(Instr::CopyReg, result_reg, acc_reg, 0);
-                        
-                        let start_pos = self.bytecode.cursor.position();
-                        self.bytecode.store_opcode(Instr::Fold, func_reg, result_reg, list_reg);
-                        self.bytecode.store_value(&[temp_reg]);
-                        
-                        let end_pos = self.bytecode.cursor.position();
-                        let jump_dist = (start_pos as i64) - (end_pos as i64) - 12;
-                        self.bytecode.store_opcode(Instr::Jump, 0, JumpCondition::Jump as u8, 0);
-                        self.bytecode.store_value(&jump_dist.to_le_bytes());
-                        
-                        return Ok(result_reg);
-                    }
 
                     //try registered functions first, not overwritable so far
                     let opt_func = self.functions.get_registered_function(s);
@@ -272,7 +180,9 @@ impl<'a> Compiler<'a> {
 
                         // evaluate all other expressions as arguments
                         let mut arg_regs = Vec::new();
-                        for (expr, sub_map) in list.iter().skip(1).zip(map_list.iter().skip(1)) {
+                        let mut map_iter = map_list.iter().skip(1);
+                        for expr in list.iter().skip(1) {
+                            let sub_map = map_iter.next().unwrap_or(dummy_map);
                             self.push_map(sub_map);
                             let reg = self.compile_expr(expr, &[], false)?;
                             self.pop_map();
@@ -292,26 +202,11 @@ impl<'a> Compiler<'a> {
 
                         let reg_count = arg_regs.len() as u8;
                         
-                        // Check for intrinsics
-                        if s == "car" && reg_count == 1 {
-                            self.bytecode.store_opcode(Instr::Car, result_reg, start_reg, 0);
-                        } else if s == "cdr" && reg_count == 1 {
-                            self.bytecode.store_opcode(Instr::Cdr, result_reg, start_reg, 0);
-                        } else if s == "cons" && reg_count == 2 {
-                            self.bytecode.store_opcode(Instr::Cons, result_reg, start_reg, start_reg + 1);
-                        } else if s == "pair?" && reg_count == 1 {
-                            self.bytecode.store_opcode(Instr::IsPair, result_reg, start_reg, 0);
-                        } else if s == "eq?" && reg_count == 2 {
-                            self.bytecode.store_opcode(Instr::IsEq, result_reg, start_reg, start_reg + 1);
-                        } else if s == "null?" && reg_count == 1 {
-                            self.bytecode.store_opcode(Instr::IsNull, result_reg, start_reg, 0);
-                        } else {
-                            let func_id = self.functions.get_or_insert_used_function(s, func);
+                        let func_id = self.functions.get_or_insert_used_function(s, func);
 
-                            self.bytecode.store_opcode(Instr::CallFunction, result_reg, start_reg, reg_count);
-                            let id: i64 = func_id as i64;
-                            self.bytecode.store_value(&id.to_le_bytes());
-                        }
+                        self.bytecode.store_opcode(Instr::CallFunction, result_reg, start_reg, reg_count);
+                        let id: i64 = func_id as i64;
+                        self.bytecode.store_value(&id.to_le_bytes());
                     }
                     else {
                         // Check for self-recursion optimization
@@ -347,7 +242,9 @@ impl<'a> Compiler<'a> {
                             self.pop_map();
                             
                             let mut arg_regs = Vec::new();
-                            for (expr, sub_map) in list.iter().skip(1).zip(map_list.iter().skip(1)) {
+                            let mut map_iter = map_list.iter().skip(1);
+                            for expr in list.iter().skip(1) {
+                                let sub_map = map_iter.next().unwrap_or(dummy_map);
                                 self.push_map(sub_map);
                                 let reg = self.compile_expr(expr, &[], false)?;
                                 self.pop_map();
@@ -368,76 +265,6 @@ impl<'a> Compiler<'a> {
                             self.bytecode.store_value(&dist.to_le_bytes());
                         }
                         else {
-                            // Check for intrinsics
-                            if s == "car" && list.len() == 2 {
-                                self.pop_map();
-                                let sub_map = map_list.get(1).unwrap_or(self.current_map());
-                                self.push_map(sub_map);
-                                let arg_reg = self.compile_expr(&list[1], &[], false)?;
-                                self.pop_map();
-                                let result_reg = self.scopes.allocate_reg()?;
-                                self.bytecode.store_opcode(Instr::Car, result_reg, arg_reg, 0);
-                                self.scopes.reset_reg(result_reg + 1);
-                                return Ok(result_reg);
-                            } else if s == "cdr" && list.len() == 2 {
-                                self.pop_map();
-                                let sub_map = map_list.get(1).unwrap_or(self.current_map());
-                                self.push_map(sub_map);
-                                let arg_reg = self.compile_expr(&list[1], &[], false)?;
-                                self.pop_map();
-                                let result_reg = self.scopes.allocate_reg()?;
-                                self.bytecode.store_opcode(Instr::Cdr, result_reg, arg_reg, 0);
-                                self.scopes.reset_reg(result_reg + 1);
-                                return Ok(result_reg);
-                            } else if s == "cons" && list.len() == 3 {
-                                self.pop_map();
-                                let sub_map1 = map_list.get(1).unwrap_or(self.current_map());
-                                self.push_map(sub_map1);
-                                let arg1_reg = self.compile_expr(&list[1], &[], false)?;
-                                self.pop_map();
-                                let sub_map2 = map_list.get(2).unwrap_or(self.current_map());
-                                self.push_map(sub_map2);
-                                let arg2_reg = self.compile_expr(&list[2], &[], false)?;
-                                self.pop_map();
-                                let result_reg = self.scopes.allocate_reg()?;
-                                self.bytecode.store_opcode(Instr::Cons, result_reg, arg1_reg, arg2_reg);
-                                self.scopes.reset_reg(result_reg + 1);
-                                return Ok(result_reg);
-                            } else if s == "pair?" && list.len() == 2 {
-                                self.pop_map();
-                                let sub_map = map_list.get(1).unwrap_or(self.current_map());
-                                self.push_map(sub_map);
-                                let arg_reg = self.compile_expr(&list[1], &[], false)?;
-                                self.pop_map();
-                                let result_reg = self.scopes.allocate_reg()?;
-                                self.bytecode.store_opcode(Instr::IsPair, result_reg, arg_reg, 0);
-                                self.scopes.reset_reg(result_reg + 1);
-                                return Ok(result_reg);
-                            } else if s == "eq?" && list.len() == 3 {
-                                self.pop_map();
-                                let sub_map1 = map_list.get(1).unwrap_or(self.current_map());
-                                self.push_map(sub_map1);
-                                let arg1_reg = self.compile_expr(&list[1], &[], false)?;
-                                self.pop_map();
-                                let sub_map2 = map_list.get(2).unwrap_or(self.current_map());
-                                self.push_map(sub_map2);
-                                let arg2_reg = self.compile_expr(&list[2], &[], false)?;
-                                self.pop_map();
-                                let result_reg = self.scopes.allocate_reg()?;
-                                self.bytecode.store_opcode(Instr::IsEq, result_reg, arg1_reg, arg2_reg);
-                                self.scopes.reset_reg(result_reg + 1);
-                                return Ok(result_reg);
-                            } else if s == "null?" && list.len() == 2 {
-                                self.pop_map();
-                                let sub_map = map_list.get(1).unwrap_or(self.current_map());
-                                self.push_map(sub_map);
-                                let arg_reg = self.compile_expr(&list[1], &[], false)?;
-                                self.pop_map();
-                                let result_reg = self.scopes.allocate_reg()?;
-                                self.bytecode.store_opcode(Instr::IsNull, result_reg, arg_reg, 0);
-                                self.scopes.reset_reg(result_reg + 1);
-                                return Ok(result_reg);
-                            }
 
                             let sym_reg; //register for symbol
                             if let Some(reg) = self.scopes.find_symbol(s.as_str()) {
@@ -529,7 +356,9 @@ impl<'a> Compiler<'a> {
                     self.pop_map();
                     
                     let mut arg_regs = Vec::new();
-                    for (expr, sub_map) in list.iter().skip(1).zip(map_list.iter().skip(1)) {
+                    let mut map_iter = map_list.iter().skip(1);
+                    for expr in list.iter().skip(1) {
+                        let sub_map = map_iter.next().unwrap_or(dummy_map);
                         self.push_map(sub_map);
                         let reg = self.compile_expr(expr, &[], false)?;
                         self.pop_map();
@@ -658,7 +487,7 @@ impl<'a> Compiler<'a> {
         }
 
         let map = self.current_map();
-        let map_list = if let SourceMap::List(_, l) = map { l } else { return Err(CompilationError::from("SourceMap mismatch")); };
+        let map_list: &[SourceMap] = if let SourceMap::List(_, l) = map { l } else { &[] };
 
         // Scan for internal definitions (letrec semantics)
         let mut internal_defines: Vec<(usize, String, u8)> = Vec::new();
@@ -687,7 +516,11 @@ impl<'a> Compiler<'a> {
 
         let base_reg = self.scopes.last_used_reg;
         let mut last_reg = 0;
-        for (index, (expr, sub_map)) in args.iter().skip(1).zip(map_list.iter().skip(2)).enumerate() {
+        let dummy_map = self.current_map();
+        let mut map_iter = map_list.iter().skip(2);
+
+        for (index, expr) in args.iter().skip(1).enumerate() {
+            let sub_map = map_iter.next().unwrap_or(dummy_map);
             self.push_map(sub_map);
             
             let define_info = internal_defines.iter().find(|(i, _, _)| *i == index);
@@ -794,7 +627,16 @@ impl<'a> Compiler<'a> {
             },
             Instruction::Eq | Instruction::Lt | Instruction::Gt | Instruction::Leq | Instruction::Geq => {
                 ops::math::compile_comparison(self, instr, args)
-            }
+            },
+            Instruction::Map => ops::list::compile_map(self, args),
+            Instruction::ForEach => ops::list::compile_for_each(self, args),
+            Instruction::Filter => ops::list::compile_filter(self, args),
+            Instruction::Fold => ops::list::compile_fold(self, args),
+            Instruction::Car => ops::list::compile_car(self, args),
+            Instruction::Cdr => ops::list::compile_cdr(self, args),
+            Instruction::Cons => ops::list::compile_cons(self, args),
+            Instruction::IsPair => ops::list::compile_is_pair(self, args),
+            Instruction::IsNull => ops::list::compile_is_null(self, args),
         }
     }
 }

@@ -767,7 +767,7 @@ impl Vm {
 
                     let list_val = self.registers[list_reg];
                     if list_val.is_nil() {
-                        prog.jump(12); // Skip Jump (12)
+                        // Done
                     } else {
                         if let ValueKind::Object(handle) = list_val.kind() {
                             if let Some(HeapValue::Pair(p)) = self.heap.get(handle) {
@@ -909,7 +909,7 @@ impl Vm {
 
                     let list_val = self.registers[list_reg];
                     if list_val.is_nil() {
-                        prog.jump(12); // Skip Jump (12)
+                        // Done
                     } else {
                         if let ValueKind::Object(handle) = list_val.kind() {
                             if let Some(HeapValue::Pair(p)) = self.heap.get(handle) {
@@ -946,9 +946,9 @@ impl Vm {
                                     }
                                 }
 
-                                // Fold expects 2 args: acc, val
-                                self.registers[self.window_start] = self.registers[acc_reg];
-                                self.registers[self.window_start + 1] = car;
+                                // Fold expects 2 args: val, acc
+                                self.registers[self.window_start] = car;
+                                self.registers[self.window_start + 1] = self.registers[acc_reg];
 
                                 if self.jit_enabled {
                                     let end_addr = self.scan_function_end(prog, address);

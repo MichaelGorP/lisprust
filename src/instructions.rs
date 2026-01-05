@@ -22,5 +22,14 @@ pub enum Instruction {
     Gt,
     Leq,
     Geq,
-    Quote
+    Quote,
+    Map,
+    ForEach,
+    Filter,
+    Fold,
+    Car,
+    Cdr,
+    Cons,
+    IsPair,
+    IsNull
 }
