@@ -1,5 +1,3 @@
-use lisp::parser::{SExpression, Atom};
-
 mod common;
 use common::{parse_and_exec, compare_expr};
 

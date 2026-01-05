@@ -9,6 +9,7 @@ pub fn parse_and_exec(prog: &str) -> SExpression {
     parse_compile_and_exec(prog, true)
 }
 
+#[allow(dead_code)]
 pub fn parse_and_exec_opt(prog: &str) -> Option<SExpression> {
     let tokens = lexer::tokenize(prog).unwrap_or(vec![]);
     let parser = Parser::new();

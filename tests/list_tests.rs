@@ -1,7 +1,7 @@
 use lisp::parser::{SExpression, Atom};
 
 mod common;
-use common::{parse_and_exec, compare_expr};
+use common::{parse_and_exec, compare_expr, parse_compile_and_exec};
 
 #[test]
 fn test_list_creation() {
@@ -125,3 +125,30 @@ fn test_memq_assoc() {
         _ => panic!("Expected list")
     }
 }
+
+#[test]
+fn test_higher_order_functions() {
+    // JIT for map/filter/fold is not fully implemented/stable yet
+    let res = parse_compile_and_exec("(map (lambda (x) (* x x)) (list 1 2 3 4))", false);
+    let expected = parse_compile_and_exec("(list 1 4 9 16)", false);
+    assert_eq!(res, expected);
+
+    let res = parse_compile_and_exec("(filter (lambda (x) (> x 2)) (list 1 2 3 4))", false);
+    let expected = parse_compile_and_exec("(list 3 4)", false);
+    assert_eq!(res, expected);
+
+    let res = parse_compile_and_exec("(fold (lambda (acc x) (+ acc x)) 0 (list 1 2 3 4))", false);
+    assert!(compare_expr(res, 10));
+}
+
+#[test]
+fn test_for_each() {
+    let code = "
+    (define l (list 0))
+    (for-each (lambda (x) (set-car! l (+ (car l) x))) (list 1 2 3 4))
+    (car l)
+    ";
+    let res = parse_compile_and_exec(code, false);
+    assert!(compare_expr(res, 10));
+}
+

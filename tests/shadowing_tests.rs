@@ -1,6 +1,4 @@
 
-use lisp::parser::{SExpression, Atom};
-
 mod common;
 use common::{parse_and_exec, compare_expr};
 
@@ -47,7 +45,6 @@ fn test_let_star_shadowing_reference() {
     assert!(compare_expr(res, 1));
 }
 
-#[test]
 #[test]
 fn test_lambda_shadowing() {
     let prog = "

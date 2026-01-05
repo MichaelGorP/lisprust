@@ -175,6 +175,12 @@ impl<'a> Compiler<'a> {
                         let list_reg = self.compile_expr(&list[2], &[], false)?;
                         self.pop_map();
 
+                        let val_reg = if s == "filter" {
+                            Some(self.scopes.allocate_reg()?)
+                        } else {
+                            None
+                        };
+
                         let temp_reg = self.scopes.allocate_reg()?;
 
                         if s == "map" {
@@ -208,7 +214,7 @@ impl<'a> Compiler<'a> {
                             
                             self.bytecode.store_opcode(Instr::LoadNil, result_reg, 0, 0);
                         } else if s == "filter" {
-                            let val_reg = self.scopes.allocate_reg()?;
+                            let val_reg = val_reg.unwrap();
                             self.bytecode.store_opcode(Instr::Filter, func_reg, list_reg, result_reg);
                             self.bytecode.store_value(&[temp_reg]);
                             self.bytecode.store_value(&[val_reg]);
