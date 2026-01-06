@@ -5,6 +5,7 @@ use lisp::vm::math_functions;
 use lisp::vm::list_functions;
 use lisp::vm::vm::Vm;
 
+#[allow(dead_code)]
 pub fn parse_and_exec(prog: &str) -> SExpression {
     parse_compile_and_exec(prog, true)
 }

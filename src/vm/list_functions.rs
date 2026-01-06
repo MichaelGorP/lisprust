@@ -23,20 +23,42 @@ pub fn register_functions(compiler: &mut Compiler) {
 }
 
 fn list(ctx: &mut dyn VmContext, args: &[Value]) -> Result<Value, String> {
+    let len = args.len();
+    if len == 0 {
+        return Ok(Value::nil());
+    }
+
+    let heap = ctx.heap();
+    
+    if len == 1 {
+        let p = Pair{ car: args[0], cdr: Value::nil() };
+        return Ok(Value::object(heap.alloc(HeapValue::Pair(p))));
+    }
+    
+    if len == 2 {
+        let p2 = Pair{ car: args[1], cdr: Value::nil() };
+        let h2 = heap.alloc(HeapValue::Pair(p2));
+        let p1 = Pair{ car: args[0], cdr: Value::object(h2) };
+        return Ok(Value::object(heap.alloc(HeapValue::Pair(p1)))); 
+    }
+
+    if len == 3 {
+        let p3 = Pair{ car: args[2], cdr: Value::nil() };
+        let h3 = heap.alloc(HeapValue::Pair(p3));
+        let p2 = Pair{ car: args[1], cdr: Value::object(h3) };
+        let h2 = heap.alloc(HeapValue::Pair(p2));
+        let p1 = Pair{ car: args[0], cdr: Value::object(h2) };
+        return Ok(Value::object(heap.alloc(HeapValue::Pair(p1))));
+    }
+
     let mut result = Value::nil();
-    ctx.push_scratch(result);
     for val in args.iter().rev() {
-        ctx.pop_scratch();
-        ctx.push_scratch(result);
-        
-        ctx.collect();
         let pair = Pair {
             car: *val,
             cdr: result,
         };
-        result = Value::object(ctx.heap().alloc(HeapValue::Pair(pair)));
+        result = Value::object(heap.alloc(HeapValue::Pair(pair)));
     }
-    ctx.pop_scratch();
     Ok(result)
 }
 

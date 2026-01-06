@@ -165,7 +165,63 @@ impl<'a> Compiler<'a> {
                 SExpression::Symbol(s) => {
                     let result_reg = self.scopes.allocate_reg()?;
 
+                if s == "list" {
+                    self.pop_map();
 
+                    let mut arg_regs = Vec::new();
+                    let mut map_iter = map_list.iter().skip(1);
+                    for expr in list.iter().skip(1) {
+                        let sub_map = map_iter.next().unwrap_or(dummy_map);
+                        self.push_map(sub_map);
+                        let reg = self.compile_expr(expr, &[], false)?;
+                        self.pop_map();
+                        arg_regs.push(reg);
+                    }
+
+                    if arg_regs.is_empty() {
+                        self.bytecode.store_opcode(Instr::LoadNil, result_reg, 0, 0);
+                    } else {
+                        let mut current_cdr = self.scopes.allocate_reg()?;
+                        self.bytecode.store_opcode(Instr::LoadNil, current_cdr, 0, 0);
+                        
+                        // We need the arguments to be contiguous for Instr::List
+                        // We already have arg_regs. Are they contiguous?
+                        // "arg_regs.push(reg)" where reg comes from compile_expr.
+                        // compile_expr allocates new registers. They might not be contiguous if sub-expressions used temps.
+                        // So we need to copy them to a contiguous block, just like we do for function calls.
+                        
+                        let count = arg_regs.len();
+                        let start_reg = self.scopes.allocate_reg()?;
+                        for _ in 1..count {
+                            self.scopes.allocate_reg()?;
+                        }
+                        
+                        for (i, &reg) in arg_regs.iter().enumerate() {
+                             self.bytecode.store_opcode(Instr::CopyReg, start_reg + i as u8, reg, 0);
+                        }
+
+                        // Instr::List(dest, start, count)
+                        // count can be larger than u8? Opcode format usually [u8; 4].
+                        // If count > 255, we might need a larger instruction or multiple Cons.
+                        // For now assuming < 255.
+                        
+                        if count > 255 {
+                            // Fallback to Cons loop if too many args
+                            let mut current_cdr = self.scopes.allocate_reg()?;
+                            self.bytecode.store_opcode(Instr::LoadNil, current_cdr, 0, 0);
+
+                            for &arg_reg in arg_regs.iter().rev() {
+                                let new_cons = self.scopes.allocate_reg()?;
+                                self.bytecode.store_opcode(Instr::Cons, new_cons, arg_reg, current_cdr);
+                                current_cdr = new_cons;
+                            }
+                            self.bytecode.store_opcode(Instr::CopyReg, result_reg, current_cdr, 0);
+                        } else {
+                            self.bytecode.store_opcode(Instr::List, result_reg, start_reg, count as u8);
+                        }
+                    }
+                    return Ok(result_reg);
+                }
 
                     //try registered functions first, not overwritable so far
                     let opt_func = self.functions.get_registered_function(s);

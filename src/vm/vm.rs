@@ -1,8 +1,9 @@
 use std::cell::Cell;
 use std::collections::{HashSet, HashMap};
+use rustc_hash::FxHashMap;
 
 use crate::parser::{SExpression, Atom};
-use crate::vm::gc::{Arena, Handle};
+use crate::vm::gc::{Arena, Handle, Trace, GcVisitor};
 
 use super::vp::{ClosureData, FunctionData, FunctionHeader, Instr, JumpCondition, Value, ValueKind, HeapValue, VirtualProgram, VmContext, Pair};
 use super::jit::Jit;
@@ -87,6 +88,16 @@ pub struct CallState {
     pub return_addr: u64
 }
 
+#[derive(Clone)]
+pub struct MapCache {
+    pub handle: Handle,
+    pub header: FunctionHeader,
+    pub address: u64,
+    pub captures: Option<Vec<Value>>,
+    pub jit_code: u64,
+    pub fast_jit_code: u64,
+}
+
 pub trait Debugger {
     fn on_step(&mut self, vm: &Vm, prog: &VirtualProgram);
 }
@@ -96,7 +107,7 @@ pub struct Vm {
     pub heap: Arena<HeapValue>,
     pub registers: Vec<Value>,
     pub global_vars: Vec<Value>,
-    pub symbol_table: HashMap<String, Handle>,
+    pub symbol_table: FxHashMap<String, Handle>,
     pub(super) call_states: Vec<CallState>,
     pub window_start: usize,
     pub jit: Jit,
@@ -105,6 +116,9 @@ pub struct Vm {
     pub roots_buffer: Vec<Handle>,
     pub tail_call_pending: bool,
     pub next_jit_code: u64,
+    pub map_cache: Option<MapCache>,
+    pub symbol_opt_cache: FxHashMap<u64, Handle>,
+    pub jit_constants: Vec<Handle>,
 }
 
 impl VmContext for Vm {
@@ -128,7 +142,7 @@ impl VmContext for Vm {
 impl Vm {
     pub fn new(jit_enabled: bool) -> Vm {
         const EMPTY : Value = empty_value();
-        Vm {heap: Arena::new(), registers: vec![EMPTY; 64000], global_vars: Vec::new(), symbol_table: HashMap::new(), call_states: Vec::new(), window_start: 0, jit: Jit::new(), jit_enabled, scratch_buffer: Vec::with_capacity(32), roots_buffer: Vec::with_capacity(1024), tail_call_pending: false, next_jit_code: 0}
+        Vm {heap: Arena::new(), registers: vec![EMPTY; 64000], global_vars: Vec::new(), symbol_table: FxHashMap::default(), call_states: Vec::new(), window_start: 0, jit: Jit::new(), jit_enabled, scratch_buffer: Vec::with_capacity(32), roots_buffer: Vec::with_capacity(1024), tail_call_pending: false, next_jit_code: 0, map_cache: None, symbol_opt_cache: FxHashMap::default(), jit_constants: Vec::with_capacity(1024)}
     }
 
     pub fn collect_garbage(&mut self) {
@@ -136,35 +150,59 @@ impl Vm {
             return;
         }
         
-        self.roots_buffer.clear();
+        // Use Copying GC
+        let registers = &mut self.registers;
+        let global_vars = &mut self.global_vars;
+        let symbol_table = &mut self.symbol_table;
+        let scratch_buffer = &mut self.scratch_buffer;
+        let map_cache = &mut self.map_cache;
+        let symbol_opt_cache = &mut self.symbol_opt_cache;
         
-        for v in &self.registers {
-            if let ValueKind::Object(h) = v.kind() {
-                self.roots_buffer.push(h);
+        self.heap.collect_from_roots(|visitor| {
+            // Visit registers
+            for v in registers {
+                v.trace(visitor);
             }
-        }
-        
-        for v in &self.global_vars {
-            if let ValueKind::Object(h) = v.kind() {
-                self.roots_buffer.push(h);
+            
+            // Visit globals
+            for v in global_vars {
+                v.trace(visitor);
             }
-        }
-        
-        for h in self.symbol_table.values() {
-            self.roots_buffer.push(*h);
-        }
-        
-        for v in &self.scratch_buffer {
-            if let ValueKind::Object(h) = v.kind() {
-                self.roots_buffer.push(h);
+            
+            // Visit symbol table (the values are Handles)
+            for h in symbol_table.values_mut() {
+                visitor.visit(h);
             }
-        }
-        
-        self.heap.collect(&self.roots_buffer);
+            
+            // Visit scratch buffer
+            for v in scratch_buffer {
+                v.trace(visitor);
+            }
+            
+            // Visit MapCache
+            if let Some(cache) = map_cache {
+                visitor.visit(&mut cache.handle);
+                if let Some(caps) = &mut cache.captures {
+                    for v in caps {
+                        v.trace(visitor);
+                    }
+                }
+            }
+            
+            // Visit Symbol Opt Cache
+            for h in symbol_opt_cache.values_mut() {
+                visitor.visit(h);
+            }
+            
+            // Visit JIT constants
+            for h in self.jit_constants.iter_mut() {
+                visitor.visit(h);
+            }
+        });
     }
 
     pub fn run_jit_function(&mut self, prog: *mut VirtualProgram, start_addr: u64, end_addr: u64) -> bool {
-        match self.jit.compile(&self.global_vars, &self.heap, unsafe { &mut *prog }, start_addr, end_addr) {
+        match self.jit.compile(&self.global_vars, &mut self.heap, &mut self.jit_constants, &mut self.symbol_table, unsafe { &mut *prog }, start_addr, end_addr) {
             Ok(func) => {
                 unsafe {
                     let mut current_func = func;

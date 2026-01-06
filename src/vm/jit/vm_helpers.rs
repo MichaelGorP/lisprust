@@ -119,16 +119,59 @@ pub unsafe extern "C" fn helper_op(vm: *mut Vm, prog: *mut VirtualProgram, regis
              let prog = &mut *prog;
              if let Some(s) = prog.read_string() {
                  let dest_reg = opcode[1] as usize;
-                 *registers.add(dest_reg) = LispValue::object(vm.heap.alloc(HeapValue::Symbol(s)));
+                 let handle = if let Some(&h) = vm.symbol_table.get(&s) {
+                     h
+                 } else {
+                     let h = vm.heap.alloc(HeapValue::Symbol(s.clone()));
+                     vm.symbol_table.insert(s, h);
+                     h
+                 };
+                 *registers.add(dest_reg) = LispValue::object(handle);
              }
         },
         Ok(Instr::LoadNil) => {
              let dest_reg = opcode[1] as usize;
              *registers.add(dest_reg) = LispValue::nil();
         },
+        Ok(Instr::List) => {
+             let dest_reg = opcode[1] as usize;
+             let start_reg = opcode[2] as usize;
+             let count = opcode[3] as usize;
+             
+             let mut last_node = LispValue::nil();
+             for i in (0..count).rev() {
+                 let val = *registers.add(start_reg + i);
+                 let handle = vm.heap.alloc(HeapValue::Pair(Pair { car: val, cdr: last_node }));
+                 last_node = LispValue::object(handle);
+             }
+             *registers.add(dest_reg) = last_node;
+        },
         _ => {
         }
     }
+}
+
+pub unsafe extern "C" fn helper_list(vm: *mut Vm, registers: *mut LispValue, dest_reg: usize, start_reg: usize, count: usize) {
+    let vm = &mut *vm;
+    
+    if count == 0 {
+        *registers.add(dest_reg) = LispValue::nil();
+        return;
+    }
+
+    let start_ptr = registers.add(start_reg);
+
+    let first_handle = vm.heap.alloc_contiguous(count, |i, handle| {
+        let val = *start_ptr.add(i);
+        let next = if i == count - 1 {
+            LispValue::nil()
+        } else {
+             LispValue::object(handle.offset(1))
+        };
+        HeapValue::Pair(Pair { car: val, cdr: next })
+    });
+    
+    *registers.add(dest_reg) = LispValue::object(first_handle);
 }
 
 pub unsafe extern "C" fn helper_check_condition(_vm: *mut Vm, registers: *mut LispValue, reg_idx: usize) -> i32 {
@@ -184,9 +227,8 @@ pub unsafe extern "C" fn helper_call_function(vm: *mut Vm, prog: *mut VirtualPro
     let Some(function) = prog.get_function(func_id) else { return };
     
     let args_slice = std::slice::from_raw_parts(registers.add(start_reg), reg_count);
-    let args = args_slice.to_vec();
     
-    match function(vm, &args) {
+    match function(vm, args_slice) {
         Ok(val) => *registers.add(dest_reg) = val,
         Err(e) => panic!("Runtime error: {}", e),
     }
@@ -200,15 +242,15 @@ pub unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgr
 
     let resolved_func = resolve_value(vm, registers, func_reg as u8);
     
-    let (header, address, captures, jit_code_cell, fast_jit_code_cell) = if let ValueKind::Object(handle) = resolved_func.kind() {
+    let (header, address, captures, jit_code_val) = if let ValueKind::Object(handle) = resolved_func.kind() {
         match vm.heap.get(handle) {
-            Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, Some(&f.jit_code), Some(&f.fast_jit_code)),
-            Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), Some(&c.function.jit_code), Some(&c.function.fast_jit_code)),
+            Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, f.jit_code.get()),
+            Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code.get()),
             Some(HeapValue::Ref(inner)) => {
                  if let ValueKind::Object(inner_handle) = inner.kind() {
                      match vm.heap.get(inner_handle) {
-                        Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, None, None),
-                        Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), None, None),
+                        Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, 0),
+                        Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), 0),
                         _ => return
                      }
                  } else {
@@ -240,22 +282,28 @@ pub unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgr
         }
     }
     
-    let jit_code = jit_code_cell.map(|c| c.get()).unwrap_or(0);
+    let jit_code = jit_code_val;
     if jit_code != 0 {
          vm.tail_call_pending = true;
          vm.next_jit_code = jit_code;
     } else {
          let end_addr = if vm.jit.is_compiled(address) { 0 } else { super::analysis::scan_function_end(prog, address) };
-         match vm.jit.compile(&vm.global_vars, &vm.heap, prog, address, end_addr) {
+         match vm.jit.compile(&vm.global_vars, &mut vm.heap, &mut vm.jit_constants, &mut vm.symbol_table, prog, address, end_addr) {
              Ok(func) => {
-                 if let Some(cell) = jit_code_cell {
-                     if let Some(&code) = vm.jit.cache.get(&address) {
-                         cell.set(code as u64);
-                     }
-                 }
-                 if let Some(cell) = fast_jit_code_cell {
-                     if let Some(&code) = vm.jit.fast_cache.get(&address) {
-                         cell.set(code as u64);
+                 if let ValueKind::Object(handle) = resolved_func.kind() {
+                     let code_val = func as usize as u64;
+                     let fast_code_val = vm.jit.fast_cache.get(&address).map(|&x| x as usize as u64).unwrap_or(0);
+                     
+                     match vm.heap.get(handle) {
+                        Some(HeapValue::FuncRef(f)) => {
+                            f.jit_code.set(code_val);
+                            f.fast_jit_code.set(fast_code_val);
+                        },
+                        Some(HeapValue::Closure(c)) => {
+                            c.function.jit_code.set(code_val);
+                            c.function.fast_jit_code.set(fast_code_val);
+                        },
+                        _ => {}
                      }
                  }
                  
@@ -309,15 +357,15 @@ pub unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut Virtual
 
     let func = *registers.add(func_reg);
     
-    let (header, address, captures, jit_code_cell) = match func.kind() {
+    let (header, address, captures, jit_code_val) = match func.kind() {
         ValueKind::Object(handle) => match vm.heap.get(handle) {
-            Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, Some(&f.jit_code)),
-            Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), Some(&c.function.jit_code)),
+            Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, f.jit_code.get()),
+            Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code.get()),
             Some(HeapValue::Ref(inner)) => {
                  if let ValueKind::Object(inner_handle) = inner.kind() {
                      match vm.heap.get(inner_handle) {
-                        Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, None),
-                        Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), None),
+                        Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, 0),
+                        Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), 0),
                         _ => return
                      }
                  } else {
@@ -367,22 +415,33 @@ pub unsafe extern "C" fn helper_tail_call_symbol(vm: *mut Vm, prog: *mut Virtual
         }
     }
 
-    let jit_code = jit_code_cell.map(|c| c.get()).unwrap_or(0);
+    let jit_code = jit_code_val;
     if jit_code != 0 {
          vm.tail_call_pending = true;
          vm.next_jit_code = jit_code;
     } else {
          // println!("Compiling tail call target at {}", address);
          let end_addr = if vm.jit.is_compiled(address) { 0 } else { super::analysis::scan_function_end(prog, address) };
-         if let Ok(func) = vm.jit.compile(&vm.global_vars, &vm.heap, prog, address, end_addr) {
-             if let Some(cell) = jit_code_cell {
-                 if let Some(&code) = vm.jit.cache.get(&address) {
-                     cell.set(code as u64);
+         if let Ok(func_ptr) = vm.jit.compile(&vm.global_vars, &mut vm.heap, &mut vm.jit_constants, &mut vm.symbol_table, prog, address, end_addr) {
+             let code = func_ptr as usize as u64;
+             if let ValueKind::Object(handle) = func.kind() {
+                 match vm.heap.get(handle) {
+                     Some(HeapValue::FuncRef(f)) => { f.jit_code.set(code); }
+                     Some(HeapValue::Closure(c)) => { c.function.jit_code.set(code); }
+                     _ => {} // Handles Refs? Refs logic extracted 0 above. But Refs point to inner.
+                     // The logic above unpacked Refs to inner header/address.
+                     // So `func` is the original Ref?
+                     // If `func` is Ref, we should update the INNER object's JIT code.
+                     // But we don't have the inner handle easily here unless we unpack again.
+                     // This is an edge case. For now simple support.
                  }
+                 // If it was a Ref, we are not updating the cache. This means next time it recompiles or checks again.
+                 // Ideally we should resolve Ref in `func` variable too?
+                 // But `func` comes from register. 
              }
              
              vm.tail_call_pending = true;
-             vm.next_jit_code = func as usize as u64;
+             vm.next_jit_code = code;
          } else {
              println!("JIT compilation failed in tail call");
          }
@@ -494,25 +553,33 @@ pub unsafe extern "C" fn helper_load_string(vm: *mut Vm, prog: *mut VirtualProgr
 
 pub unsafe extern "C" fn helper_load_symbol(vm: *mut Vm, prog: *mut VirtualProgram, registers: *mut LispValue, dest_reg: usize, offset: u64) {
     let vm = &mut *vm;
+
+    // Check cache first
+    if let Some(&handle) = vm.symbol_opt_cache.get(&offset) {
+        *registers.add(dest_reg) = LispValue::object(handle);
+        return;
+    }
+
     let prog = &mut *prog;
     let bytecode = prog.get_bytecode();
-    let offset = offset as usize;
+    let offset_idx = offset as usize;
     
-    if offset + 8 <= bytecode.len() {
-        let len_bytes = &bytecode[offset..offset+8];
+    if offset_idx + 8 <= bytecode.len() {
+        let len_bytes = &bytecode[offset_idx..offset_idx+8];
         let len = i64::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
         
-        if offset + 8 + len <= bytecode.len() {
-            let str_bytes = &bytecode[offset+8..offset+8+len];
+        if offset_idx + 8 + len <= bytecode.len() {
+            let str_bytes = &bytecode[offset_idx+8..offset_idx+8+len];
             if let Ok(s) = std::str::from_utf8(str_bytes) {
-                vm.collect_garbage();
                 let handle = if let Some(&h) = vm.symbol_table.get(s) {
                     h
                 } else {
+                    vm.collect_garbage();
                     let h = vm.heap.alloc(HeapValue::Symbol(s.to_string()));
                     vm.symbol_table.insert(s.to_string(), h);
                     h
                 };
+                vm.symbol_opt_cache.insert(offset, handle);
                 *registers.add(dest_reg) = LispValue::object(handle);
             }
         }
@@ -552,11 +619,7 @@ pub unsafe extern "C" fn helper_cons(vm: *mut Vm, registers: *mut LispValue, des
     let car = *registers.add(car_reg);
     let cdr = *registers.add(cdr_reg);
     
-    vm.scratch_buffer.push(car);
-    vm.scratch_buffer.push(cdr);
-    vm.collect_garbage();
-    vm.scratch_buffer.pop();
-    vm.scratch_buffer.pop();
+    // vm.collect_garbage(); // alloc handles expansion.
     
     let handle = vm.heap.alloc(HeapValue::Pair(Pair { car, cdr }));
     *registers.add(dest_reg) = LispValue::object(handle);
@@ -605,29 +668,60 @@ pub unsafe extern "C" fn helper_prepare_map(vm: *mut Vm, prog: *mut VirtualProgr
             
             // Update list register with CDR
             vm.registers[list_idx] = cdr;
-            
+
+            // Check cache
             let regs_ptr = vm.registers.as_mut_ptr().add(vm.window_start);
-            let resolved_func = resolve_value(vm, regs_ptr, func_reg as u8);
+            let raw_func_val = *regs_ptr.add(func_reg);
             
-            let (header, address, captures, jit_code_cell, fast_jit_code_cell) = if let ValueKind::Object(handle) = resolved_func.kind() {
-                match vm.heap.get(handle) {
-                    Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, Some(&f.jit_code), Some(&f.fast_jit_code)),
-                    Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), Some(&c.function.jit_code), Some(&c.function.fast_jit_code)),
-                     Some(HeapValue::Ref(inner)) => {
-                         if let ValueKind::Object(inner_handle) = inner.kind() {
-                             match vm.heap.get(inner_handle) {
-                                Some(HeapValue::FuncRef(f)) => (f.header, f.address, None, None, None),
-                                Some(HeapValue::Closure(c)) => (c.function.header, c.function.address, Some(c.captures.clone()), None, None),
-                                _ => return 0
-                             }
-                         } else {
-                             return 0
-                         }
-                     },
-                    _ => return 0
+            let use_cache = if let Some(cache) = &vm.map_cache {
+                if let ValueKind::Object(h) = raw_func_val.kind() {
+                     h == cache.handle
+                } else {
+                    false
                 }
             } else {
-                return 0
+                false
+            };
+            
+            let (header, address, captures, jit_code, _fast_jit_code) = if use_cache {
+                 let cache = vm.map_cache.as_ref().unwrap();
+                 (cache.header, cache.address, cache.captures.clone(), cache.jit_code, cache.fast_jit_code)
+            } else {
+                let resolved_func = resolve_value(vm, regs_ptr, func_reg as u8);
+                
+                let (_h, head, addr, caps, jc, fjc) = if let ValueKind::Object(handle) = resolved_func.kind() {
+                    match vm.heap.get(handle) {
+                        Some(HeapValue::FuncRef(f)) => (handle, f.header, f.address, None, f.jit_code.get(), f.fast_jit_code.get()),
+                        Some(HeapValue::Closure(c)) => (handle, c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code.get(), c.function.fast_jit_code.get()),
+                         Some(HeapValue::Ref(inner)) => {
+                             if let ValueKind::Object(inner_handle) = inner.kind() {
+                                 match vm.heap.get(inner_handle) {
+                                    Some(HeapValue::FuncRef(f)) => (inner_handle, f.header, f.address, None, 0, 0),
+                                    Some(HeapValue::Closure(c)) => (inner_handle, c.function.header, c.function.address, Some(c.captures.clone()), 0, 0),
+                                    _ => return 0
+                                 }
+                             } else {
+                                 return 0
+                             }
+                         },
+                        _ => return 0
+                    }
+                } else {
+                    return 0
+                };
+                
+                if let ValueKind::Object(orig_handle) = raw_func_val.kind() {
+                      vm.map_cache = Some(crate::vm::vm::MapCache {
+                          handle: orig_handle,
+                          header: head,
+                          address: addr,
+                          captures: caps.clone(),
+                          jit_code: jc,
+                          fast_jit_code: fjc
+                      });
+                }
+                
+                (head, addr, caps, jc, fjc)
             };
             
             let param_start = temp_reg;
@@ -652,25 +746,17 @@ pub unsafe extern "C" fn helper_prepare_map(vm: *mut Vm, prog: *mut VirtualProgr
             
             vm.registers[vm.window_start] = car;
             
-            let jit_code = jit_code_cell.map(|c| c.get()).unwrap_or(0);
             if jit_code != 0 {
                  return jit_code;
-            } else {
-                let end_addr = super::analysis::scan_function_end(prog, address);
-                if let Ok(func) = vm.jit.compile(&vm.global_vars, &vm.heap, prog, address, end_addr) {
-                     if let Some(cell) = jit_code_cell {
-                         if let Some(&code) = vm.jit.cache.get(&address) {
-                             cell.set(code as u64);
-                         }
-                     }
-                     if let Some(cell) = fast_jit_code_cell {
-                         if let Some(&code) = vm.jit.fast_cache.get(&address) {
-                             cell.set(code as u64);
-                         }
-                     }
-                     return func as usize as u64;
-                }
-                return 0;
+            }
+
+            let end_addr = if vm.jit.is_compiled(address) { 0 } else { super::analysis::scan_function_end(prog, address) };
+            if let Ok(func) = vm.jit.compile(&vm.global_vars, &mut vm.heap, &mut vm.jit_constants, &mut vm.symbol_table, prog, address, end_addr) {
+                    let code = func as usize as u64;
+                    if let Some(cache) = &mut vm.map_cache {
+                        cache.jit_code = code;
+                    }
+                    return code;
             }
         }
     }

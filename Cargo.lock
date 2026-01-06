@@ -407,6 +407,7 @@ dependencies = [
  "iced-x86",
  "logos",
  "mimalloc",
+ "rustc-hash",
  "serde",
  "serde_json",
  "unicase",

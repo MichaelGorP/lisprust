@@ -1,17 +1,20 @@
 use std::collections::{HashMap, HashSet};
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use cranelift::prelude::*;
 use cranelift::codegen::ir::BlockArg;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{DataDescription, Linkage, Module};
-use crate::vm::vp::{Value as LispValue, ValueKind, Instr, JumpCondition, VirtualProgram, FunctionHeader, HeapValue};
+use rustc_hash::FxHashMap;
+use crate::vm::vp::{Value as LispValue, ValueKind, Instr, JumpCondition, VirtualProgram, FunctionHeader, HeapValue, FunctionData};
 use crate::vm::vm::Vm;
-use crate::vm::gc::Arena;
+use crate::vm::gc::{Arena, Handle};
 
 pub mod jit_types;
 pub mod analysis;
 pub mod vm_helpers;
+pub mod vm_helpers_ext;
 
 use self::jit_types::JitType;
 use self::analysis::{analyze_function, scan_function_end};
@@ -22,14 +25,65 @@ pub struct Jit {
     ctx: codegen::Context,
     _data_ctx: DataDescription,
     module: JITModule,
-    cache: HashMap<u64, *const u8>,
-    fast_cache: HashMap<u64, *const u8>,
-    signatures: HashMap<u64, (Vec<JitType>, JitType)>,
-    pending_funcs: HashMap<u64, cranelift_module::FuncId>,
+    cache: FxHashMap<u64, *const u8>,
+    fast_cache: FxHashMap<u64, *const u8>,
+    signatures: FxHashMap<u64, (Vec<JitType>, JitType)>,
+    pending_funcs: FxHashMap<u64, cranelift_module::FuncId>,
     pub function_map: Arc<Mutex<Vec<(usize, usize, String)>>>,
+    pub constant_map: FxHashMap<ConstantKey, usize>,
+}
+
+#[derive(Hash, PartialEq, Eq, Clone)]
+pub enum ConstantKey {
+    Symbol(String),
+    String(String),
+    FuncRef(u64), // Header address
 }
 
 impl Jit {
+    fn get_constant_index(&mut self, heap: &mut Arena<HeapValue>, jit_constants: &mut Vec<Handle>, symbol_table: &mut FxHashMap<String, Handle>, prog: &mut VirtualProgram, key: ConstantKey) -> usize {
+        if let Some(&idx) = self.constant_map.get(&key) {
+             return idx;
+        }
+        
+        let handle = match &key {
+            ConstantKey::Symbol(s) => {
+                 if let Some(&h) = symbol_table.get(s) {
+                     h
+                 } else {
+                     let h = heap.alloc(HeapValue::Symbol(s.clone()));
+                     symbol_table.insert(s.clone(), h);
+                     h
+                 }
+            },
+            ConstantKey::String(s) => {
+                 heap.alloc(HeapValue::String(s.clone()))
+            },
+            ConstantKey::FuncRef(header_addr) => {
+                 let pos = prog.cursor.position();
+                 prog.cursor.set_position(*header_addr);
+                 let header = FunctionHeader::read(&mut prog.cursor);
+                 prog.cursor.set_position(pos);
+                 
+                 let func_addr = *header_addr + std::mem::size_of::<FunctionHeader>() as u64;
+                 let jit_code = self.cache.get(&func_addr).map(|&ptr| ptr as u64).unwrap_or(0);
+                 
+                 let fd = FunctionData{
+                     header, 
+                     address: func_addr, 
+                     jit_code: Cell::new(jit_code), 
+                     fast_jit_code: Cell::new(0)
+                 };
+                 heap.alloc(HeapValue::FuncRef(fd))
+            }
+        };
+        
+        let idx = jit_constants.len();
+        jit_constants.push(handle);
+        self.constant_map.insert(key, idx);
+        idx
+    }
+
     pub fn new() -> Self {
         let mut flag_builder = settings::builder();
         flag_builder.set("use_colocated_libcalls", "false").unwrap();
@@ -49,10 +103,13 @@ impl Jit {
         builder.symbol("helper_check_condition", helper_check_condition as *const u8);
         builder.symbol("helper_load_global", helper_load_global as *const u8);
         builder.symbol("helper_define", helper_define as *const u8);
+        builder.symbol("helper_get_jit_constant", crate::vm::jit::vm_helpers_ext::helper_get_jit_constant as *const u8);
         builder.symbol("helper_load_func_ref", helper_load_func_ref as *const u8);
         builder.symbol("helper_call_symbol", helper_call_symbol as *const u8);
         builder.symbol("helper_tail_call_symbol", helper_tail_call_symbol as *const u8);
         builder.symbol("helper_check_self_recursion", helper_check_self_recursion as *const u8);
+        builder.symbol("helper_list", helper_list as *const u8);
+
         builder.symbol("helper_make_closure", helper_make_closure as *const u8);
         builder.symbol("helper_make_ref", helper_make_ref as *const u8);
         builder.symbol("helper_set_ref", helper_set_ref as *const u8);
@@ -77,11 +134,12 @@ impl Jit {
             ctx: module.make_context(),
             _data_ctx: DataDescription::new(),
             module,
-            cache: HashMap::new(),
-            fast_cache: HashMap::new(),
-            signatures: HashMap::new(),
-            pending_funcs: HashMap::new(),
+            cache: FxHashMap::default(),
+            fast_cache: FxHashMap::default(),
+            signatures: FxHashMap::default(),
+            pending_funcs: FxHashMap::default(),
             function_map: Arc::new(Mutex::new(Vec::new())),
+            constant_map: FxHashMap::default(),
         }
     }
 
@@ -177,14 +235,14 @@ impl Jit {
         Some(self.module.get_finalized_function(wrapper_id))
     }
 
-    fn try_compile_fast(&mut self, global_vars: &Vec<LispValue>, heap: &Arena<HeapValue>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Option<*const u8> {
+    fn try_compile_fast(&mut self, global_vars: &Vec<LispValue>, heap: &mut Arena<HeapValue>, jit_constants: &mut Vec<Handle>, symbol_table: &mut FxHashMap<String, Handle>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Option<*const u8> {
         if let Some(&code) = self.fast_cache.get(&start_addr) {
             return self.generate_wrapper(prog, start_addr, code);
         }
 
         self.pending_funcs.clear();
         
-        let _ = self.compile_fast_internal(global_vars, heap, prog, start_addr, end_addr)?;
+        let _ = self.compile_fast_internal(global_vars, heap, jit_constants, symbol_table, prog, start_addr, end_addr)?;
         
         if let Err(e) = self.module.finalize_definitions() {
              println!("Finalize definitions failed: {}", e);
@@ -202,7 +260,7 @@ impl Jit {
         self.generate_wrapper(prog, start_addr, *fast_ptr)
     }
 
-    fn compile_fast_internal(&mut self, global_vars: &Vec<LispValue>, heap: &Arena<HeapValue>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Option<cranelift_module::FuncId> {
+    fn compile_fast_internal(&mut self, global_vars: &Vec<LispValue>, heap: &mut Arena<HeapValue>, jit_constants: &mut Vec<Handle>, symbol_table: &mut FxHashMap<String, Handle>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Option<cranelift_module::FuncId> {
         if let Some(&id) = self.pending_funcs.get(&start_addr) {
             return Some(id);
         }
@@ -471,7 +529,7 @@ impl Jit {
                              builder.ins().return_call_indirect(sig_ref, callee, &args);
                              break;
                         } else {
-                             if let Some(tgt_id) = self.compile_fast_internal(global_vars, heap, prog, target_addr, target_end) {
+                             if let Some(tgt_id) = self.compile_fast_internal(global_vars, heap, jit_constants, symbol_table, prog, target_addr, target_end) {
                                  let local_tgt = self.module.declare_func_in_func(tgt_id, &mut builder.func);
                                  builder.ins().return_call(local_tgt, &args);
                                  break;
@@ -513,6 +571,58 @@ impl Jit {
                         };
                         builder.def_var(vars[dest], v);
                         const_funcs.remove(&dest);
+                    },
+                    Instr::LoadSymbol => {
+                        let dest = opcode[1] as usize;
+                        let name = prog.read_string().unwrap();
+                        let handle = if let Some(&h) = symbol_table.get(&name) {
+                            h
+                        } else {
+                            let h = heap.alloc(HeapValue::Symbol(name.clone()));
+                            symbol_table.insert(name, h);
+                            h
+                        };
+                        let mut sig_helper_get_jit_constant = self.module.make_signature();
+                        sig_helper_get_jit_constant.params.push(AbiParam::new(self.module.target_config().pointer_type())); // vm
+                        sig_helper_get_jit_constant.params.push(AbiParam::new(types::I64)); // idx
+                        sig_helper_get_jit_constant.returns.push(AbiParam::new(types::I64)); // value
+                        let callee_helper_get_jit_constant = self.module.declare_function("helper_get_jit_constant", Linkage::Import, &sig_helper_get_jit_constant).map_err(|e| e.to_string()).ok()?;
+                        let local_helper_get_jit_constant = self.module.declare_func_in_func(callee_helper_get_jit_constant, &mut builder.func);
+                        
+                        let idx = jit_constants.len() as i64;
+                        jit_constants.push(handle);
+                        
+                        let ptr_type = self.module.target_config().pointer_type();
+                        // Fast JIT doesn't have vm_ptr in args! The wrapper has.
+                        // Wait. Fast JIT (compile_fast_internal) generates a function call signature (f64 or i64 ...). 
+                        // It does NOT take `vm`.
+                        // This means Fast JIT functions cannot call runtime helpers easily unless passed `vm`.
+                        // But Fast JIT functions only do arithmetic.
+                        // `Instr::LoadSymbol` breaks the "Fast JIT" constraint if it requires VM helper.
+                        // 
+                        // But I need to load instructions. 
+                        // If I can't pass VM, I can't look up JIT constants at runtime.
+                        // 
+                        // Fast JIT functions are "leaf" functions or call other Fast JIT functions.
+                        // They are not passed `vm`.
+                        // The wrapper `generate_wrapper` calls the fast function. The wrapper has `vm`.
+                        // 
+                        // If `deriv` uses `LoadSymbol`, it cannot be Fast JIT compiled if Fast JIT cannot access memory/VM.
+                        // 
+                        // Option: Add `vm` parameter to Fast JIT signature?
+                        // If I do that, the calling convention changes.
+                        // `Fast Jit` Signature: (args...) -> result.
+                        // If I change it to (vm, args...) -> result, it's fine.
+                        // But recursive calls need to pass `vm`.
+                        // And the wrapper needs to pass `vm`.
+                        
+                        // Let's abort Fast JIT for `LoadSymbol` for now, or upgrade Fast JIT to take `vm`.
+                        // Upgrading Fast JIT seems better but risky for now.
+                        // Reverting `LoadSymbol` here means `compile_fast_internal` returns `None`.
+                        // Then it falls back to Slow JIT (wrapper around linear scan), which DOES have `vm`.
+                        
+                        prog.cursor.set_position(original_pos);
+                        return None;
                     },
                     Instr::CopyReg => {
                         let v = builder.use_var(vars[opcode[2] as usize]);
@@ -597,7 +707,7 @@ impl Jit {
                              let res = builder.inst_results(call)[0];
                              builder.def_var(vars[target_reg as usize], res);
                         } else {
-                             if let Some(tgt_id) = self.compile_fast_internal(global_vars, heap, prog, target_addr, target_end) {
+                             if let Some(tgt_id) = self.compile_fast_internal(global_vars, heap, jit_constants, symbol_table, prog, target_addr, target_end) {
                                  let local_tgt = self.module.declare_func_in_func(tgt_id, &mut builder.func);
                                  let call = builder.ins().call(local_tgt, &args);
                                  let res = builder.inst_results(call)[0];
@@ -692,7 +802,7 @@ impl Jit {
                         break;
                     },
                     _ => {
-                        println!("Fast JIT: Unsupported instr {:?} (in default arm)", instr);
+                        // println!("Fast JIT: Unsupported instr {:?} (in default arm)", instr);
                         prog.cursor.set_position(original_pos);
                         return None;
                     }
@@ -717,14 +827,14 @@ impl Jit {
         self.cache.contains_key(&start_addr)
     }
 
-    pub fn compile(&mut self, global_vars: &Vec<LispValue>, heap: &Arena<HeapValue>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Result<fn(*mut Vm, *mut VirtualProgram, *mut LispValue), String> {
+    pub fn compile(&mut self, global_vars: &Vec<LispValue>, heap: &mut Arena<HeapValue>, jit_constants: &mut Vec<Handle>, symbol_table: &mut FxHashMap<String, Handle>, prog: &mut VirtualProgram, start_addr: u64, end_addr: u64) -> Result<fn(*mut Vm, *mut VirtualProgram, *mut LispValue), String> {
         self.module.clear_context(&mut self.ctx);
         
         if let Some(&code) = self.cache.get(&start_addr) {
             return Ok(unsafe { std::mem::transmute(code) });
         }
 
-        if let Some(wrapper) = self.try_compile_fast(global_vars, heap, prog, start_addr, end_addr) {
+        if let Some(wrapper) = self.try_compile_fast(global_vars, heap, jit_constants, symbol_table, prog, start_addr, end_addr) {
             self.cache.insert(start_addr, wrapper);
             return Ok(unsafe { std::mem::transmute(wrapper) });
         }
@@ -883,6 +993,13 @@ impl Jit {
         builder.switch_to_block(loop_header);
 
         // Import helper functions
+        let mut sig_helper_get_jit_constant = self.module.make_signature();
+        sig_helper_get_jit_constant.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_get_jit_constant.params.push(AbiParam::new(types::I64)); // idx
+        sig_helper_get_jit_constant.returns.push(AbiParam::new(types::I64)); // value
+        let callee_helper_get_jit_constant = self.module.declare_function("helper_get_jit_constant", Linkage::Import, &sig_helper_get_jit_constant).map_err(|e| e.to_string())?;
+        let local_helper_get_jit_constant = self.module.declare_func_in_func(callee_helper_get_jit_constant, &mut builder.func);
+
         let mut sig_helper_op = self.module.make_signature();
         sig_helper_op.params.push(AbiParam::new(ptr_type)); // vm
         sig_helper_op.params.push(AbiParam::new(ptr_type)); // prog
@@ -1002,6 +1119,15 @@ impl Jit {
         let callee_helper_call_function = self.module.declare_function("helper_call_function", Linkage::Import, &sig_helper_call_function).map_err(|e| e.to_string())?;
         let local_helper_call_function = self.module.declare_func_in_func(callee_helper_call_function, &mut builder.func);
 
+        let mut sig_helper_list = self.module.make_signature();
+        sig_helper_list.params.push(AbiParam::new(ptr_type)); // vm
+        sig_helper_list.params.push(AbiParam::new(ptr_type)); // registers
+        sig_helper_list.params.push(AbiParam::new(types::I64)); // dest
+        sig_helper_list.params.push(AbiParam::new(types::I64)); // start
+        sig_helper_list.params.push(AbiParam::new(types::I64)); // count
+        let callee_helper_list = self.module.declare_function("helper_list", Linkage::Import, &sig_helper_list).map_err(|e| e.to_string())?;
+        let local_helper_list = self.module.declare_func_in_func(callee_helper_list, &mut builder.func);
+
         let mut sig_helper_load_string = self.module.make_signature();
         sig_helper_load_string.params.push(AbiParam::new(ptr_type)); // vm
         sig_helper_load_string.params.push(AbiParam::new(ptr_type)); // prog
@@ -1018,7 +1144,7 @@ impl Jit {
         sig_helper_load_symbol.params.push(AbiParam::new(types::I64)); // dest_reg
         sig_helper_load_symbol.params.push(AbiParam::new(types::I64)); // offset
         let callee_helper_load_symbol = self.module.declare_function("helper_load_symbol", Linkage::Import, &sig_helper_load_symbol).map_err(|e| e.to_string())?;
-        let local_helper_load_symbol = self.module.declare_func_in_func(callee_helper_load_symbol, &mut builder.func);
+        // let local_helper_load_symbol = self.module.declare_func_in_func(callee_helper_load_symbol, &mut builder.func); We use constant pool now
 
         let mut sig_helper_car = self.module.make_signature();
         sig_helper_car.params.push(AbiParam::new(ptr_type)); // vm
@@ -1233,6 +1359,18 @@ impl Jit {
                     
                     is_terminated = false;
                 },
+                Instr::LoadNil => {
+                    let dest_reg = opcode[1] as i64;
+                    
+                    let val_size = 8;
+                    let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
+                    
+                    let raw = builder.ins().iconst(types::I64, 3); // IMM_NIL = 3
+                    
+                    builder.ins().store(MemFlags::trusted(), raw, dest_ptr, 0);
+                    
+                    is_terminated = false;
+                },
                 Instr::LoadGlobal => {
                     let dest_reg = opcode[1] as i64;
                     let sym_id = prog.read_int().unwrap();
@@ -1254,16 +1392,7 @@ impl Jit {
                     builder.ins().call(local_helper_define, &[vm_ptr, registers_ptr, src_reg_const, sym_id_const]);
                     is_terminated = false;
                 },
-                Instr::LoadFuncRef => {
-                    let dest_reg = opcode[1] as i64;
-                    let header_addr = prog.read_int().unwrap();
-                    
-                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
-                    let header_addr_const = builder.ins().iconst(types::I64, header_addr);
-                    
-                    builder.ins().call(local_helper_load_func_ref, &[vm_ptr, prog_ptr, registers_ptr, dest_reg_const, header_addr_const]);
-                    is_terminated = false;
-                },
+
                 Instr::LoadString => {
                     let dest_reg = opcode[1] as i64;
                     let offset = prog.current_address() as i64;
@@ -1277,13 +1406,66 @@ impl Jit {
                 },
                 Instr::LoadSymbol => {
                     let dest_reg = opcode[1] as i64;
-                    let offset = prog.current_address() as i64;
-                    prog.read_string().unwrap();
+                    let name = prog.read_string().unwrap();
+
+                    let handle = if let Some(&h) = symbol_table.get(&name) {
+                        h
+                    } else {
+                        let h = heap.alloc(HeapValue::Symbol(name.clone()));
+                        symbol_table.insert(name, h);
+                        h
+                    };
+
+                    let idx = jit_constants.len() as i64;
+                    jit_constants.push(handle);
                     
-                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
-                    let offset_const = builder.ins().iconst(types::I64, offset);
+                    let idx_const = builder.ins().iconst(types::I64, idx);
+                    let call = builder.ins().call(local_helper_get_jit_constant, &[vm_ptr, idx_const]);
+                    let val = builder.inst_results(call)[0];
+
+                    let dest_offset = (dest_reg as i32) * 8;
+                    builder.ins().store(MemFlags::trusted(), val, registers_ptr, dest_offset);
+
+                    is_terminated = false;
+                },
+                Instr::LoadFuncRef => {
+                    let dest_reg = opcode[1] as i64;
+                    let address = prog.read_int().unwrap() as u64;
+
+                    let key = ConstantKey::FuncRef(address);
                     
-                    builder.ins().call(local_helper_load_symbol, &[vm_ptr, prog_ptr, registers_ptr, dest_reg_const, offset_const]);
+                    let idx = if let Some(&idx) = self.constant_map.get(&key) {
+                        idx
+                    } else {
+                         let pos = prog.cursor.position();
+                         prog.cursor.set_position(address);
+                         let header = FunctionHeader::read(&mut prog.cursor);
+                         prog.cursor.set_position(pos);
+
+                         let func_addr = address + std::mem::size_of::<FunctionHeader>() as u64;
+                         let jit_code = self.cache.get(&func_addr).map(|&ptr| ptr as u64).unwrap_or(0);
+
+                         let fd = FunctionData{
+                             header, 
+                             address: func_addr, 
+                             jit_code: Cell::new(jit_code), 
+                             fast_jit_code: Cell::new(0)
+                         };
+                         let handle = heap.alloc(HeapValue::FuncRef(fd));
+                         
+                         let idx = jit_constants.len();
+                         jit_constants.push(handle);
+                         self.constant_map.insert(key, idx);
+                         idx
+                    } as i64;
+                    
+                    let idx_const = builder.ins().iconst(types::I64, idx);
+                    let call = builder.ins().call(local_helper_get_jit_constant, &[vm_ptr, idx_const]);
+                    let val = builder.inst_results(call)[0];
+                    
+                    let dest_offset = (dest_reg as i32) * 8;
+                    builder.ins().store(MemFlags::trusted(), val, registers_ptr, dest_offset);
+                    
                     is_terminated = false;
                 },
                 Instr::CallSymbol => {
@@ -1371,6 +1553,28 @@ impl Jit {
                     // Reload registers_ptr as it might have changed due to GC
                     let call_inst = builder.ins().call(local_helper_get_registers_ptr, &[vm_ptr]);
                     registers_ptr = builder.inst_results(call_inst)[0];
+                    
+                    is_terminated = false;
+                },
+                Instr::List => {
+                    let dest_reg = opcode[1] as i64;
+                    let start_reg = opcode[2] as i64;
+                    let count = opcode[3] as i64;
+
+                    let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
+                    let start_reg_const = builder.ins().iconst(types::I64, start_reg);
+                    let count_const = builder.ins().iconst(types::I64, count);
+
+                    builder.ins().call(local_helper_list, &[vm_ptr, registers_ptr, dest_reg_const, start_reg_const, count_const]);
+
+                    // Reload registers_ptr as it might have changed due to GC (implicit in allocation) - wait, List allocs, but helper_list doesn't call collect_garbage explicitly, BUT alloc MIGHT trigger expansion. 
+                    // Wait, helper_list in my implementation does NOT trigger GC explicitly.
+                    // But if I want to be safe for future, or if alloc triggers GC (it doesn't currently), I should reload.
+                    // However, `helper_cons` DOES call `helper_get_registers_ptr`.
+                    // My `helper_list` doesn't currently call GC.
+                    // But maybe I should add `collect_garbage` if I implement bulk alloc safely?
+                    // For now, no GC. But let's reload registers_ptr just in case implementation changes.
+                    // Actually, if helper_list calls allocations, and if we change alloc to trigger GC, this is needed.
                     
                     is_terminated = false;
                 },
@@ -1548,8 +1752,20 @@ impl Jit {
                     let t1_is_int = builder.ins().icmp_imm(IntCC::Equal, tag1, 1);
                     let t2_is_int = builder.ins().icmp_imm(IntCC::Equal, tag2, 1);
                     let both_int = builder.ins().band(t1_is_int, t2_is_int);
+
+                    // TAG_OBJECT = 0. Allow Eq/Neq on objects (assuming pointer equality/identity)
+                    let use_obj_fast_path = if matches!(instr, Instr::Eq | Instr::Neq) {
+                         let t1_is_obj = builder.ins().icmp_imm(IntCC::Equal, tag1, 0);
+                         let t2_is_obj = builder.ins().icmp_imm(IntCC::Equal, tag2, 0);
+                         let both_obj = builder.ins().band(t1_is_obj, t2_is_obj);
+                         both_obj
+                    } else {
+                         builder.ins().iconst(types::I32, 0)
+                    };
                     
-                    builder.ins().brif(both_int, block_int, &[], block_slow, &[]);
+                    let fast_path = builder.ins().bor(both_int, use_obj_fast_path);
+                    
+                    builder.ins().brif(fast_path, block_int, &[], block_slow, &[]);
 
                     builder.switch_to_block(block_dispatch);
                     builder.ins().jump(block_slow, &[]); // Skip dispatch for now

@@ -1,5 +1,5 @@
 use std::{cell::Cell, io::{Cursor, Read}, mem::size_of, ops::Range, collections::HashMap};
-use crate::vm::gc::{Handle, Trace, Arena};
+use crate::vm::gc::{Handle, Trace, Arena, GcVisitor};
 
 use enum_display::EnumDisplay;
 
@@ -46,6 +46,7 @@ pub(super) enum Instr {
     Car,
     Cdr,
     Cons,
+    List,
     IsPair,
     IsEq,
     IsNull,
@@ -104,6 +105,7 @@ impl TryFrom<u8> for Instr {
             x if x == Instr::Car as u8 => Ok(Instr::Car),
             x if x == Instr::Cdr as u8 => Ok(Instr::Cdr),
             x if x == Instr::Cons as u8 => Ok(Instr::Cons),
+            x if x == Instr::List as u8 => Ok(Instr::List),
             x if x == Instr::IsPair as u8 => Ok(Instr::IsPair),
             x if x == Instr::IsEq as u8 => Ok(Instr::IsEq),
             x if x == Instr::IsNull as u8 => Ok(Instr::IsNull),
@@ -167,7 +169,7 @@ pub struct FunctionData {
 }
 
 impl Trace<HeapValue> for FunctionData {
-    fn trace(&self, _arena: &mut Arena<HeapValue>) {}
+    fn trace(&mut self, _visitor: &mut impl GcVisitor) {}
 }
 
 impl PartialEq for FunctionData {
@@ -183,9 +185,9 @@ pub struct Pair {
 }
 
 impl Trace<HeapValue> for Pair {
-    fn trace(&self, arena: &mut Arena<HeapValue>) {
-        self.car.trace(arena);
-        self.cdr.trace(arena);
+    fn trace(&mut self, visitor: &mut impl GcVisitor) {
+        self.car.trace(visitor);
+        self.cdr.trace(visitor);
     }
 }
 
@@ -205,10 +207,10 @@ impl std::fmt::Debug for ClosureData {
 }
 
 impl Trace<HeapValue> for ClosureData {
-    fn trace(&self, arena: &mut Arena<HeapValue>) {
-        self.function.trace(arena);
-        for capture in &self.captures {
-            capture.trace(arena);
+    fn trace(&mut self, visitor: &mut impl GcVisitor) {
+        self.function.trace(visitor);
+        for capture in &mut self.captures {
+            capture.trace(visitor);
         }
     }
 }
@@ -243,13 +245,13 @@ impl std::fmt::Display for HeapValue {
 }
 
 impl Trace<HeapValue> for HeapValue {
-    fn trace(&self, arena: &mut Arena<HeapValue>) {
+    fn trace(&mut self, visitor: &mut impl GcVisitor) {
         match self {
             HeapValue::String(_) | HeapValue::Symbol(_) => {},
-            HeapValue::Pair(p) => p.trace(arena),
-            HeapValue::FuncRef(f) => f.trace(arena),
-            HeapValue::Closure(c) => c.trace(arena),
-            HeapValue::Ref(v) => v.trace(arena),
+            HeapValue::Pair(p) => p.trace(visitor),
+            HeapValue::FuncRef(f) => f.trace(visitor),
+            HeapValue::Closure(c) => c.trace(visitor),
+            HeapValue::Ref(v) => v.trace(visitor),
         }
     }
 }
@@ -364,6 +366,8 @@ impl Value {
         !self.is_bool() || self.as_bool()
     }
 
+    pub const fn raw(&self) -> u64 { self.0 }
+
     pub fn kind(&self) -> ValueKind {
         if self.is_int() { ValueKind::Integer(self.as_int()) }
         else if self.is_float() { ValueKind::Float(self.as_float()) }
@@ -421,9 +425,12 @@ impl std::fmt::Display for Value {
 }
 
 impl Trace<HeapValue> for Value {
-    fn trace(&self, arena: &mut Arena<HeapValue>) {
+    fn trace(&mut self, visitor: &mut impl GcVisitor) {
         if self.is_object() {
-            arena.mark(self.as_handle());
+            let mut handle = self.as_handle();
+            visitor.visit(&mut handle);
+            // Updating the value with new handle
+            *self = Value::object(handle);
         }
     }
 }
