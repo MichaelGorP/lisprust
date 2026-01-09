@@ -1,6 +1,4 @@
 
-use std::mem::size_of;
-
 /// A handle to an object in the arena.
 /// It is essentially an index into the arena's storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -74,8 +72,9 @@ impl<T> Arena<T> {
     // Internal: expands the arena by adding a new chunk
     #[inline(never)]
     fn expand(&mut self) {
-        let mut new_chunk = Vec::with_capacity(CHUNK_SIZE);
-        unsafe { new_chunk.set_len(CHUNK_SIZE); }
+        // Use zeroed memory to avoid undefined behavior with uninitialized reads
+        // This is safer with custom allocators like MiMalloc
+        let mut new_chunk = vec![Slot::Forwarded(Handle(0)); CHUNK_SIZE];
         
         self.chunk_base = new_chunk.as_mut_ptr();
         self.chunks.push(new_chunk);
@@ -256,69 +255,9 @@ where T: Trace<T> + Clone
                  let chunk = new_chunks_ptr.add(c_idx);
                  let slot = (*chunk).get_unchecked_mut(s_idx);
                  if let Slot::Occupied(val) = slot {
-                     // We need to trace it. Val is T.
-                     // Trace expects &mut self (val) and &mut visitor.
-                     // This is tricky: visitor is borrowed by new_chunks_ptr? No.
-                     // But val borrows from visitor.new_chunks.
-                     // We cannot pass &mut visitor to val.trace because visitor owns val.
-                     // Workaround: We only need `visit` method from visitor.
-                     // We can't easily adhere to the Trace trait signature if it takes full visitor.
-                     // Unless we don't access new_chunks inside visit?
-                     // Visit accesses old_chunks and new_chunks(alloc).
-                     
-                     // REALITY CHECK: Standard copying GC uses two pointers (scan, free).
-                     // We are using a Visitor pattern which complicates "Scanning".
-                     
-                     // SOLUTION: We need to pull the value out, trace it, put it back?
-                     // No, Trace mutates the value (update handles).
-                     // We can use a specialized "Scanner" that holds references differently?
-                     
-                     // Hack: Cast visitor to raw ptr and back to bypass borrow checker implies we know it's safe.
-                     // Is it safe?
-                     // val is in visitor.new_chunks.
-                     // val.trace calls visitor.visit.
-                     // visitor.visit touches old_chunks and pushes to new_chunks (append).
-                     // It does NOT invalidate pointers to existing items in new_chunks (Vec<Vec> is stable if we only push new chunks).
-                     // BUT we push to `gray_queue` in visitor.
-                     
-                     // It is statistically safe if we don't realloc the chunk vector *while* holding reference to an element.
-                     // `expand` pushes to `new_chunks`. This might realloc `new_chunks` vector backing store.
-                     // So `chunk` pointer might be invalidated!
-                     
-                     // Fix: `expand` invalidates chunk pointers.
-                     // We must NOT hold a pointer to `val` while calling `visit` (which calls `alloc` -> `expand`).
-                     
-                     // PROPER FIX: 
-                     // Iterative scanning often uses an index (c_idx, s_idx).
-                     // We handle one object.
-                     // 1. Read object at (c_idx, s_idx).
-                     // 2. Trace it. Trace will call `visit`.
-                     // 3. `visit` might `alloc`. `alloc` might `expand`.
-                     // 4. If `expand` happens, `new_chunks` moves.
-                     
-                     // So we cannot pass `&mut T` to `trace`.
-                     // `Trace` trait requires `&mut self`.
-                     // This implies T must be pinned or we are careful.
-                     
-                     // But wait, `Trace` updates handles INSIDE T.
-                     // T is `HeapValue`. `Pair { car: Value, ... }`.
-                     // `Value` is POD.
-                     // If we hold `&mut T`, we point into the vector buffer.
-                     // If buffer reallocs, `&mut T` dangles.
-                     
-                     // We MUST prevent realloc of `new_chunks` while tracing.
-                     // OR we reserve enough space? Impossible to know.
-                     
-                     // Option B: `gray_queue` holds indices.
-                     // We process one object.
-                     // We need to update that object.
-                     // `trace` scans fields.
-                     // Can we copy the object out, trace it, write it back?
-                     // T is HeapValue. Contains Strings, Vectors (Closure).
-                     // `Clone` exists.
-                     // Costly? Maybe.
-                     // But safe.
-                     // Let's try: Clone, Trace, Write Back.
+                     // To avoid borrowing conflicts when tracing `val` (which is inside `visitor.new_chunks`)
+                     // while passing `visitor` to `trace`, we clone the value, trace it, and write it back.
+                     // This ensures memory safety even if `new_chunks` reallocates.
                      
                      let mut temp_val = val.clone();
                      temp_val.trace(&mut visitor);
@@ -367,8 +306,8 @@ pub struct CopyingVisitor<'a, T> {
 impl<'a, T: Clone> CopyingVisitor<'a, T> {
     #[inline(never)]
     fn expand(&mut self) {
-        let mut new_chunk = Vec::with_capacity(CHUNK_SIZE);
-        unsafe { new_chunk.set_len(CHUNK_SIZE); }
+        // Use initialized memory to avoid undefined behavior
+        let mut new_chunk = vec![Slot::Forwarded(Handle(0)); CHUNK_SIZE];
         
         self.chunk_base = new_chunk.as_mut_ptr();
         self.new_chunks.push(new_chunk);
@@ -427,7 +366,6 @@ impl<'a, T: Clone> GcVisitor for CopyingVisitor<'a, T> {
              Slot::Forwarded(new_handle) => {
                  *handle = *new_handle;
              },
-             _ => {}
          }
     }
 }

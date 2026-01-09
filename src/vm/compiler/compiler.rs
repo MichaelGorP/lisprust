@@ -181,7 +181,7 @@ impl<'a> Compiler<'a> {
                     if arg_regs.is_empty() {
                         self.bytecode.store_opcode(Instr::LoadNil, result_reg, 0, 0);
                     } else {
-                        let mut current_cdr = self.scopes.allocate_reg()?;
+                        let current_cdr = self.scopes.allocate_reg()?;
                         self.bytecode.store_opcode(Instr::LoadNil, current_cdr, 0, 0);
                         
                         // We need the arguments to be contiguous for Instr::List

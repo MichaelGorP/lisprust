@@ -226,10 +226,13 @@ pub unsafe extern "C" fn helper_call_function(vm: *mut Vm, prog: *mut VirtualPro
     
     let Some(function) = prog.get_function(func_id) else { return };
     
-    let args_slice = std::slice::from_raw_parts(registers.add(start_reg), reg_count);
+    let args = std::slice::from_raw_parts(registers.add(start_reg), reg_count).to_vec();
     
-    match function(vm, args_slice) {
-        Ok(val) => *registers.add(dest_reg) = val,
+    match function(vm, &args) {
+        Ok(val) => {
+             let target_ptr = vm.registers.as_mut_ptr().add(vm.window_start + dest_reg);
+             *target_ptr = val;
+        },
         Err(e) => panic!("Runtime error: {}", e),
     }
 }
@@ -282,11 +285,8 @@ pub unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgr
         }
     }
     
-    let jit_code = jit_code_val;
-    if jit_code != 0 {
-         vm.tail_call_pending = true;
-         vm.next_jit_code = jit_code;
-    } else {
+    let mut current_jit_code = jit_code_val;
+    if current_jit_code == 0 {
          let end_addr = if vm.jit.is_compiled(address) { 0 } else { super::analysis::scan_function_end(prog, address) };
          match vm.jit.compile(&vm.global_vars, &mut vm.heap, &mut vm.jit_constants, &mut vm.symbol_table, prog, address, end_addr) {
              Ok(func) => {
@@ -307,8 +307,7 @@ pub unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgr
                      }
                  }
                  
-                 vm.tail_call_pending = true;
-                 vm.next_jit_code = func as usize as u64;
+                 current_jit_code = func as usize as u64;
              },
              Err(e) => {
                  println!("JIT compilation failed in call: {}", e);
@@ -321,29 +320,33 @@ pub unsafe extern "C" fn helper_call_symbol(vm: *mut Vm, prog: *mut VirtualProgr
                  prog.jump_to(address);
                  vm.run_debug(prog, None);
                  
-                 let res_val = resolve_value(vm, registers, target_reg as u8);
-                 println!("helper_call_symbol fallback done: target_reg={} val={:?}", target_reg, res_val);
-
-                 vm.tail_call_pending = false;
                  return;
              }
          }
     }
 
-    while vm.tail_call_pending {
-        vm.tail_call_pending = false;
-        let code = vm.next_jit_code;
-        if code != 0 {
-             let func: unsafe extern "C" fn(*mut Vm, *mut VirtualProgram, *mut LispValue) = std::mem::transmute(code as *const u8);
-             func(vm, prog, vm.registers.as_mut_ptr().add(vm.window_start));
+    // Synchronous Execution Loop (Trampoline)
+    type JitFunction = unsafe extern "C" fn(*mut Vm, *mut VirtualProgram, *mut LispValue);
+    loop {
+        let func: JitFunction = std::mem::transmute(current_jit_code as *const u8);
+        // Safety: vm.registers might have been resized by previous calls, so we always get a fresh pointer.
+        // vm.window_start tracks the current frame.
+        let regs_ptr = vm.registers.as_mut_ptr().add(vm.window_start);
+        func(vm, prog, regs_ptr);
+        
+        if !vm.tail_call_pending {
+            break;
         }
+        vm.tail_call_pending = false;
+        current_jit_code = vm.next_jit_code;
     }
     
+    // Pop the call state and swap the result to the caller's target register.
+    // The JIT-generated Instr::Ret just returns without popping, so we do it here.
     let state = vm.call_states.pop().unwrap();
     let source_reg = vm.window_start + state.result_reg as usize;
     let target_reg = state.window_start + state.target_reg as usize;
     vm.registers.swap(source_reg, target_reg);
-    
     vm.window_start = old_ws;
 }
 

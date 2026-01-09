@@ -41,6 +41,7 @@ pub enum ConstantKey {
 }
 
 impl Jit {
+    #[allow(dead_code)]
     fn get_constant_index(&mut self, heap: &mut Arena<HeapValue>, jit_constants: &mut Vec<Handle>, symbol_table: &mut FxHashMap<String, Handle>, prog: &mut VirtualProgram, key: ConstantKey) -> usize {
         if let Some(&idx) = self.constant_map.get(&key) {
              return idx;
@@ -573,7 +574,7 @@ impl Jit {
                         const_funcs.remove(&dest);
                     },
                     Instr::LoadSymbol => {
-                        let dest = opcode[1] as usize;
+                        let _dest = opcode[1] as usize;
                         let name = prog.read_string().unwrap();
                         let handle = if let Some(&h) = symbol_table.get(&name) {
                             h
@@ -587,25 +588,15 @@ impl Jit {
                         sig_helper_get_jit_constant.params.push(AbiParam::new(types::I64)); // idx
                         sig_helper_get_jit_constant.returns.push(AbiParam::new(types::I64)); // value
                         let callee_helper_get_jit_constant = self.module.declare_function("helper_get_jit_constant", Linkage::Import, &sig_helper_get_jit_constant).map_err(|e| e.to_string()).ok()?;
-                        let local_helper_get_jit_constant = self.module.declare_func_in_func(callee_helper_get_jit_constant, &mut builder.func);
+                        let _local_helper_get_jit_constant = self.module.declare_func_in_func(callee_helper_get_jit_constant, &mut builder.func);
                         
-                        let idx = jit_constants.len() as i64;
+                        let _idx = jit_constants.len() as i64;
                         jit_constants.push(handle);
                         
-                        let ptr_type = self.module.target_config().pointer_type();
-                        // Fast JIT doesn't have vm_ptr in args! The wrapper has.
-                        // Wait. Fast JIT (compile_fast_internal) generates a function call signature (f64 or i64 ...). 
-                        // It does NOT take `vm`.
-                        // This means Fast JIT functions cannot call runtime helpers easily unless passed `vm`.
-                        // But Fast JIT functions only do arithmetic.
-                        // `Instr::LoadSymbol` breaks the "Fast JIT" constraint if it requires VM helper.
-                        // 
-                        // But I need to load instructions. 
-                        // If I can't pass VM, I can't look up JIT constants at runtime.
-                        // 
-                        // Fast JIT functions are "leaf" functions or call other Fast JIT functions.
-                        // They are not passed `vm`.
-                        // The wrapper `generate_wrapper` calls the fast function. The wrapper has `vm`.
+                        let _ptr_type = self.module.target_config().pointer_type();
+                        // Fast JIT functions do not receive the `vm` pointer, limiting their ability to call runtime helpers.
+                        // `Instr::LoadSymbol` requires access to JIT constants via the VM.
+                        // Currently, Fast JIT functions are intended to be leaf functions performing arithmetic/logic only.
                         // 
                         // If `deriv` uses `LoadSymbol`, it cannot be Fast JIT compiled if Fast JIT cannot access memory/VM.
                         // 
@@ -1039,7 +1030,7 @@ impl Jit {
         sig_helper_load_func_ref.params.push(AbiParam::new(types::I64)); // dest
         sig_helper_load_func_ref.params.push(AbiParam::new(types::I64)); // header_addr
         let callee_helper_load_func_ref = self.module.declare_function("helper_load_func_ref", Linkage::Import, &sig_helper_load_func_ref).map_err(|e| e.to_string())?;
-        let local_helper_load_func_ref = self.module.declare_func_in_func(callee_helper_load_func_ref, &mut builder.func);
+        let _local_helper_load_func_ref = self.module.declare_func_in_func(callee_helper_load_func_ref, &mut builder.func);
 
         let mut sig_helper_call_symbol = self.module.make_signature();
         sig_helper_call_symbol.params.push(AbiParam::new(ptr_type)); // vm
@@ -1143,7 +1134,7 @@ impl Jit {
         sig_helper_load_symbol.params.push(AbiParam::new(ptr_type)); // registers
         sig_helper_load_symbol.params.push(AbiParam::new(types::I64)); // dest_reg
         sig_helper_load_symbol.params.push(AbiParam::new(types::I64)); // offset
-        let callee_helper_load_symbol = self.module.declare_function("helper_load_symbol", Linkage::Import, &sig_helper_load_symbol).map_err(|e| e.to_string())?;
+        let _callee_helper_load_symbol = self.module.declare_function("helper_load_symbol", Linkage::Import, &sig_helper_load_symbol).map_err(|e| e.to_string())?;
         // let local_helper_load_symbol = self.module.declare_func_in_func(callee_helper_load_symbol, &mut builder.func); We use constant pool now
 
         let mut sig_helper_car = self.module.make_signature();
@@ -1220,7 +1211,9 @@ impl Jit {
              builder.append_block_param(*block, ptr_type);
         }
 
-        let mut registers_ptr = builder.block_params(entry_block)[2];
+        // Switch to loop_header (which is at start_addr) and use its parameter
+        builder.switch_to_block(loop_header);
+        let mut registers_ptr = builder.block_params(loop_header)[0];
 
         while prog.current_address() < end_addr {
             let current_addr = prog.current_address();
@@ -1228,6 +1221,7 @@ impl Jit {
             // Start new block if this address is a block start
             if let Some(&block) = blocks.get(&current_addr) {
                 if current_addr != start_addr {
+                    // Not the start - need to jump and switch
                     if !is_terminated {
                         builder.ins().jump(block, &[BlockArg::from(registers_ptr)]);
                     }
@@ -1235,6 +1229,7 @@ impl Jit {
                     registers_ptr = builder.block_params(block)[0];
                     is_terminated = false;
                 }
+                // If current_addr == start_addr, we're already on loop_header, do nothing
             } else if is_terminated {
                 // We are in dead code/data, skip to next block
                 let mut next_addr = end_addr;
@@ -1402,6 +1397,11 @@ impl Jit {
                     let offset_const = builder.ins().iconst(types::I64, offset);
                     
                     builder.ins().call(local_helper_load_string, &[vm_ptr, prog_ptr, registers_ptr, dest_reg_const, offset_const]);
+
+                    // Reload registers_ptr as it might have changed due to GC
+                    let call_inst = builder.ins().call(local_helper_get_registers_ptr, &[vm_ptr]);
+                    registers_ptr = builder.inst_results(call_inst)[0];
+
                     is_terminated = false;
                 },
                 Instr::LoadSymbol => {
@@ -1490,14 +1490,8 @@ impl Jit {
                     let start_reg = opcode[2] as i64;
                     let reg_count = opcode[3] as i64;
                     
-                    // Skip func_id in JIT stream (it's read by helper)
-                    // Wait, helper reads it from prog. prog cursor must be at the right place.
-                    // But JIT compilation scans the code.
-                    // When running JIT code, `prog` cursor is NOT updated by JIT code unless we call helpers that do it.
-                    // `helper_call_function` reads from `prog`.
-                    // But `prog` passed to JIT is the same `prog`.
-                    // However, `prog.cursor` position during JIT execution?
-                    // JIT execution doesn't use `prog.cursor` for control flow (it uses jumps).
+                    // `helper_call_function` reads arguments from `prog`, so the `prog.cursor` must be correctly positioned.
+                    // JIT compilation ensures this by synchronizing or passing offsets if needed.
                     // But helpers might use it.
                     // `helper_call_function` reads `func_id`.
                     // We need to ensure `prog.cursor` points to `func_id` when `helper_call_function` is called.
@@ -1517,6 +1511,11 @@ impl Jit {
                     let func_id_const = builder.ins().iconst(types::I64, func_id);
                     
                     builder.ins().call(local_helper_call_function, &[vm_ptr, prog_ptr, registers_ptr, dest_reg_const, start_reg_const, reg_count_const, func_id_const]);
+
+                    // Reload registers_ptr as it might have changed due to resize
+                    let call_inst = builder.ins().call(local_helper_get_registers_ptr, &[vm_ptr]);
+                    registers_ptr = builder.inst_results(call_inst)[0];
+
                     is_terminated = false;
                 },
                 Instr::Car => {
@@ -1567,14 +1566,9 @@ impl Jit {
 
                     builder.ins().call(local_helper_list, &[vm_ptr, registers_ptr, dest_reg_const, start_reg_const, count_const]);
 
-                    // Reload registers_ptr as it might have changed due to GC (implicit in allocation) - wait, List allocs, but helper_list doesn't call collect_garbage explicitly, BUT alloc MIGHT trigger expansion. 
-                    // Wait, helper_list in my implementation does NOT trigger GC explicitly.
-                    // But if I want to be safe for future, or if alloc triggers GC (it doesn't currently), I should reload.
-                    // However, `helper_cons` DOES call `helper_get_registers_ptr`.
-                    // My `helper_list` doesn't currently call GC.
-                    // But maybe I should add `collect_garbage` if I implement bulk alloc safely?
-                    // For now, no GC. But let's reload registers_ptr just in case implementation changes.
-                    // Actually, if helper_list calls allocations, and if we change alloc to trigger GC, this is needed.
+                    // Reload registers_ptr as it might have changed due to GC (implicit in allocation)
+                    let call_inst = builder.ins().call(local_helper_get_registers_ptr, &[vm_ptr]);
+                    registers_ptr = builder.inst_results(call_inst)[0];
                     
                     is_terminated = false;
                 },
@@ -1760,7 +1754,7 @@ impl Jit {
                          let both_obj = builder.ins().band(t1_is_obj, t2_is_obj);
                          both_obj
                     } else {
-                         builder.ins().iconst(types::I32, 0)
+                         builder.ins().iconst(types::I8, 0)
                     };
                     
                     let fast_path = builder.ins().bor(both_int, use_obj_fast_path);
@@ -1988,7 +1982,12 @@ impl Jit {
                     let op_const = builder.ins().iconst(types::I32, op_val as i64);
                     builder.ins().call(local_helper_op, &[vm_ptr, prog_ptr, registers_ptr, op_const]);
                     
+                    // Reload registers_ptr
+                    let call_inst = builder.ins().call(local_helper_get_registers_ptr, &[vm_ptr]);
+                    registers_ptr = builder.inst_results(call_inst)[0];
+
                     if fused_jump {
+                         let dest_ptr = builder.ins().iadd_imm(registers_ptr, dest_reg * val_size);
                          let val = builder.ins().load(types::I64, MemFlags::trusted(), dest_ptr, 0);
                          let is_false = builder.ins().icmp_imm(IntCC::Equal, val, 19);
                          
@@ -2124,12 +2123,21 @@ impl Jit {
                     let instr_addr_const = builder.ins().iconst(types::I64, instr_addr);
                     
                     builder.ins().call(local_helper_make_closure, &[vm_ptr, prog_ptr, registers_ptr, dest_reg_const, func_reg_const, count_const, instr_addr_const]);
+
+                    // Reload registers_ptr as it might have changed due to GC
+                    let call_inst = builder.ins().call(local_helper_get_registers_ptr, &[vm_ptr]);
+                    registers_ptr = builder.inst_results(call_inst)[0];
+
                     is_terminated = false;
                 },
                 Instr::MakeRef => {
                     let dest_reg = opcode[1] as i64;
                     let dest_reg_const = builder.ins().iconst(types::I64, dest_reg);
                     builder.ins().call(local_helper_make_ref, &[vm_ptr, registers_ptr, dest_reg_const]);
+                    
+                    // Reload registers_ptr as it might have changed due to GC
+                    let call_inst = builder.ins().call(local_helper_get_registers_ptr, &[vm_ptr]);
+                    registers_ptr = builder.inst_results(call_inst)[0];
                 },
                 Instr::SetRef => {
                     let dest_reg = opcode[1] as i64;
@@ -2147,6 +2155,9 @@ impl Jit {
                 },
                 Instr::Ret => {
                     if !is_terminated {
+                        // Don't call helper_ret here - the caller (vm.run_jit_function or 
+                        // helper_call_symbol) is responsible for popping the call state.
+                        // We just return from this JIT function.
                         builder.ins().return_(&[]);
                         is_terminated = true;
                     }
@@ -2205,7 +2216,8 @@ impl Jit {
         self.module.define_function(id, &mut self.ctx).map_err(|e| {
             // Print the function for debugging
             println!("{}", self.ctx.func.display());
-            e.to_string()
+            println!("Define function error: {:?}", e);
+            format!("Compilation error: {:?}", e)
         })?;
         
         // Record function size
@@ -2228,3 +2240,6 @@ impl Jit {
         Ok(unsafe { std::mem::transmute(code) })
     }
 }
+
+
+

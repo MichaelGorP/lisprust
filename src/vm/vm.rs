@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::{HashSet, HashMap};
+use std::collections::HashSet;
 use rustc_hash::FxHashMap;
 
 use crate::parser::{SExpression, Atom};
@@ -701,6 +701,29 @@ impl Vm {
                     self.scratch_buffer.pop();
                     self.registers[opcode[1] as usize + self.window_start] = Value::object(self.heap.alloc(HeapValue::Pair(Pair { car, cdr })));
                 },
+                Ok(Instr::List) => {
+                    // Instr::List: dest_reg, start_reg, count
+                    let dest_reg = opcode[1] as usize + self.window_start;
+                    let start_reg = opcode[2] as usize + self.window_start;
+                    let count = opcode[3] as usize;
+                    
+                    if count == 0 {
+                        self.registers[dest_reg] = Value::nil();
+                    } else {
+                        // Build the list from back to front
+                        let mut result = Value::nil();
+                        for i in (0..count).rev() {
+                            let car = self.registers[start_reg + i];
+                            self.scratch_buffer.push(result);
+                            self.scratch_buffer.push(car);
+                            self.collect_garbage();
+                            self.scratch_buffer.pop();
+                            self.scratch_buffer.pop();
+                            result = Value::object(self.heap.alloc(HeapValue::Pair(Pair { car, cdr: result })));
+                        }
+                        self.registers[dest_reg] = result;
+                    }
+                },
                 Ok(Instr::IsPair) => {
                     let arg = self.registers[opcode[2] as usize + self.window_start];
                     let is_pair = if let ValueKind::Object(handle) = arg.kind() {
@@ -731,20 +754,9 @@ impl Vm {
                         let res = self.registers[res_reg];
                         self.registers[res_reg] = self.reverse_list(res);
                     } else {
-                        // Initialize result register if it's the first iteration (check if it's nil or garbage?)
-                        // Actually, we can't easily check if it's the first iteration here.
-                        // But wait, Map builds the list in reverse.
-                        // The initial value of res_reg should be nil.
-                        // But res_reg is updated in the loop (Cons).
-                        // If we set it to nil every time, we lose the list!
-                        // So initialization must happen BEFORE the loop.
-                        // But Map opcode IS the loop header (conceptually).
-                        // The compiler emits: Map ... -> Cons ... -> Jump back to Map.
-                        // So Map is executed every iteration.
-                        // We cannot initialize res_reg inside Map opcode!
-                        
-                        // So I MUST emit initialization in the compiler!
-                        // I missed that.
+                        // Map opcode handles the iteration check.
+                        // Initialization of `res_reg` must happen before the loop, which the compiler ensures.
+                        // Map checks if the list is empty. If so, it reverses the accumulated result and exits.
                         
                         if let ValueKind::Object(handle) = list_val.kind() {
                             if let Some(HeapValue::Pair(p)) = self.heap.get(handle) {
