@@ -72,9 +72,12 @@ impl<T> Arena<T> {
     // Internal: expands the arena by adding a new chunk
     #[inline(never)]
     fn expand(&mut self) {
-        // Use zeroed memory to avoid undefined behavior with uninitialized reads
-        // This is safer with custom allocators like MiMalloc
-        let mut new_chunk = vec![Slot::Forwarded(Handle(0)); CHUNK_SIZE];
+        if let Some(chunk) = self.chunks.last_mut() {
+            unsafe { chunk.set_len(CHUNK_SIZE); }
+        }
+
+        // Use uninitialized memory to avoid overhead
+        let mut new_chunk = Vec::with_capacity(CHUNK_SIZE);
         
         self.chunk_base = new_chunk.as_mut_ptr();
         self.chunks.push(new_chunk);
@@ -94,7 +97,7 @@ impl<T> Arena<T> {
         }
         
         unsafe {
-            *self.alloc_ptr = Slot::Occupied(value);
+            std::ptr::write(self.alloc_ptr, Slot::Occupied(value));
             let slot_idx = self.alloc_ptr.offset_from(self.chunk_base) as u32;
             let handle = Handle::new(self.current_chunk as u32, slot_idx);
             
@@ -188,6 +191,12 @@ impl<T> Arena<T> {
 
 impl<T> Drop for Arena<T> {
     fn drop(&mut self) {
+        if !self.alloc_ptr.is_null() && !self.chunks.is_empty() {
+             let used = unsafe { self.alloc_ptr.offset_from(self.chunk_base) as usize };
+             unsafe {
+                 self.chunks.last_mut().unwrap().set_len(used);
+             }
+        }
     }
 }
 
@@ -219,6 +228,13 @@ impl<T> Arena<T>
 where T: Trace<T> + Clone
 {
     pub fn collect_from_roots(&mut self, root_visitor: impl FnOnce(&mut CopyingVisitor<T>)) {
+        if !self.alloc_ptr.is_null() && !self.chunks.is_empty() {
+             let used = unsafe { self.alloc_ptr.offset_from(self.chunk_base) as usize };
+             unsafe {
+                 self.chunks.last_mut().unwrap().set_len(used);
+             }
+        }
+
         // Take ownership of old chunks to avoid self-borrow issues
         let mut old_chunks = std::mem::take(&mut self.chunks);
         
@@ -306,8 +322,12 @@ pub struct CopyingVisitor<'a, T> {
 impl<'a, T: Clone> CopyingVisitor<'a, T> {
     #[inline(never)]
     fn expand(&mut self) {
-        // Use initialized memory to avoid undefined behavior
-        let mut new_chunk = vec![Slot::Forwarded(Handle(0)); CHUNK_SIZE];
+        if let Some(chunk) = self.new_chunks.last_mut() {
+            unsafe { chunk.set_len(CHUNK_SIZE); }
+        }
+
+        // Use uninitialized memory to avoid overhead
+        let mut new_chunk = Vec::with_capacity(CHUNK_SIZE);
         
         self.chunk_base = new_chunk.as_mut_ptr();
         self.new_chunks.push(new_chunk);
@@ -325,7 +345,7 @@ impl<'a, T: Clone> CopyingVisitor<'a, T> {
         }
 
         unsafe {
-            *self.alloc_ptr = Slot::Occupied(value);
+            std::ptr::write(self.alloc_ptr, Slot::Occupied(value));
             let slot_idx = self.alloc_ptr.offset_from(self.chunk_base) as u32;
             let handle = Handle::new(self.current_chunk as u32, slot_idx);
             
