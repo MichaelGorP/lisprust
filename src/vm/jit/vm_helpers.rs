@@ -226,9 +226,9 @@ pub unsafe extern "C" fn helper_call_function(vm: *mut Vm, prog: *mut VirtualPro
     
     let Some(function) = prog.get_function(func_id) else { return };
     
-    let args = std::slice::from_raw_parts(registers.add(start_reg), reg_count).to_vec();
+    let args = std::slice::from_raw_parts(registers.add(start_reg), reg_count);
     
-    match function(vm, &args) {
+    match function(vm, args) {
         Ok(val) => {
              let target_ptr = vm.registers.as_mut_ptr().add(vm.window_start + dest_reg);
              *target_ptr = val;
@@ -686,21 +686,44 @@ pub unsafe extern "C" fn helper_prepare_map(vm: *mut Vm, prog: *mut VirtualProgr
                 false
             };
             
-            let (header, address, captures, jit_code, _fast_jit_code) = if use_cache {
+            let mut captures_ptr: *const Vec<LispValue> = std::ptr::null();
+            
+            let (header, address, jit_code, _fast_jit_code) = if use_cache {
                  let cache = vm.map_cache.as_ref().unwrap();
-                 (cache.header, cache.address, cache.captures.clone(), cache.jit_code, cache.fast_jit_code)
+                 if let Some(caps) = &cache.captures {
+                     captures_ptr = caps;
+                 }
+                 (cache.header, cache.address, cache.jit_code, cache.fast_jit_code)
             } else {
                 let resolved_func = resolve_value(vm, regs_ptr, func_reg as u8);
                 
-                let (_h, head, addr, caps, jc, fjc) = if let ValueKind::Object(handle) = resolved_func.kind() {
+                let head: FunctionHeader;
+                let addr: u64;
+                let jc: u64;
+                let fjc: u64;
+                let mut caps_for_cache: Option<Vec<LispValue>> = None;
+                
+                if let ValueKind::Object(handle) = resolved_func.kind() {
                     match vm.heap.get(handle) {
-                        Some(HeapValue::FuncRef(f)) => (handle, f.header, f.address, None, f.jit_code.get(), f.fast_jit_code.get()),
-                        Some(HeapValue::Closure(c)) => (handle, c.function.header, c.function.address, Some(c.captures.clone()), c.function.jit_code.get(), c.function.fast_jit_code.get()),
+                        Some(HeapValue::FuncRef(f)) => {
+                            head = f.header; addr = f.address; jc = f.jit_code.get(); fjc = f.fast_jit_code.get();
+                        },
+                        Some(HeapValue::Closure(c)) => {
+                            head = c.function.header; addr = c.function.address; jc = c.function.jit_code.get(); fjc = c.function.fast_jit_code.get();
+                            captures_ptr = &c.captures;
+                            caps_for_cache = Some(c.captures.clone());
+                        },
                          Some(HeapValue::Ref(inner)) => {
                              if let ValueKind::Object(inner_handle) = inner.kind() {
                                  match vm.heap.get(inner_handle) {
-                                    Some(HeapValue::FuncRef(f)) => (inner_handle, f.header, f.address, None, 0, 0),
-                                    Some(HeapValue::Closure(c)) => (inner_handle, c.function.header, c.function.address, Some(c.captures.clone()), 0, 0),
+                                    Some(HeapValue::FuncRef(f)) => {
+                                        head = f.header; addr = f.address; jc = 0; fjc = 0;
+                                    },
+                                    Some(HeapValue::Closure(c)) => {
+                                        head = c.function.header; addr = c.function.address; jc = 0; fjc = 0;
+                                        captures_ptr = &c.captures;
+                                        caps_for_cache = Some(c.captures.clone());
+                                    },
                                     _ => return 0
                                  }
                              } else {
@@ -718,13 +741,13 @@ pub unsafe extern "C" fn helper_prepare_map(vm: *mut Vm, prog: *mut VirtualProgr
                           handle: orig_handle,
                           header: head,
                           address: addr,
-                          captures: caps.clone(),
+                          captures: caps_for_cache,
                           jit_code: jc,
                           fast_jit_code: fjc
                       });
                 }
                 
-                (head, addr, caps, jc, fjc)
+                (head, addr, jc, fjc)
             };
             
             let param_start = temp_reg;
@@ -740,10 +763,10 @@ pub unsafe extern "C" fn helper_prepare_map(vm: *mut Vm, prog: *mut VirtualProgr
             
             vm.window_start += param_start;
             
-            if let Some(caps) = captures {
+            if !captures_ptr.is_null() {
                 let start_reg = header.param_count as usize;
-                for (i, val) in caps.into_iter().enumerate() {
-                    vm.registers[vm.window_start + start_reg + i] = val;
+                for (i, val) in (*captures_ptr).iter().enumerate() {
+                    vm.registers[vm.window_start + start_reg + i] = *val;
                 }
             }
             
